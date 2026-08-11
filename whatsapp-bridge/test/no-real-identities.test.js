@@ -3,7 +3,11 @@ import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
 
-import { realIdentityStrings, scanForRealIdentities } from "../src/identity-guard.js";
+import {
+  realIdentityStrings,
+  scanForContactIdentifiers,
+  scanForRealIdentities,
+} from "../src/identity-guard.js";
 
 /**
  * The control that stops a leak of real identity data from happening twice.
@@ -208,5 +212,118 @@ test("guard: identity config arrives configured wherever an archive exists", () 
     configured,
     "This machine has an archive configured but no WA_SEND_ALLOWLIST / WA_CONTACT_ALIASES, " +
       "so the identity guard cannot see what it is meant to protect. Set them in .env.",
+  );
+});
+
+/* ══════════════════════════════════════════════════════════════════════════ *
+ * Contact identifiers — the half that needs no configuration
+ *
+ * The DOM transport knew display names and nothing else. The protocol transport
+ * (`whatsapp-transport/`) knows every contact's phone number, because whatsmeow
+ * addresses people as `<number>@s.whatsapp.net` before WhatsApp's LID migration
+ * reaches them. That is a new class of identifier in this tree, and the name
+ * guard above cannot see it: a number is not in `WA_SEND_ALLOWLIST`, so there is
+ * nothing to derive a forbidden string from.
+ *
+ * So this half is STRUCTURAL. It forbids the shape rather than the value, which
+ * has two consequences worth stating:
+ *
+ *   1. It needs no `.env`, so unlike the name half it never skips. On CI and on
+ *      a fresh clone the number guard is fully armed while the name guard is
+ *      inert.
+ *   2. It cannot be defeated by a contact the operator has not configured. The
+ *      name half only knows the people named in `.env`; every number is caught.
+ *
+ * Every fixture below is assembled from parts at run time. A literal
+ * `<digits>@s.whatsapp.net` written in this file would be caught by the very
+ * scan it tests — correctly, since `no-real-identities.test.js` may not be
+ * exempted — so the shapes are built rather than typed.
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+/** A documentation-range number (never routable), assembled so no literal appears. */
+const SYNTHETIC = "1555" + "0001111";
+
+test("guard: the canonical whatsmeow address forms are caught", () => {
+  const cases = [
+    [`${SYNTHETIC}@s.whatsapp.net`, "phone number"],
+    [`${SYNTHETIC}@c.us`, "phone number"],
+    [`${"9988" + "776655443322"}@lid`, "contact identifier"],
+    [`+${SYNTHETIC}`, "phone number"],
+    // Written the way a human pastes one, with separators.
+    [`+${"55"} ${"11"} ${"98765"}-${"4321"}`, "phone number"],
+  ];
+
+  for (const [text, kind] of cases) {
+    const hits = scanForContactIdentifiers(`a line\nwith ${text} in it\n`);
+    assert.equal(hits.length, 1, `expected exactly one hit for a ${kind}, got ${hits.length}`);
+    assert.equal(hits[0].kind, kind);
+    assert.equal(hits[0].line, 2, "the reported line must locate the leak");
+    // Same rule as the name half: a CI log is a publication surface.
+    assert.ok(
+      !JSON.stringify(hits).includes(SYNTHETIC.slice(0, 6)),
+      "the scanner returned the matched digits; a failure log would re-leak them",
+    );
+  }
+});
+
+/**
+ * The false positives that would get this guard deleted.
+ *
+ * `MINIMUM_IDENTIFYING_LENGTH` exists because a noisy guard is a disabled guard,
+ * and a bare run of digits is far noisier than a short name: epoch milliseconds
+ * are thirteen digits, and this repository is full of them.
+ *
+ * So a bare digit run is deliberately NOT an identifier, and the residual gap is
+ * stated rather than papered over — `Identity.PhoneNumber()` in the Go transport
+ * returns bare digits, and a fixture built from its output by hand would pass
+ * this scan. What closes that hole is the containment on the Go side (the field
+ * is unexported, so nothing serialises it by accident), not this regex.
+ */
+test("guard: shapes that merely look numeric are not identifiers", () => {
+  const benign = [
+    "1754870400000", // epoch milliseconds
+    "2026-08-11T01:07:31Z", // a timestamp
+    "d142ca3", // a short git SHA
+    "protobuf v1.36.11", // a version
+    "sha256-9f8b7a6c5d4e3f2a1b0c", // a hash fragment
+    "120363000000000000@g.us", // a group, which is not a person's number
+    "1000000", // a size in bytes
+    `${SYNTHETIC}`, // the bare number, per the docstring above
+  ];
+
+  for (const text of benign) {
+    assert.deepEqual(
+      scanForContactIdentifiers(`x\n${text}\n`),
+      [],
+      `"${text}" was flagged as a contact identifier; a guard this noisy gets disabled`,
+    );
+  }
+});
+
+test("guard: no tracked file contains a contact identifier", () => {
+  // No skip path, deliberately. This scan needs no configuration, so there is
+  // never a state in which it "had nothing to check" — which makes it the one
+  // identity control that is armed on every machine, including CI.
+  const offences = [];
+
+  for (const file of trackedFiles()) {
+    if (EXEMPT.has(file)) continue;
+    let text;
+    try {
+      text = readFileSync(ROOT + file, "utf8");
+    } catch {
+      continue;
+    }
+    for (const hit of scanForContactIdentifiers(text)) {
+      offences.push(`${file}:${hit.line} leaks a ${hit.kind}`);
+    }
+  }
+
+  assert.deepEqual(
+    offences,
+    [],
+    `Contact identifiers found in ${offences.length} place(s):\n  ${offences.join("\n  ")}\n\n` +
+      "Replace them with values assembled at run time from synthetic parts, the way this " +
+      "test's own fixtures are. The matched strings are deliberately not printed.",
   );
 });

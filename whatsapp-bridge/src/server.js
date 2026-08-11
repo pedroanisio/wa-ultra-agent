@@ -54,6 +54,14 @@ import {
   readChat,
   sendMessage,
   sendSelfNote,
+  sendViaTransport,
+  startTransportDrain,
+  transportConfigured,
+  transportConnect,
+  transportContacts,
+  transportDrain,
+  transportPairPhone,
+  transportStatus,
 } from "./whatsapp.js";
 
 /**
@@ -96,6 +104,9 @@ async function readJson(req) {
   }
   return chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : {};
 }
+
+/** The drain loop's handle, so shutdown can stop it. Null until boot. */
+let drain = null;
 
 const server = createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
@@ -206,7 +217,45 @@ const server = createServer(async (req, res) => {
     if (path === "/send" && req.method === "POST") {
       const { to, message } = await readJson(req);
       if (!to || !message) return send(res, 400, { error: "to and message are required" });
+
+      // The protocol path when there is one. Not serialised: `serial` exists to
+      // keep browser operations from interleaving in one tab, and a protocol send
+      // touches no tab. Routing on configuration rather than on a request field
+      // keeps the agent's tools unchanged — they call /send either way.
+      if (transportConfigured()) {
+        return send(res, 200, await sendViaTransport({ to, message }));
+      }
       return send(res, 200, await serial(() => sendMessage({ to, message })));
+    }
+
+    /* -------------------------------------------------------------- *
+     * The protocol transport.
+     *
+     * None of these touch the browser, so none are serialised. They are 503 when
+     * no transport is configured, which is a statement about this installation
+     * rather than an error.
+     * -------------------------------------------------------------- */
+
+    if (path === "/transport/status") return send(res, 200, await transportStatus());
+
+    if (path === "/transport/contacts") return send(res, 200, await transportContacts());
+
+    // A drain the operator asked for, rather than the one on the interval. Useful
+    // after a restart, and the only way to see the outcome of a single batch.
+    if (path === "/transport/drain" && req.method === "POST") {
+      const { limit } = await readJson(req);
+      return send(res, 200, await transportDrain({ limit }));
+    }
+
+    if (path === "/transport/connect" && req.method === "POST") {
+      return send(res, 200, await transportConnect());
+    }
+
+    // Pairing returns a code the operator types into their phone. Short-lived and
+    // useless without the handset, so it is safe to hand back over loopback.
+    if (path === "/transport/pair/phone" && req.method === "POST") {
+      const { phone } = await readJson(req);
+      return send(res, 200, await transportPairPhone(phone));
     }
 
     // Everything ingested so far. Cheap and browser-free: it reads SQLite, not
@@ -559,6 +608,16 @@ server.listen(PORT, HOST, () => {
   console.log(`whatsapp-bridge listening on http://${HOST}:${PORT}`);
   console.log(`send: ${process.env.WA_ALLOW_SEND === "true" ? "ENABLED" : "disabled"}`);
 
+  // The protocol transport, when one is configured. Started before the watcher
+  // because it needs no browser: messages begin arriving in the archive whether
+  // or not Chromium ever comes up.
+  if (transportConfigured()) {
+    drain = startTransportDrain();
+    console.log("transport: draining the outbox into the archive");
+  } else {
+    console.log("transport: none configured (set WA_TRANSPORT_URL to receive over the protocol)");
+  }
+
   // Opt-in, and off by default. Watching is passive and costs no interactions,
   // but the queue it fills is what a dispatcher then acts on, and an operator
   // who has not configured quiet hours or a cooldown should not acquire a
@@ -582,6 +641,10 @@ server.listen(PORT, HOST, () => {
 
 for (const sig of ["SIGINT", "SIGTERM"]) {
   process.on(sig, async () => {
+    // Stopped first: a drain that is mid-flight when the store closes would
+    // throw on the write, and a drain that starts after it would ack entries it
+    // never stored.
+    drain?.stop();
     await shutdown();
     server.close(() => process.exit(0));
   });

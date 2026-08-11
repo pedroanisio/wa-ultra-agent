@@ -1,0 +1,410 @@
+#!/usr/bin/env bash
+#
+# transport — the NO-DOCKER development path for the protocol transport.
+#
+# ── Which is which ───────────────────────────────────────────────────────────
+# `docker compose` is how this project runs. The transport is a service in
+# docker-compose.yml, its token comes from `.env`, and its paired session lives
+# in the `whatsapp-transport-data` volume. That is the deployment.
+#
+# This script exists for working on the Go code without rebuilding an image. It
+# keeps its own session in WA_TRANSPORT_DIR and its own token in a file, so it is
+# a SEPARATE account link from the container's:
+#
+#   pairing here does not pair the container, and vice versa
+#   only one of the two may hold port 8100 at a time
+#
+# `doctor` warns when both are in play. If you are not editing Go, use compose.
+#
+# Exists because the setup has three failure modes that all look like something
+# else, and every one of them was hit by hand before this script was written:
+#
+#   1. A token minted per shell. `export WA_TRANSPORT_TOKEN=$(openssl rand ...)`
+#      in a new terminal produces a token the running server has never seen, so
+#      every request 401s and the server looks broken. The token is now stored
+#      beside the session and read, not generated.
+#   2. A second instance. Only one process may hold the paired session, so the
+#      second start fails on the port and the message names the port rather than
+#      the cause.
+#   3. Go's module root. The module is this directory, not the repository root,
+#      so `go run ./cmd/...` from the top fails with "cannot find main module".
+#
+# Every subcommand is safe to re-run.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MODULE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+REPO_ROOT="$(cd "$MODULE_DIR/.." && pwd)"
+
+: "${WA_TRANSPORT_DIR:=$REPO_ROOT/data/transport}"
+: "${WA_TRANSPORT_ADDR:=127.0.0.1:8100}"
+
+TOKEN_FILE="$WA_TRANSPORT_DIR/.token"
+HOST="${WA_TRANSPORT_ADDR%%:*}"
+PORT="${WA_TRANSPORT_ADDR##*:}"
+BASE="http://$WA_TRANSPORT_ADDR"
+
+# ── output ──────────────────────────────────────────────────────────────────
+if [ -t 1 ]; then
+  R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; B=$'\e[1m'; Z=$'\e[0m'
+else
+  R=""; G=""; Y=""; B=""; Z=""
+fi
+ok()   { printf '  %s✓%s %s\n' "$G" "$Z" "$*"; }
+warn() { printf '  %s!%s %s\n' "$Y" "$Z" "$*"; }
+bad()  { printf '  %s✗%s %s\n' "$R" "$Z" "$*"; }
+head_() { printf '\n%s%s%s\n' "$B" "$*" "$Z"; }
+die()  { printf '\n%s✗ %s%s\n' "$R" "$*" "$Z" >&2; exit 1; }
+
+need() { command -v "$1" >/dev/null 2>&1; }
+
+# ── the token ───────────────────────────────────────────────────────────────
+#
+# Generated once and read thereafter. This is the fix for failure mode 1: a
+# value that lives in a file is the same value in every shell, whereas a value
+# minted by the shell that happened to start the server is unreachable from any
+# other one.
+ensure_token() {
+  mkdir -p "$WA_TRANSPORT_DIR"
+  chmod 700 "$WA_TRANSPORT_DIR"
+
+  if [ ! -s "$TOKEN_FILE" ]; then
+    if need openssl; then
+      openssl rand -hex 32 > "$TOKEN_FILE"
+    else
+      # /dev/urandom is always present; openssl is not guaranteed to be.
+      head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$TOKEN_FILE"
+    fi
+    chmod 600 "$TOKEN_FILE"
+  fi
+  chmod 600 "$TOKEN_FILE"
+  TOKEN="$(cat "$TOKEN_FILE")"
+  [ -n "$TOKEN" ] || die "token file $TOKEN_FILE is empty; delete it and re-run"
+}
+
+# `awk ... exit` rather than `| head -1`, deliberately.
+#
+# Under `set -o pipefail`, `head` closing the pipe sends SIGPIPE to the producer,
+# the pipeline reports failure, and `set -e` kills the script mid-report — only
+# when the port is BUSY, which is precisely the case this function exists to
+# describe. Letting awk stop on its own keeps the pipeline's exit status honest.
+port_holder() {
+  if need ss; then
+    { ss -tlnp 2>/dev/null || true; } | awk -v p=":$PORT\$" '$4 ~ p {print $NF; exit}'
+  elif need lsof; then
+    { lsof -ti "tcp:$PORT" -sTCP:LISTEN 2>/dev/null || true; } | awk 'NR==1'
+  fi
+}
+
+api() {
+  local method="$1" path="$2" body="${3:-}"
+  if [ -n "$body" ]; then
+    curl -fsS -X "$method" -H "Authorization: Bearer $TOKEN" -d "$body" "$BASE$path"
+  else
+    curl -fsS -X "$method" -H "Authorization: Bearer $TOKEN" "$BASE$path"
+  fi
+}
+
+pretty() { if need jq; then jq .; else cat; fi; }
+
+# http_code returns the status code and never fails.
+#
+# `curl -f` turns an HTTP error into a non-zero exit, which is right for "fetch
+# this or stop" and wrong for "tell me what happened". A 401 is an EXPECTED
+# answer here — it is how a stale token is detected — and treating it as a
+# command failure aborted the whole report under `set -e`, mid-section, with no
+# message. Asking for the number directly keeps expected outcomes on the data
+# path instead of the error path.
+http_code() {
+  curl -s -o /dev/null -w '%{http_code}' \
+    -H "Authorization: Bearer ${TOKEN:-}" "$BASE$1" 2>/dev/null || echo 000
+}
+
+# ── doctor ──────────────────────────────────────────────────────────────────
+cmd_doctor() {
+  local problems=0
+
+  head_ "Toolchain"
+  if need go; then
+    ok "go — $(go version | awk '{print $3}')"
+  else
+    bad "go is not installed — https://go.dev/dl/"; problems=$((problems + 1))
+  fi
+  need curl && ok "curl" || { bad "curl is missing"; problems=$((problems + 1)); }
+  need jq && ok "jq" || warn "jq is missing (output will be unformatted, nothing breaks)"
+  need qrencode && ok "qrencode — QR pairing available" \
+    || warn "qrencode is missing — use 'transport pair <your-number>' instead of QR"
+
+  head_ "Paths"
+  ok "module     $MODULE_DIR"
+  ok "data dir   $WA_TRANSPORT_DIR"
+  # Only meaningful for a directory inside the repository. One outside it cannot
+  # be committed at all, and reporting it as unignored would be a false alarm
+  # that teaches the operator to ignore this check.
+  case "$(cd "$WA_TRANSPORT_DIR" 2>/dev/null && pwd || echo "$WA_TRANSPORT_DIR")" in
+    "$REPO_ROOT"/*)
+      if git -C "$REPO_ROOT" check-ignore -q "$WA_TRANSPORT_DIR/session.db" 2>/dev/null; then
+        ok "data dir is gitignored (it holds the account credential)"
+      else
+        bad "data dir is inside the repo and NOT gitignored — pairing would create a committable credential"
+        problems=$((problems + 1))
+      fi
+      ;;
+    *) ok "data dir is outside the repository, so nothing there can be committed" ;;
+  esac
+
+  head_ "Token"
+  if [ -s "$TOKEN_FILE" ]; then
+    TOKEN="$(cat "$TOKEN_FILE")"
+    ok "stored at $TOKEN_FILE ($(stat -c %a "$TOKEN_FILE" 2>/dev/null || echo '?') perms)"
+  else
+    warn "not created yet — 'transport up' will generate one"
+  fi
+
+  head_ "Docker"
+  if need docker && docker compose -f "$REPO_ROOT/docker-compose.yml" ps \
+       --services --filter status=running 2>/dev/null | grep -qx whatsapp-transport; then
+    warn "the whatsapp-transport CONTAINER is running — that is the real deployment"
+    printf '      Its session and token are separate from this one, so pairing here\n'
+    printf '      would link a SECOND device. Unless you are editing Go, use:\n'
+    printf '        docker compose logs -f whatsapp-transport\n'
+    problems=$((problems + 1))
+  elif need docker; then
+    ok "no transport container running, so this script may hold the port"
+  else
+    warn "docker not found, and compose is how this project normally runs"
+  fi
+
+
+  head_ "Port $WA_TRANSPORT_ADDR"
+  local holder; holder="$(port_holder)"
+  if [ -z "$holder" ]; then
+    ok "free"
+  else
+    # A busy port is only a problem if the thing holding it is not a transport
+    # we can talk to. Distinguishing the two is the whole point of this check.
+    if [ "$(http_code /health)" = "200" ]; then
+      if [ -s "$TOKEN_FILE" ] && [ "$(http_code /status)" = "200" ]; then
+        ok "a transport is already running and accepts the stored token"
+      else
+        bad "a transport is running but rejects the stored token"
+        printf '      It was started with a different token (a per-shell\n'
+        printf '      "openssl rand" does this). Stop it and start again:\n'
+        printf '        %s stop && %s up\n' "$0" "$0"
+        problems=$((problems + 1))
+      fi
+    else
+      bad "port held by something that is not this transport: $holder"
+      printf '      Free it, or set WA_TRANSPORT_ADDR to another port.\n'
+      problems=$((problems + 1))
+    fi
+  fi
+
+  head_ "Build"
+  if (cd "$MODULE_DIR" && go build ./... 2>/dev/null); then
+    ok "go build ./... succeeds"
+  else
+    bad "go build ./... fails — run it in $MODULE_DIR to see why"
+    problems=$((problems + 1))
+  fi
+
+  if [ "$problems" -eq 0 ]; then
+    printf '\n%s✓ ready%s — run: %s up\n' "$G" "$Z" "$0"
+  else
+    printf '\n%s✗ %d problem(s) above%s\n' "$R" "$problems" "$Z"
+    return 1
+  fi
+}
+
+# ── up ──────────────────────────────────────────────────────────────────────
+cmd_up() {
+  need go || die "go is not installed"
+  ensure_token
+
+  if [ "$(http_code /health)" = "200" ]; then
+    if [ "$(http_code /status)" = "200" ]; then
+      printf '%sAlready running on %s and answering.%s\n' "$G" "$WA_TRANSPORT_ADDR" "$Z"
+      cmd_status
+      return 0
+    fi
+    die "A transport is running on $WA_TRANSPORT_ADDR but rejects the stored token.
+It was started with a different token. Stop it first:  $0 stop"
+  fi
+
+  local holder; holder="$(port_holder)"
+  [ -z "$holder" ] || die "Port $WA_TRANSPORT_ADDR is held by: $holder
+Free it, or set WA_TRANSPORT_ADDR to another port."
+
+  printf 'Starting on %s\n  data  %s\n  token %s\n\n' \
+    "$WA_TRANSPORT_ADDR" "$WA_TRANSPORT_DIR" "$TOKEN_FILE"
+
+  cd "$MODULE_DIR"
+  WA_TRANSPORT_DIR="$WA_TRANSPORT_DIR" \
+  WA_TRANSPORT_TOKEN="$TOKEN" \
+  WA_TRANSPORT_ADDR="$WA_TRANSPORT_ADDR" \
+    exec go run ./cmd/whatsapp-transport
+}
+
+# port_pid returns the pid listening on our configured port, and only that one.
+port_pid() {
+  if need ss; then
+    { ss -tlnp 2>/dev/null || true; } \
+      | awk -v p=":$PORT\$" '$4 ~ p { if (match($0, /pid=[0-9]+/)) { print substr($0, RSTART+4, RLENGTH-4); exit } }'
+  elif need lsof; then
+    { lsof -ti "tcp:$PORT" -sTCP:LISTEN 2>/dev/null || true; } | awk 'NR==1'
+  fi
+}
+
+cmd_stop() {
+  # Scoped to the configured port, deliberately.
+  #
+  # An earlier version matched the binary name with pgrep and killed every
+  # transport on the machine — including one an operator was running on a
+  # different port with a different data directory. Stopping a process nobody
+  # asked about is not a tidy-up, it is a surprise, so this now stops exactly the
+  # instance this invocation is configured to talk to.
+  local pid; pid="$(port_pid)"
+
+  if [ -z "$pid" ]; then
+    printf 'Nothing listening on %s.\n' "$WA_TRANSPORT_ADDR"
+    return 0
+  fi
+
+  if [ "$(http_code /health)" != "200" ]; then
+    die "Something holds $WA_TRANSPORT_ADDR (pid $pid) but does not answer /health,
+so it is probably not this transport. Refusing to kill it — stop it yourself if
+you know what it is."
+  fi
+
+  # The child of `go run` is the server; killing the parent alone orphans it and
+  # leaves the port held, which looks exactly like the bug this script exists to
+  # explain. Take the listener, then its parent if that parent is `go run`.
+  local parent; parent="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')"
+
+  # TERM, not KILL: the server drains in-flight requests and closes both
+  # databases cleanly. A killed process leaves WAL files to recover.
+  kill "$pid" 2>/dev/null || true
+  if [ -n "$parent" ] && ps -o args= -p "$parent" 2>/dev/null | grep -q 'go run'; then
+    kill "$parent" 2>/dev/null || true
+  fi
+
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    [ "$(http_code /health)" = "200" ] || break
+    sleep 0.3
+  done
+
+  if [ "$(http_code /health)" = "200" ]; then
+    die "pid $pid did not stop. Investigate before killing it harder."
+  fi
+  printf 'Stopped (pid %s on %s).\n' "$pid" "$WA_TRANSPORT_ADDR"
+}
+
+cmd_status() {
+  ensure_token
+  [ "$(http_code /health)" = "200" ] || die "Not running. Start it with: $0 up"
+  [ "$(http_code /status)" = "200" ] || die "Running, but it rejects the stored token.
+It was started with a different one. Restart it:  $0 stop && $0 up"
+  api GET /status | pretty
+}
+
+# ── pair ────────────────────────────────────────────────────────────────────
+cmd_pair() {
+  ensure_token
+  [ "$(http_code /health)" = "200" ] || die "Not running. Start it with: $0 up"
+  [ "$(http_code /status)" = "200" ] || die "Running, but it rejects the stored token.
+Restart it:  $0 stop && $0 up"
+
+  if api GET /status 2>/dev/null | grep -q '"paired": *true'; then
+    printf '%sAlready paired.%s\n' "$G" "$Z"
+    return 0
+  fi
+
+  local phone="${1:-}"
+  if [ -n "$phone" ]; then
+    phone="${phone//[^0-9]/}"
+    [ -n "$phone" ] || die "Give the number in full international form, digits only, e.g. 5511987654321"
+
+    printf 'Requesting a pairing code for +%s …\n\n' "$phone"
+    local code
+    code="$(api POST /pair/phone "{\"phone\":\"$phone\"}" | (need jq && jq -r .code || cat))"
+    printf '  %sPairing code:  %s%s\n\n' "$B" "$code" "$Z"
+    cat <<'STEPS'
+  On your phone:
+    WhatsApp → Settings → Linked devices → Link a device
+      → "Link with phone number instead" → enter the code above.
+
+  The code expires in a couple of minutes. Re-run this to get a fresh one.
+STEPS
+    printf '\n  Then check:  %s status\n' "$0"
+    return 0
+  fi
+
+  if ! need qrencode; then
+    die "qrencode is not installed, so a QR cannot be drawn here.
+
+Use phone pairing instead — no rendering needed, and it is the easier path on a
+headless host:
+
+    $0 pair <your-number-in-full-international-form>
+    e.g. $0 pair 5511987654321
+
+Or install a renderer:  sudo apt-get install -y qrencode
+
+Do NOT paste the pairing code into an online QR generator. That code links a
+device to your WhatsApp account, and whoever renders it can scan it first."
+  fi
+
+  printf 'Streaming QR codes. They rotate every ~20s; scan any one.\n'
+  printf 'WhatsApp → Settings → Linked devices → Link a device\n\n'
+
+  curl -fsSN -H "Authorization: Bearer $TOKEN" "$BASE/pair/qr" | while IFS= read -r line; do
+    case "$line" in
+      data:*)
+        local payload="${line#data: }"
+        local event code
+        event="$(printf '%s' "$payload" | jq -r .event 2>/dev/null || echo '')"
+        code="$(printf '%s' "$payload" | jq -r .code 2>/dev/null || echo '')"
+        case "$event" in
+          code)    printf '\n'; qrencode -t ANSIUTF8 "$code" ;;
+          success) printf '\n%s✓ paired%s — run: %s status\n' "$G" "$Z" "$0"; break ;;
+          *)       [ -n "$event" ] && printf '  %s\n' "$event" ;;
+        esac
+        ;;
+    esac
+  done
+}
+
+usage() {
+  cat <<USAGE
+transport — WhatsApp protocol transport (no-docker development path)
+
+  `docker compose up -d whatsapp-transport` is how this project RUNS.
+  Use this script only to work on the Go code; it keeps a separate session.
+
+  $0 doctor              check everything, change nothing
+  $0 up                  start it (foreground)
+  $0 status              show pairing, queue and event counters
+  $0 pair <number>       pair using a code typed on your phone  (recommended)
+  $0 pair                pair by QR (needs qrencode)
+  $0 stop                stop a running instance
+
+Environment (both optional):
+  WA_TRANSPORT_DIR       default $REPO_ROOT/data/transport
+  WA_TRANSPORT_ADDR      default 127.0.0.1:8100
+
+The token is generated once into <data dir>/.token and reused. Do not set
+WA_TRANSPORT_TOKEN by hand — a per-shell value is how you end up with a server
+that rejects you.
+USAGE
+}
+
+case "${1:-}" in
+  doctor) shift; cmd_doctor "$@" ;;
+  up)     shift; cmd_up "$@" ;;
+  status) shift; cmd_status "$@" ;;
+  pair)   shift; cmd_pair "$@" ;;
+  stop)   shift; cmd_stop "$@" ;;
+  ""|-h|--help|help) usage ;;
+  *) usage; exit 1 ;;
+esac

@@ -15,6 +15,13 @@ import {
   resolveAlias,
 } from "./recipients.js";
 import { createBudget } from "./rate.js";
+import {
+  ENV as TRANSPORT_ENV,
+  createTransport,
+  drainOnce,
+  resolveRecipient,
+  startDrain,
+} from "./transport.js";
 import { assertSelfNoteConfigured, normalizeMessages, sendSelfNoteWith } from "./self-note.js";
 import { openStore, retentionFromEnv } from "./store.js";
 import { trySerial } from "./serial.js";
@@ -983,6 +990,153 @@ function store() {
     dateOrder: process.env.WA_DATE_ORDER,
   });
   return storeHandle;
+}
+
+/* ------------------------------------------------------------------
+ * The protocol transport
+ *
+ * `whatsapp-transport` (Go, whatsmeow) receives messages over WhatsApp's own
+ * multi-device protocol and queues them durably. This section is the bridge's
+ * side of that hand-off. It is wired here rather than in server.js for one
+ * reason: the drain must write through the SAME store handle as everything else.
+ * A second `openStore` on the same file would be a second writer to an archive
+ * whose whole design rests on having exactly one.
+ *
+ * All of it is inert unless WA_TRANSPORT_URL is set, so an installation that has
+ * not adopted the transport is unaffected.
+ * ------------------------------------------------------------------ */
+
+let transportHandle = null;
+
+/** Whether the operator has pointed this bridge at a transport at all. */
+export function transportConfigured() {
+  return Boolean(process.env[TRANSPORT_ENV.url]);
+}
+
+function transport() {
+  if (!transportConfigured()) {
+    const error = new Error(
+      `No protocol transport is configured. Set ${TRANSPORT_ENV.url} (and ${TRANSPORT_ENV.token}) ` +
+        "to the whatsapp-transport service to receive messages over the protocol instead of the DOM.",
+    );
+    error.statusCode = 503;
+    throw error;
+  }
+  transportHandle ??= createTransport();
+  return transportHandle;
+}
+
+/**
+ * Pairing and queue state, plus what the archive knows that the transport cannot.
+ *
+ * `provisionalChats` is reported here because it is a gap only the archive can
+ * see: the transport hands over `pn:` digests and LIDs with no link between them,
+ * so a person may hold two chat rows and neither side alone can say so.
+ */
+export async function transportStatus() {
+  const state = await transport().status();
+  const unsettled = store().provisionalChats({ limit: 25 });
+  return {
+    ...state,
+    archive: {
+      provisionalChats: unsettled.length,
+      // Names, never keys: this response is the most casually-logged thing here.
+      provisional: unsettled.map((chat) => ({
+        displayName: chat.display_name,
+        messages: chat.messages,
+      })),
+    },
+  };
+}
+
+/** Drain the queue once, now, rather than waiting for the next tick. */
+export function transportDrain({ limit } = {}) {
+  return drainOnce({ transport: transport(), store: store(), limit });
+}
+
+export function transportContacts() {
+  return transport().contacts();
+}
+
+export function transportPairPhone(phone) {
+  if (!phone) throw badRequest("phone is required");
+  return transport().pairPhone(phone);
+}
+
+export function transportConnect() {
+  return transport().connect();
+}
+
+/**
+ * Send over the protocol instead of by typing into a browser.
+ *
+ * The authorisation chain is deliberately unchanged: `assertSendConfigured` and
+ * `assertSendable` are the same functions the DOM path calls, applied to the name
+ * the roster resolved. What disappears is `assertResolvedMatches`, and only
+ * because the failure it guarded against cannot happen here — it existed because
+ * WhatsApp's search is recency-ranked and could open a group instead of a person.
+ * An identity key is exact. The ambiguity that remains is handled by
+ * `resolveRecipient`, which refuses rather than choosing.
+ *
+ * The transport enforces its own JID allowlist underneath this. That is defence
+ * in depth, not a substitute: this layer is where a human name is checked.
+ */
+export async function sendViaTransport({ to, message }) {
+  if (!message?.trim()) throw new Error("Refusing to send an empty message.");
+  assertSendConfigured();
+
+  // The env alias map first, so "mãe" reaches the same person it would on the
+  // DOM path, then the roster resolves whatever name that produced.
+  const requested = resolveAlias(to);
+  const { contacts } = await transport().contacts();
+  const resolved = resolveRecipient(requested, contacts);
+
+  // The allowlist bounds WHO may be written to, and it is written in human names,
+  // so it is checked against the name the roster matched — not against the key.
+  assertSendable(resolved.matchedName ?? requested);
+
+  const result = await transport().send({ to: resolved.to, message });
+  return {
+    ...result,
+    requestedRecipient: to,
+    resolvedName: resolved.matchedName,
+    exactMatch: resolved.exactMatch,
+    via: "transport",
+    warning: resolved.exactMatch
+      ? undefined
+      : `"${to}" resolved to "${resolved.matchedName}" — it is allowlisted, but confirm this was ` +
+        "the intended person.",
+  };
+}
+
+/**
+ * Start draining on an interval. Called once at boot.
+ *
+ * Failures are logged and the loop continues, because nothing is acked until the
+ * archive commits: a transport that is briefly unreachable costs latency, not
+ * correspondence.
+ */
+export function startTransportDrain() {
+  const intervalMs = Number(process.env.WA_TRANSPORT_DRAIN_INTERVAL_MS) || 5_000;
+  return startDrain({
+    transport: transport(),
+    store: store(),
+    intervalMs,
+    onDrain: (outcome) =>
+      console.log(
+        `transport: drained ${outcome.fetched} (${outcome.inserted} new, ` +
+          `${outcome.duplicates} known, ${outcome.rejected} unwritable), depth ${outcome.depth}`,
+      ),
+    // Loud and unmissable. A non-zero `dropped` means the queue overflowed while
+    // this bridge was down and that correspondence is gone for good — the one
+    // thing that must never be inferred from a quiet-looking archive.
+    onGap: (dropped) =>
+      console.error(
+        `transport: ${dropped} message(s) were DROPPED by the transport's outbox before this ` +
+          "bridge could store them. That is a permanent gap in the archive, not a quiet period.",
+      ),
+    onError: (error) => console.error("transport: drain failed:", error?.message || error),
+  });
 }
 
 /** A caller mistake, not a fault: 400 keeps it out of the error log. */

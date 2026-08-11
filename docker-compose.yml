@@ -2,6 +2,52 @@
 # NOT published to the host: only the agent, on the internal network, can reach
 # it. To link the account you publish the port temporarily (see README).
 services:
+  # Speaks WhatsApp's multi-device protocol directly (Go, whatsmeow) and queues
+  # what arrives in a durable outbox. The bridge drains that queue into the
+  # archive; the agent never talks to this service.
+  #
+  # Optional. Leave WA_TRANSPORT_TOKEN unset and the bridge keeps reading the DOM
+  # exactly as before — but then this service refuses to start, so comment it out
+  # too rather than running it unconfigured.
+  whatsapp-transport:
+    build: ./whatsapp-transport
+    restart: unless-stopped
+    environment:
+      # No default and no fallback. This API can read every message the account
+      # receives and send as the operator, so the process refuses to start
+      # unauthenticated rather than expose that to anything on the host.
+      WA_TRANSPORT_TOKEN: "${WA_TRANSPORT_TOKEN:?generate one with openssl rand -hex 32}"
+      # 0.0.0.0 INSIDE the container only. The binary defaults to 127.0.0.1 —
+      # correct when run bare, but unreachable from the bridge's container. What
+      # keeps it off the network is the loopback-only host mapping below, not this.
+      WA_TRANSPORT_ADDR: "0.0.0.0:8100"
+      WA_TRANSPORT_DIR: "/data"
+      # Sending is default-deny here as well as in the bridge. Two independent
+      # gates, deliberately not sharing WA_ALLOW_SEND: defence in depth is only
+      # depth if each layer is configured on purpose. Note the allowlist here is
+      # written as JIDs, not names — see GET /contacts.
+      WA_TRANSPORT_ALLOW_SEND: "${WA_TRANSPORT_ALLOW_SEND:-false}"
+      WA_TRANSPORT_SEND_ALLOWLIST: "${WA_TRANSPORT_SEND_ALLOWLIST:-}"
+      # How many messages the outbox holds before it starts discarding the
+      # oldest. The default is 50,000; the count of what was dropped is
+      # cumulative and reported on every drain, because a gap must never be
+      # inferrable only from an archive that looks quiet.
+      WA_TRANSPORT_OUTBOX_CAPACITY: "${WA_TRANSPORT_OUTBOX_CAPACITY:-}"
+      WA_TRANSPORT_LOG_LEVEL: "${WA_TRANSPORT_LOG_LEVEL:-INFO}"
+    volumes:
+      # The paired session and the outbox. This volume IS the account credential,
+      # exactly like whatsapp-profile — copying it hands someone the account.
+      - whatsapp-transport-data:/data
+    expose:
+      - "8100"
+    ports:
+      # Loopback ONLY, for the same reason as the bridge: pairing needs host
+      # access (GET /pair/qr, POST /pair/phone) and every other route sends or
+      # reads as the operator. Do not bind 0.0.0.0 and do not tunnel this.
+      - "127.0.0.1:8100:8100"
+    networks:
+      - internal
+
   whatsapp-bridge:
     build: ./whatsapp-bridge
     restart: unless-stopped
@@ -48,6 +94,15 @@ services:
       # is itself an interaction. Unset means no quiet hours, which is a choice.
       WA_QUIET_HOURS: "${WA_QUIET_HOURS:-23:00-07:00}"
       WA_HEADLESS: "${WA_HEADLESS:-false}"
+      # Where to drain messages from. Unset means "there is no transport": the
+      # bridge reads the DOM as before and every /transport/* route answers 503.
+      # Setting it moves reception onto the protocol and sends through it too.
+      WA_TRANSPORT_URL: "${WA_TRANSPORT_URL:-}"
+      # The same secret the transport refuses to start without. Not defaulted from
+      # WA_BRIDGE_TOKEN: two services sharing one token means rotating either one
+      # silently unauthenticates the other.
+      WA_TRANSPORT_TOKEN: "${WA_TRANSPORT_TOKEN:-}"
+      WA_TRANSPORT_DRAIN_INTERVAL_MS: "${WA_TRANSPORT_DRAIN_INTERVAL_MS:-5000}"
     volumes:
       # The linked session. Losing this volume means scanning the QR again;
       # copying it hands someone the account.
@@ -101,6 +156,9 @@ services:
 
 volumes:
   whatsapp-profile:
+  # Holds session.db (the linked session) and outbox.db (undrained messages).
+  # Treat it as you would a private key.
+  whatsapp-transport-data:
 
 networks:
   internal:

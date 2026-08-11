@@ -39,6 +39,84 @@ and health checks need host access. Every route but `/health` requires the
 bearer token. Binding it to `0.0.0.0`, or tunnelling that port, puts a live
 WhatsApp account on the network.
 
+## Optionally, a third: the protocol transport
+
+`whatsapp-transport` (Go, [whatsmeow](https://github.com/tulir/whatsmeow)) speaks
+WhatsApp's multi-device protocol directly. It replaces the Playwright half of the
+bridge — the browser, the selectors, the DOM walking — and **nothing else**. The
+archive, the interaction twin, people and obligations all stay in `store.js`,
+which remains the only writer of your correspondence, and the agent's tools are
+unchanged.
+
+| | DOM path | Protocol path |
+|---|---|---|
+| Reception | poll a rendered chat list | pushed, into a durable outbox |
+| Message id | hash of the rendered content | the protocol's own id |
+| Timestamp | parsed from `"8/3/2026"`, sometimes unparseable | an exact instant |
+| Identity | a fuzzy-matched display name | a stable per-person key |
+| Costs | Chromium, Xvfb, 1 GB of shared memory | one static binary |
+
+**It does not reduce the ban risk.** Read this first, above, applies unchanged:
+an unofficial protocol client is no more sanctioned than an automated browser.
+What it removes is fragility, not exposure.
+
+### Turning it on
+
+```bash
+openssl rand -hex 32   # a SECOND token, for WA_TRANSPORT_TOKEN
+```
+
+Set `WA_TRANSPORT_TOKEN` and `WA_TRANSPORT_URL=http://whatsapp-transport:8100` in
+`.env`, then bring it up and link the account — this is a **separate** linked
+device from the browser session, with its own QR:
+
+```bash
+docker compose up -d --build whatsapp-transport
+curl -sN -H "Authorization: Bearer $WA_TRANSPORT_TOKEN" \
+  http://127.0.0.1:8100/pair/qr        # server-sent events; the code rotates
+```
+
+Each `data:` line carries a fresh code — WhatsApp rotates it every ~20 s, which
+is why this is a stream and not a single response. Render one as a QR and scan it
+under **Linked devices**, or use the code-based flow instead:
+
+```bash
+curl -s -X POST -H "Authorization: Bearer $WA_TRANSPORT_TOKEN" \
+  -H 'Content-Type: application/json' -d '{"phone":"<your number, E.164>"}' \
+  http://127.0.0.1:8100/pair/phone
+```
+
+Then confirm the bridge is draining:
+
+```bash
+curl -s -H "Authorization: Bearer $WA_BRIDGE_TOKEN" \
+  http://127.0.0.1:8099/transport/status
+```
+
+Leaving `WA_TRANSPORT_URL` unset keeps everything on the DOM path; the
+`/transport/*` routes answer `503` and say so.
+
+### Two things to know before you rely on it
+
+**A gap is reported, never silent.** The outbox holds 50,000 messages by default
+and discards the oldest beyond that. Whatever it discarded is counted
+permanently and reported on every drain, and the bridge logs it loudly, because
+the alternative — an archive that is missing a week and looks merely quiet — is
+the failure that cannot be detected after the fact.
+
+**Some chats arrive twice, on purpose.** When the protocol has not yet given this
+account a stable key for someone, the transport supplies a provisional one
+derived from a digest (never their phone number). If a stable key arrives later,
+that is a second chat row for the same person, and **nothing in the payload links
+the two** — so the archive holds both and reports the count via
+`/transport/status` rather than merging them on a matching display name. Merging
+on a self-asserted name that two people can share would be a guess about whose
+correspondence belongs to whom.
+
+Your existing archive is migrated in place on first start (schema v1 → v2, three
+added columns). Chats ingested from the DOM keep their names and are
+distinguishable from protocol-addressed ones.
+
 ## Setup
 
 ```bash

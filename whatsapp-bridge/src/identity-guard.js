@@ -163,6 +163,81 @@ export function realIdentityStrings(env = {}) {
 }
 
 /**
+ * The address forms a contact identifier can take in this tree.
+ *
+ * ── Why this rule is structural and the name rule is not ────────────────────
+ * `realIdentityStrings` derives its forbidden set from configuration, because the
+ * operator's contacts' NAMES are only knowable from `.env`. Phone numbers are
+ * different: whatsmeow learns them from WhatsApp at run time, so there is nothing
+ * in the configuration to derive. A number the operator never configured is still
+ * a real person's number.
+ *
+ * So this half forbids the SHAPE. Two properties follow, and both are upgrades:
+ * it needs no configuration, so it never skips the way the name half does on CI
+ * and fresh clones; and it catches every contact rather than only the configured
+ * ones.
+ *
+ * ── Why bare digit runs are excluded ────────────────────────────────────────
+ * The same reasoning as `MINIMUM_IDENTIFYING_LENGTH`: a noisy guard is a disabled
+ * guard. Epoch milliseconds are thirteen digits, and this repository is full of
+ * them — as are byte counts, ids and version fragments. A rule matching any long
+ * digit run would fail on dozens of innocent lines on its first run and would be
+ * skipped within a day.
+ *
+ * The residual gap is real and is stated rather than hidden: `PhoneNumber()` in
+ * `whatsapp-transport/internal/identity` returns bare digits, so a fixture
+ * hand-built from its output would pass this scan. What closes that hole is the
+ * containment on the Go side — the field is unexported, so no `json.Marshal`,
+ * log line or `%#v` dump carries it by accident — not this regex.
+ *
+ * ── Why every pattern here is safe to write in this file ────────────────────
+ * None of them match their own source. Each requires literal digits adjacent to
+ * the address suffix, and the source text has metacharacters there instead. That
+ * matters because `no-real-identities.test.js` forbids exempting this file.
+ */
+const CONTACT_IDENTIFIER_PATTERNS = [
+  // The canonical whatsmeow user address, pre-LID. `c.us` is the legacy spelling
+  // and still appears in history-sync payloads.
+  { pattern: /\d{7,15}@(?:s\.whatsapp\.net|c\.us)\b/g, kind: "phone number" },
+
+  // A LID is pseudonymous, not anonymous: it is stable per person, so publishing
+  // one still links every message of theirs together. Reported under its own kind
+  // because the disclosure is weaker than a number and worth distinguishing.
+  { pattern: /\d{6,20}@lid\b/g, kind: "contact identifier" },
+
+  // E.164 as a human writes it. The leading `+` is what makes this precise
+  // enough to be worth having — it is absent from timestamps and byte counts.
+  { pattern: /\+\d(?:[\s().-]?\d){6,17}\b/g, kind: "phone number" },
+];
+
+/**
+ * Where `text` contains something that identifies a contact by address.
+ *
+ * Structural counterpart to `scanForRealIdentities`: same `{line, kind}` return,
+ * same refusal to include the matched string, and no configuration required.
+ *
+ * Group JIDs (`…@g.us`) are deliberately not flagged. A group id is not derived
+ * from anybody's number and reveals no person on its own, and flagging it would
+ * make every legitimate reference to a group in a fixture a failure.
+ *
+ * @returns {{line: number, kind: string}[]}
+ */
+export function scanForContactIdentifiers(text) {
+  if (!text) return [];
+
+  const hits = [];
+  for (const { pattern, kind } of CONTACT_IDENTIFIER_PATTERNS) {
+    // Fresh regex per call: a shared /g pattern carries `lastIndex` between
+    // calls, so the second file scanned would start mid-string and miss hits.
+    for (const match of String(text).matchAll(new RegExp(pattern.source, pattern.flags))) {
+      hits.push({ line: lineAt(text, match.index), kind });
+    }
+  }
+
+  return hits.sort((a, b) => a.line - b.line);
+}
+
+/**
  * Where `text` contains a real identity.
  *
  * Matching is case-insensitive, whitespace-collapsed (so line-wraps and irregular

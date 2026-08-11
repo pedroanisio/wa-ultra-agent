@@ -77,9 +77,30 @@ PRAGMA journal_mode = WAL;
 
 CREATE TABLE IF NOT EXISTS chats (
   id         INTEGER PRIMARY KEY,
+  -- The chat's ADDRESS, and the only handle anything above this file has on a
+  -- conversation. On the DOM path it is the name rendered in the sidebar; on the
+  -- protocol path it is the identity key (a LID, a group JID, or a pn: digest).
+  -- UNIQUE is load-bearing: every query and every agent tool passes one string
+  -- and expects it to mean one chat.
+  --
+  -- (No backticks anywhere in this block: SCHEMA is a template literal, so one
+  -- would end it and the rest of the file would be parsed as JavaScript.)
   name       TEXT NOT NULL UNIQUE,
   first_seen TEXT NOT NULL,
-  last_seen  TEXT NOT NULL
+  last_seen  TEXT NOT NULL,
+  -- The human-readable label, when the transport offers one. Deliberately NOT
+  -- the address: pushName is asserted by the sender's own device and changes
+  -- whenever they edit it, and two people can advertise the same one. Keying on
+  -- it would split a person's history the first time they renamed themselves.
+  display_name         TEXT,
+  -- Which kind of address the name column holds, or NULL for a chat that
+  -- predates the transport and is therefore addressed by a rendered display
+  -- name. This is what distinguishes the two eras in one table.
+  identity_kind        TEXT,
+  -- Set when the address is a pn: digest, meaning no LID was known when the chat
+  -- was first seen. Such a chat may be the same person as a LID-keyed one, and
+  -- the archive cannot tell -- see provisionalChats.
+  identity_provisional INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -517,7 +538,7 @@ export function parseSentAt(text, { order } = {}) {
  * The schema version this code expects. Bump it in the same commit as a new
  * entry in `MIGRATIONS`, never separately.
  */
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 
 export const ALIAS_ORIGINS = ["session", "message", "unknown"];
 
@@ -586,6 +607,25 @@ const MIGRATIONS = [
     "ALTER TABLE aliases ADD COLUMN origin TEXT NOT NULL DEFAULT 'unknown'",
     "ALTER TABLE aliases ADD COLUMN source_message_key TEXT REFERENCES messages(key)",
     "CREATE INDEX IF NOT EXISTS facts_live ON facts(retracted_at, subject)",
+  ],
+  // 1 → 2: let a chat be addressed by a protocol identity instead of a rendered
+  // name, now that `whatsapp-transport` supplies one.
+  //
+  // Additive on purpose. The obvious alternative — rebuild `chats` so `name` is a
+  // non-unique label and a new `identity_key` column becomes the address — models
+  // it more prettily and breaks everything above this file: `messagesFor(chat)`,
+  // `search({chat})`, `twin(chat)` and every agent tool pass a single string and
+  // could no longer resolve it to one row. The address stays unique; only what
+  // may FILL it has widened.
+  [
+    "ALTER TABLE chats ADD COLUMN display_name TEXT",
+    // No default and nullable: a chat that predates the transport has no identity
+    // kind, and inventing one would assert it was protocol-addressed when it was
+    // scraped from a sidebar.
+    "ALTER TABLE chats ADD COLUMN identity_kind TEXT",
+    // Defaulted, because "not provisional" is the truth for every existing row:
+    // a DOM-era chat is not a placeholder awaiting a LID.
+    "ALTER TABLE chats ADD COLUMN identity_provisional INTEGER NOT NULL DEFAULT 0",
   ],
 ];
 
@@ -686,6 +726,35 @@ export function openStore(
     return db.prepare("SELECT id FROM chats WHERE name = ?").get(name).id;
   };
 
+  /**
+   * The same upsert, for a chat the transport addressed by identity.
+   *
+   * Splitting this from `chatId` rather than widening it keeps the DOM path
+   * incapable of writing an identity kind: a rendered sidebar name is not an
+   * identity and must never be recorded as one.
+   *
+   * The display name is refreshed on every sighting because it is the sender's
+   * current self-description and the archive has no better one. The identity
+   * kind and the provisional flag are refreshed too — a chat first seen as a
+   * `pn:` digest stays keyed on that digest, but if the transport ever resolves
+   * it in place the row should stop claiming to be unsettled.
+   */
+  const identityChatId = ({ key, kind, provisional, displayName }) => {
+    const at = now();
+    db.prepare(
+      `INSERT INTO chats (name, first_seen, last_seen, display_name, identity_kind, identity_provisional)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(name) DO UPDATE SET
+         last_seen            = excluded.last_seen,
+         -- COALESCE, not a bare assignment: a payload that happens to carry no
+         -- push name must not erase a label the archive already had.
+         display_name         = COALESCE(excluded.display_name, chats.display_name),
+         identity_kind        = COALESCE(excluded.identity_kind, chats.identity_kind),
+         identity_provisional = excluded.identity_provisional`,
+    ).run(key, at, at, displayName ?? null, kind ?? null, provisional ? 1 : 0);
+    return db.prepare("SELECT id FROM chats WHERE name = ?").get(key).id;
+  };
+
   /** Today, as a plain date, from the injected clock. */
   const today = () => now().slice(0, 10);
 
@@ -778,6 +847,126 @@ export function openStore(
       }
 
       return { inserted, duplicates: messages.length - inserted };
+    },
+
+    /**
+     * Write a drained batch from `whatsapp-transport`.
+     *
+     * ── Why this is not `upsertMessages` ────────────────────────────────────
+     * Three things differ, and each would be a silent corruption if the two paths
+     * were merged:
+     *
+     *   1. A batch spans chats. A drain is a queue read, not a chat read, so the
+     *      chat is a property of each row rather than of the call.
+     *   2. The timestamp is real. `upsertMessages` runs `parseSentAt` over a
+     *      rendered string like "8/3/2026" and may fail to date a row at all;
+     *      the protocol supplies an instant, and passing it through the guesser
+     *      would be a downgrade that can only lose.
+     *   3. The key is the protocol's message id, not a content hash. It is stable
+     *      across re-reads by construction, which is what `history.js` was
+     *      approximating.
+     *
+     * A row that cannot be stored is counted in `rejected` and skipped rather
+     * than aborting the batch: an entry drained from a queue of up to a thousand
+     * cannot be allowed to block the nine hundred behind it, and the caller's ack
+     * covers the whole range either way.
+     *
+     * @param rows  Output of `toArchiveRow` in transport.js — that function owns
+     *              the protocol vocabulary, including placeholder rendering.
+     */
+    upsertTransportMessages(rows = []) {
+      const insert = db.prepare(
+        `INSERT OR IGNORE INTO messages
+           (key, chat_id, sender, sent_at, sent_at_iso, kind, text, outgoing,
+            duration_seconds, filename, caption, ingested_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      );
+
+      let inserted = 0;
+      let rejected = 0;
+      const chats = new Set();
+
+      db.exec("BEGIN");
+      try {
+        for (const row of rows) {
+          // The archive's UNIQUE key and the target of every provenance foreign
+          // key. A keyless row does not degrade the archive, it collides with
+          // every other keyless row.
+          if (!row?.key || !row?.chat?.key) {
+            rejected++;
+            continue;
+          }
+
+          const id = identityChatId(row.chat);
+          chats.add(row.chat.key);
+
+          const result = insert.run(
+            row.key,
+            id,
+            row.sender?.key ?? null,
+            row.sentAt ?? null,
+            row.sentAtIso ?? null,
+            row.kind || "unknown",
+            row.text || "",
+            row.outgoing === undefined ? null : row.outgoing ? 1 : 0,
+            row.durationSeconds ?? null,
+            row.filename ?? null,
+            row.caption ?? null,
+            now(),
+          );
+          if (result.changes > 0) inserted++;
+        }
+        db.exec("COMMIT");
+      } catch (error) {
+        db.exec("ROLLBACK");
+        throw error;
+      }
+
+      return {
+        inserted,
+        duplicates: rows.length - inserted - rejected,
+        rejected,
+        chats: [...chats],
+      };
+    },
+
+    /** What the archive knows about one identity-addressed chat. */
+    chatIdentity(name) {
+      return (
+        db
+          .prepare(
+            `SELECT name, display_name, identity_kind, identity_provisional, first_seen, last_seen
+             FROM chats WHERE name = ?`,
+          )
+          .get(name) ?? null
+      );
+    },
+
+    /**
+     * Chats still keyed on a `pn:` digest because no LID was known.
+     *
+     * These exist because the transport cannot tell the archive that a digest and
+     * a LID are the same person — the payload carries no link between the two
+     * forms. So both rows are kept and this method is how the gap gets stated.
+     * Merging them on a matching `display_name` would be a guess, and the thing
+     * being guessed at is whose correspondence belongs to whom.
+     */
+    provisionalChats({ limit = 100 } = {}) {
+      return db
+        .prepare(
+          `SELECT c.name, c.display_name, c.identity_kind, COUNT(m.id) AS messages
+           FROM chats c LEFT JOIN messages m ON m.chat_id = c.id
+           WHERE c.identity_provisional = 1
+           GROUP BY c.id
+           ORDER BY c.last_seen DESC
+           LIMIT ?`,
+        )
+        .all(limit);
+    },
+
+    /** The chat table's columns. For the migration tests, which must see the file. */
+    chatColumns() {
+      return db.prepare("SELECT name FROM pragma_table_info('chats')").all().map((r) => r.name);
     },
 
     messagesFor(chat, { limit = 200 } = {}) {
