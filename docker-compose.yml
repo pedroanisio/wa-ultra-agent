@@ -1,0 +1,107 @@
+# The bridge holds a live, authenticated WhatsApp session. It is deliberately
+# NOT published to the host: only the agent, on the internal network, can reach
+# it. To link the account you publish the port temporarily (see README).
+services:
+  whatsapp-bridge:
+    build: ./whatsapp-bridge
+    restart: unless-stopped
+    environment:
+      # Quoted: an unquoted ${VAR:?message} whose message contains ": " parses
+      # as a nested mapping and breaks the whole file.
+      WA_BRIDGE_TOKEN: "${WA_BRIDGE_TOKEN:?generate one with openssl rand -hex 32}"
+      # Sending stays off unless explicitly enabled, and an empty allowlist
+      # permits no one. Both defaults fail closed.
+      WA_ALLOW_SEND: "${WA_ALLOW_SEND:-false}"
+      WA_SEND_ALLOWLIST: "${WA_SEND_ALLOWLIST:-}"
+      # Nicknames the user actually says ("tonhão"), mapped to the chat name
+      # WhatsApp shows. A lookup convenience only — the resolved name still
+      # has to be on the allowlist.
+      WA_CONTACT_ALIASES: "${WA_CONTACT_ALIASES:-}"
+      # Self-notes: the agent writing to your own chat, for you to copy and
+      # paste. There is no allowlist because there is only one possible
+      # recipient — but the bridge must be told exactly which chat is yours, and
+      # writes nothing at all until it is. That unset default is the real gate;
+      # WA_ALLOW_SELF_NOTE only exists to switch the feature off entirely.
+      WA_SELF_CHAT_NAME: "${WA_SELF_CHAT_NAME:-}"
+      WA_ALLOW_SELF_NOTE: "${WA_ALLOW_SELF_NOTE:-true}"
+      # The archive of ingested messages. Defaults to /data/store.db in the
+      # image, so it lands on the volume rather than inside a container layer.
+      WA_STORE_PATH: "${WA_STORE_PATH:-/data/store.db}"
+      # Hard ceiling on browser interactions per hour. A safety limit: a
+      # backfill at machine speed is what gets an account banned.
+      WA_MAX_INTERACTIONS_PER_HOUR: "${WA_MAX_INTERACTIONS_PER_HOUR:-240}"
+      # Which number is the month in "8/3/2026". Normally unnecessary: any
+      # message dated past the 12th settles it for the whole account, and the
+      # evidence in the messages always wins over this. Set it only if a chat
+      # is so short that no date in it ever exceeds 12. Unset means undatable
+      # rows stay undated, which is the honest outcome — a guess here reorders
+      # a history by months and looks exactly like a correct one.
+      WA_DATE_ORDER: "${WA_DATE_ORDER:-}"
+      # Watching the chat list for arrivals. Detection is passive and free;
+      # REACTING opens chats unattended, which the four settings below bound.
+      # Off by default: upgrading should not silently make the agent reactive.
+      WA_WATCH_EVENTS: "${WA_WATCH_EVENTS:-false}"
+      WA_EVENT_COOLDOWN_MINUTES: "${WA_EVENT_COOLDOWN_MINUTES:-15}"
+      WA_EVENT_MAX_CHATS: "${WA_EVENT_MAX_CHATS:-3}"
+      WA_EVENT_MAX_SCROLLS: "${WA_EVENT_MAX_SCROLLS:-2}"
+      # UTC. Inside it the bridge reads nothing and reports nothing — a self-note
+      # is itself an interaction. Unset means no quiet hours, which is a choice.
+      WA_QUIET_HOURS: "${WA_QUIET_HOURS:-23:00-07:00}"
+      WA_HEADLESS: "${WA_HEADLESS:-false}"
+    volumes:
+      # The linked session. Losing this volume means scanning the QR again;
+      # copying it hands someone the account.
+      - whatsapp-profile:/data
+    expose:
+      - "8099"
+    ports:
+      # Loopback ONLY. You need host access to fetch /qr and to check /status,
+      # and every route but /health requires the bearer token. Binding this to
+      # 0.0.0.0 would put a live WhatsApp account on the network, so the
+      # 127.0.0.1 prefix is not optional — do not tunnel this port either.
+      - "127.0.0.1:8099:8099"
+    networks:
+      - internal
+    # WhatsApp Web is a heavy SPA; a starved container drops the session.
+    shm_size: "1gb"
+
+  agent:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      whatsapp-bridge:
+        condition: service_healthy
+    environment:
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:?set ANTHROPIC_API_KEY in .env}"
+      WA_BRIDGE_URL: "http://whatsapp-bridge:8099"
+      WA_BRIDGE_TOKEN: "${WA_BRIDGE_TOKEN:?set WA_BRIDGE_TOKEN in .env}"
+      # The UI gate. An agent that can read and send your WhatsApp must never
+      # be reachable without a password, so the channel throws when this is unset.
+      WA_UI_PASSWORD: "${WA_UI_PASSWORD:?set WA_UI_PASSWORD in .env}"
+      WA_UI_USERNAME: "${WA_UI_USERNAME:-me}"
+      # Voice-note transcription runs from the agent, not the bridge. Unset
+      # leaves voice notes listed but unreadable, which is a working state.
+      # Unset URL leaves voice notes listed but unread, which is a working
+      # state — so this does NOT use ${VAR:?} and refuse to start.
+      WA_TRANSCRIBE_URL: "${WA_TRANSCRIBE_URL:-}"
+      WA_TRANSCRIBE_MODEL: "${WA_TRANSCRIBE_MODEL:-gpt-transcribe}"
+      # Only needed for a non-OpenAI endpoint. When WA_TRANSCRIBE_URL points at
+      # api.openai.com the key below is inherited automatically — and it is
+      # never sent anywhere else.
+      WA_TRANSCRIBE_KEY: "${WA_TRANSCRIBE_KEY:-}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      # Read-only calendar feed. The URL is a credential in its own right.
+      WA_CALENDAR_ICS_URL: "${WA_CALENDAR_ICS_URL:-}"
+      PORT: "3000"
+      HOST: "0.0.0.0"
+    ports:
+      - "127.0.0.1:3000:3000"
+    networks:
+      - internal
+
+volumes:
+  whatsapp-profile:
+
+networks:
+  internal:
+    driver: bridge

@@ -1,0 +1,14 @@
+# The linked WhatsApp session must never enter a build context, let alone an
+# image layer: an image carrying it hands the account to anyone who pulls it.
+whatsapp-bridge/data/
+**/profile/
+
+.env
+.env.local
+*.png
+
+node_modules
+**/node_modules
+.eve
+.output
+.git

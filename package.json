@@ -1,0 +1,30 @@
+{
+  "name": "whatsapp-agent",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "imports": {
+    "#*": "./agent/*"
+  },
+  "scripts": {
+    "build": "eve build",
+    "agent:dev": "eve dev",
+    "bridge:dev": "cd whatsapp-bridge && npm run start:xvfb",
+    "test": "node --test",
+    "typecheck": "tsc",
+    "eval": "eve eval"
+  },
+  "dependencies": {
+    "@ai-sdk/anthropic": "^4.0.36",
+    "ai": "^7.0.38",
+    "eve": "^0.31.3",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "24.x",
+    "typescript": "7.0.2"
+  },
+  "engines": {
+    "node": "24.x"
+  }
+}
