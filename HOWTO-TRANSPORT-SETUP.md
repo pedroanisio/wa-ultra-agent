@@ -172,7 +172,7 @@ three configuration refusals, and each names its own fix:
 |---|---|---|
 | `WA_TRANSPORT_TOKEN is required` | Token empty or absent from `.env` | Step 2 |
 | `WA_TRANSPORT_DIR is required (…)` | `WA_TRANSPORT_DIR` unset | Compose sets `/data`; restore it if edited |
-| `sendguard: WA_TRANSPORT_SEND_ALLOWLIST entry is not a usable address …: Marcela` | A display **name** in the allowlist | Empty it for now; Step 9 uses JIDs |
+| `sendguard: WA_TRANSPORT_SEND_ALLOWLIST entry is not a usable address …: <contact-name>` | A display **name** in the allowlist | Empty it for now; Step 9 uses JIDs |
 
 **If `/status` returns `{"error":"unauthorized"}`:** the token in your shell
 differs from the container's. Re-run `set -a; . ./.env; set +a` and
@@ -204,7 +204,7 @@ db.prepare("INSERT INTO outbox (payload, enqueued_at) VALUES (?, ?)").run(
   JSON.stringify({key:"3EB0SMOKETEST01",
     chat:{key:"smoke-fixture@lid",kind:"lid",provisional:false},
     sender:{key:"smoke-fixture@lid",kind:"lid",provisional:false},
-    pushName:"Marcela",outgoing:false,sentAt:"2026-08-11T09:05:00Z",
+    pushName:"<contact-name>",outgoing:false,sentAt:"2026-08-11T09:05:00Z",
     kind:"voice",text:"",durationSeconds:222,recognised:true,fromHistory:false}),
   new Date().toISOString());
 console.log("queued, depth:", db.prepare("SELECT COUNT(*) c FROM outbox").get().c);
@@ -411,7 +411,7 @@ To let the agent and yourself refer to a person by name, teach it an alias:
 ```bash
 curl -s -X POST -H "Authorization: Bearer $WA_BRIDGE_TOKEN" \
   -H 'Content-Type: application/json' \
-  -d '{"alias":"Marcela","canonical":"<the identity key from above>"}' \
+  -d '{"alias":"<contact-name>","canonical":"<the identity key from above>"}' \
   http://127.0.0.1:8099/people/alias
 ```
 
@@ -433,9 +433,9 @@ Set both gates in `.env`, then recreate both services:
 
 ```bash
 WA_ALLOW_SEND=true
-WA_SEND_ALLOWLIST=Marcela
+WA_SEND_ALLOWLIST=<contact-name>
 WA_TRANSPORT_ALLOW_SEND=true
-WA_TRANSPORT_SEND_ALLOWLIST=<the key for Marcela from /contacts>
+WA_TRANSPORT_SEND_ALLOWLIST=<the key for <contact-name> from /contacts>
 ```
 
 ```bash
@@ -448,7 +448,7 @@ Then send to yourself or a consenting recipient:
 
 ```bash
 curl -s -X POST -H "Authorization: Bearer $WA_BRIDGE_TOKEN" \
-  -H 'Content-Type: application/json' -d '{"to":"Marcela","message":"test"}' \
+  -H 'Content-Type: application/json' -d '{"to":"<contact-name>","message":"test"}' \
   http://127.0.0.1:8099/send
 ```
 
