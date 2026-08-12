@@ -20,6 +20,7 @@ and [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- reach each model through the endpoint that accepts its tools, and search the web (`c7edfa9`)
 - check the documentation against the code, in CI (`76c0b38`)
 - the queue you can act on, instead of a phone and a curl (`7039e82`)
 - the archive can say what period it covers, and obligations can be windowed by it (`779b712`)
@@ -42,6 +43,8 @@ and [Semantic Versioning](https://semver.org/).
 
 ### Documentation
 
+- scrub a real name from the quarantined draft (`21149ab`)
+- regenerate the changelog (`ae85b18`)
 - make every document describe the system that exists (`da153ae`)
 - say which name the send allowlist actually matches (`06dede8`)
 - update HOWTO-TRANSPORT-SETUP.md for contact name placeholders and add PRODUCT-DRAFT.md (`93d432b`)
