@@ -472,6 +472,56 @@ export const bridge = {
       signal,
     ),
 
+  /**
+   * Send an attachment of a given kind.
+   *
+   * `kind` is what decides how it ARRIVES: `voice` is a push-to-talk bubble with
+   * a waveform, `audio` is the same bytes as a file with a paperclip. The
+   * transport reads that one field and nothing else infers it, so a voice note
+   * sent as `audio` is not a slightly worse voice note — it is a different
+   * message.
+   */
+  /**
+   * The same, to the user's own chat.
+   *
+   * A separate route because the self chat is not a roster contact: it is the
+   * account itself, addressed by the transport from its own device store. There
+   * is no name to resolve and so no allowlist to consult — which is also why
+   * `/send/media` answers 404 for it rather than sending.
+   */
+  sendSelfMedia: (
+    params: {
+      dataBase64: string;
+      mimetype: string;
+      kind: "voice" | "audio" | "image" | "video" | "document" | "sticker";
+      caption?: string;
+      filename?: string;
+      durationSeconds?: number;
+    },
+    signal?: AbortSignal,
+  ) => call<{ id?: string; sent?: boolean; sentAt?: string }>(
+    "/send/self/media",
+    { method: "POST", body: JSON.stringify(params) },
+    signal,
+  ),
+
+  sendMediaAs: (
+    params: {
+      to: string;
+      dataBase64: string;
+      mimetype: string;
+      kind: "voice" | "audio" | "image" | "video" | "document" | "sticker";
+      caption?: string;
+      filename?: string;
+      durationSeconds?: number;
+    },
+    signal?: AbortSignal,
+  ) => call<{ id: string; sentAt?: string }>(
+    "/send/media",
+    { method: "POST", body: JSON.stringify(params) },
+    signal,
+  ),
+
   /* ---------------------------------------------------------------- *
    * Acting on a message that already exists.
    *
@@ -565,16 +615,39 @@ export const bridge = {
       archive?: { provisionalChats?: number };
     }>("/transport/status", {}, signal),
 
-  sendMessage: (to: string, message: string, signal?: AbortSignal) =>
+  /**
+   * Send text, optionally as a reply to a specific message.
+   *
+   * `quoted` is what makes an answer an answer: without it a reply lands in the
+   * chat as a new message and, in a group, as a non sequitur. `messageId` is the
+   * protocol's own id — the `key` on an archive row — and `sender` is who wrote
+   * the quoted message, which a group needs to attribute it.
+   *
+   * ── The return shape is the transport's, not the DOM path's ────────────────
+   * It used to be declared as `{sent, to, message, at, exactMatch, warning}`.
+   * Not one of those fields is returned any more: `warning` and `exactMatch`
+   * went when a near-miss stopped being warned about and started being refused
+   * (see `assertResolvedMatches`), and the rest were the browser path's. A type
+   * that promises fields the server does not send is worse than none — it reads
+   * as a contract and silently yields `undefined`.
+   */
+  sendMessage: (
+    to: string,
+    message: string,
+    options: { quoted?: { messageId: string; sender?: string } } = {},
+    signal?: AbortSignal,
+  ) =>
     call<{
-      sent: boolean;
-      to: string;
-      message: string;
-      at: string;
+      id: string;
+      sentAt: string;
       requestedRecipient: string;
-      exactMatch: boolean;
-      warning?: string;
-    }>("/send", { method: "POST", body: JSON.stringify({ to, message }) }, signal),
+      resolvedName: string | null;
+      via: "transport";
+    }>(
+      "/send",
+      { method: "POST", body: JSON.stringify({ to, message, quoted: options.quoted }) },
+      signal,
+    ),
 
   /**
    * Ask the phone for messages older than the archive already holds.
@@ -1015,14 +1088,23 @@ export const bridge = {
       bytes: Uint8Array;
       mimetype: string;
       caption?: string;
-      kind?: "image" | "document";
+      /**
+       * Which arm the attachment is sent in. The transport builds a different
+       * protobuf for each and uploads under a different MediaType, so this is
+       * not a label — a video sent as an image decrypts to nothing at the far
+       * end. `voice` is an audio marked PTT, which is the whole difference
+       * between somebody speaking and a file they attached.
+       */
+      kind?: "image" | "video" | "audio" | "voice" | "document" | "sticker";
       filename?: string;
       width?: number;
       height?: number;
+      /** Playing time, for audio and video. Omitted rather than guessed. */
+      durationSeconds?: number;
     },
     signal?: AbortSignal,
   ) =>
-    call<{ sent: boolean; to: string; at: string; exactMatch?: boolean }>(
+    call<{ id: string; sentAt: string; bytes: number; requestedRecipient: string; resolvedName: string | null }>(
       "/send/media",
       {
         method: "POST",
@@ -1037,6 +1119,7 @@ export const bridge = {
           filename: params.filename,
           width: params.width,
           height: params.height,
+          durationSeconds: params.durationSeconds,
         }),
       },
       signal,

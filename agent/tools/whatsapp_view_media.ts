@@ -2,6 +2,7 @@ import { defineTool, toolOutput, toolOutputPart } from "eve/tools";
 import { z } from "zod";
 
 import { BridgeError, bridge } from "../lib/bridge.ts";
+import { describeSize, fitsInContext } from "../lib/tool-output.ts";
 
 /**
  * Look at a photo, sticker or PDF that arrived in a chat.
@@ -18,7 +19,15 @@ import { BridgeError, bridge } from "../lib/bridge.ts";
 /** What Claude can actually read as a content part. */
 const VIEWABLE = /^(image\/(jpeg|png|gif|webp)|application\/pdf)$/;
 
-/** eve warns above 3 MiB, and a content part is re-sent on every later turn. */
+/**
+ * eve warns above 3 MiB, and a content part is re-sent on every later turn.
+ *
+ * That second clause is the expensive one and it is why the real ceiling is not
+ * here but in `tool-output.ts`: an attachment is not paid for once, it is paid
+ * for again on every subsequent turn of the conversation it appears in. A 3 MB
+ * photo base64-encodes to ~4 MB of text, which is more than a 1M-token window
+ * holds — and a turn that asked for something else entirely died of it.
+ */
 const MAX_BYTES = 3 * 1024 * 1024;
 
 export default defineTool({
@@ -37,7 +46,33 @@ export default defineTool({
   async execute({ key }, ctx) {
     try {
       const media = await bridge.fetchMedia({ key }, ctx.abortSignal);
-      return { ok: true as const, ...media, viewable: VIEWABLE.test(media.mediaType) };
+
+      // Measured before it is handed on, and the bytes are DROPPED rather than
+      // truncated when it does not fit. Half a JPEG is not a smaller picture:
+      // it is a corrupt one, described to the model as though it were the real
+      // thing. Refusing leaves the user able to ask for something else; a
+      // silently spent context window leaves the whole turn dead with a 400.
+      const verdict = fitsInContext(media.sizeBytes, { base64: true, what: "attachment" });
+      if (!verdict.ok) {
+        return {
+          ok: true as const,
+          tooLarge: true as const,
+          key,
+          mediaType: media.mediaType,
+          filename: media.filename,
+          sizeBytes: media.sizeBytes,
+          size: describeSize(media.sizeBytes),
+          viewable: false,
+          reason: verdict.reason,
+        };
+      }
+
+      return {
+        ok: true as const,
+        tooLarge: false as const,
+        ...media,
+        viewable: VIEWABLE.test(media.mediaType),
+      };
     } catch (error) {
       if (error instanceof BridgeError) return { ok: false as const, error: error.message };
       throw error;
@@ -49,6 +84,17 @@ export default defineTool({
       return {
         type: "text" as const,
         value: `Could not fetch that attachment: ${output.error}`,
+      };
+    }
+
+    if (output.tooLarge) {
+      return {
+        type: "text" as const,
+        value:
+          `That attachment is too large to look at: ${output.reason}\n\n` +
+          `It is ${output.size}${output.filename ? ` ("${output.filename}")` : ""} and was NOT loaded. ` +
+          "Tell the user what is there and that you cannot open it — do not guess at its contents, and " +
+          "do not retry, because it will be the same size next time.",
       };
     }
 

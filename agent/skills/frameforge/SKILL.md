@@ -47,6 +47,16 @@ wasted round trip, and there is a tool whose entire job is to prevent that:
 - `describe_capabilities(topic="rect")` — one type's fields and JSON schema.
 - `get_guide()` — the authoring reference, with the shape of a document.
 
+Two that catch everyone, both verified against the live SDK:
+
+```python
+linear_gradient([c0, c1], angle=135)     # a STOPS SEQUENCE, not two colour args
+main.ellipse([cx, cy], rx, ry, fill=...)  # centre + radii, NOT an [x, y, w, h] box
+```
+
+They are worth naming because both fail as a `TypeError` from inside your own
+code, which reads like a bug in what you wrote rather than a lookup you skipped.
+
 The skeleton that works, from the guide:
 
 ```python
@@ -69,6 +79,112 @@ print arrives as a thumbnail nobody can read without opening it.
 face with no error at all, and the layout you measured for collapses. Call
 `list_fonts(family="...")` before naming one, and read `resolves.exact`.
 
+## Making it good, not merely correct
+
+Everything below this line is about a page being *right*. This section is about
+it being worth looking at, and the difference is not taste — it is four
+libraries the SDK already ships that most authors never find. A page built
+without them is a page of default-grey boxes that validates perfectly.
+
+### Colour: mix in OKLab, never in hex
+
+`from frameforge_sdk import mix, ramp, delta_e, to_oklch`
+
+Interpolating two colours in sRGB drags the midpoint through mud — blue to
+yellow via grey-green is the classic. `mix(a, b, t)` and `ramp(stops, n)`
+default to **OKLab**, which is perceptually uniform, so the middle of a ramp
+looks like the middle:
+
+```python
+from frameforge_sdk import mix, ramp
+dusk = ramp(["#172a46", "#7b3f9d", "#f3c969"], 7)   # 7 even perceptual steps
+accent = mix("#172a46", "#f3c969", 0.5)             # not a muddy midpoint
+```
+
+`delta_e(a, b)` is the honest answer to "are these two colours too close to sit
+beside each other". Note the scale: it measures in **OKLab by default, not the
+classic 0–100 ΔE** — two near-identical navies come back ≈0.01 and deep blue
+against gold ≈0.6. Calibrate against a pair you can see rather than importing a
+threshold from elsewhere. A palette whose neighbours sit near the bottom of that
+range reads as one smear at thumbnail size, which is the size WhatsApp shows
+first.
+
+### Type: a scale, a measure, a margin
+
+`from frameforge_sdk.canon import modular_scale, measure_fits, content_box, caps_tracking`
+
+Sizes that were each chosen separately look like they were.
+`modular_scale(base, ratio=1.25)` returns a **named dict** — `caption`, `body`,
+`lead`, `h3`, `h2`, `h1`, `display` — so the scale is addressable rather than
+remembered:
+
+```python
+from frameforge_sdk.canon import modular_scale, measure_fits, content_box, caps_tracking
+t = modular_scale(18)          # {'caption': 18.0, 'body': 22.5, ... 'display': 68.66}
+title = t["h1"]; body = t["body"]
+```
+
+`measure_fits(chars_per_line)` returns a **bool** for the 45–75 band that makes
+prose readable — `measure_fits(62)` is True, `measure_fits(120)` is False. Check
+the column you are about to set, not the one you wish you had.
+`content_box(page_w, page_h, unit)` returns `(x, y, w, h)` for the book margin
+canon (inner 1½, top 2, outer 3, foot 4 — Johnston 1906) — `unit` is the module
+you are scaling from, so `content_box(1080, 1350, 48)` gives generous margins and
+`unit=1` gives you almost the whole page. A page laid out on the canon looks
+composed; four equal margins look like a form. `caps_tracking(font_size)` returns
+the letter-spacing all-caps needs (`caps_tracking(32)` → `1.92`), because caps at
+normal tracking are a wall.
+
+### Depth: gradients, then light
+
+`from frameforge_sdk.paint import linear_gradient, radial_gradient, conic_gradient, glow, neon, shadow, soft_shadow, rgba`
+
+Flat fills are what a page looks like when nobody decided anything. The
+vocabulary is there: three gradient kinds, `hatch`/`dots`/`grid_pattern` for
+texture, `glow`/`neon`/`soft_shadow` for light. Beyond those, `effect_stack(...)`
+applies ordered effects (kinds may repeat, first→last) and `appearance({...},
+...)` paints the same geometry once per pass, bottom→top — that is how one shape
+gets a dark base, a lit rim and a bloom without three overlapping objects.
+`turbulence(...)` and `blur_filter(...)` add grain and diffusion.
+
+**Effects have a backend dependency, and it is silent.** Rasterization prefers
+headless Chromium and falls back to CairoSVG, which "can [not] render effects
+fully". Every render reports which `backend` it used. If filters, blend modes or
+masks are material to the page, read that field — a soft-shadow that silently
+did not paint is a design you never actually saw.
+
+### Composition: let the layout compute
+
+`from frameforge_sdk import grid, inset, FlowBuilder`
+
+`inset(box, [v, h])` produces the content box; `grid(content, cols=3, count=5,
+gap=24)` produces the cells. Hand-computed x/y for a five-card row is how a
+layout ends up two pixels out of alignment in one place, which reads as
+sloppiness even to someone who cannot say why. For prose, `FlowBuilder` and
+`from_markdown(text)` paginate properly instead of you positioning paragraphs.
+
+### Shape the page for where it lands
+
+`canvas_presets` includes `phone`, `instagram-story`, `instagram-square`,
+`deck-16x9`, `A4`, `book-6x9` and more; `profiles` are `deck`, `book`, `letter`,
+`report`, `diagram`, `mixed`. Name the preset rather than typing pixel pairs —
+it carries the aspect the destination expects. For WhatsApp, tall beats wide:
+a `phone` or `instagram-story` page fills the preview, an A4 arrives as a
+thumbnail of a document.
+
+### The dead-corner trap
+
+A composition built only from shapes — an ellipse of colour, a ring, a burst —
+leaves whatever is behind it visible at the corners, and the default behind is
+black. Verified the hard way: a full-bleed chroma page rendered as a bright
+ellipse framed by four dead corners, `(0,0,0)` in all four.
+
+Paint a background rect over the whole canvas **first**, then lay everything
+over it, and mark anything meant to run past the edge `containment="allowed"` —
+that is consent for intentional bleed, not a clipping change. Then check the
+corners of the render, because that is where this defect always shows and the
+middle of the page always looks fine.
+
 ## A render that says `ok: true` can still be broken
 
 Four defects survive a glance at the page, so the result reports them as
@@ -78,6 +194,7 @@ numbers. Read them every time:
 |---|---|
 | `design.unpainted` | An object painted **no ink**. It is in the document, it validated, it is invisible. Nothing on the page to notice. |
 | `design.unreadable` | Contrast below WCAG, or type below the legible floor. The render is faithful and the reader still cannot read it. |
+| `design.health` / `render_warning` | **`contrast-unverified` is not a pass.** On a gradient, pattern or image ground the backdrop cannot be resolved from the SVG, so type is not scored at all — a verified page reports `0% verified` and says so. Exactly the beautiful pages this section encourages are the ones the automatic check goes blind on; read the raster yourself there. |
 | `design.collisions` | Text painted over text on the same layer. |
 | `diagnostics.overflow` | Content clipped by its frame, or a line wider than its column. The page looks fine and has lost a sentence off the edge. |
 

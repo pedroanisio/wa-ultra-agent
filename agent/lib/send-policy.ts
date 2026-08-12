@@ -98,3 +98,22 @@ export function sendApproval(
 ): ApprovalDecision {
   return commitsTheUser(input.toolInput?.message) ? "user-approval" : "not-applicable";
 }
+
+/**
+ * The policy for putting a GENERATED image in front of another person.
+ *
+ * It asks on the recipient rather than on the content, and that is the whole
+ * difference from `sendApproval`. There is no text to read for a commitment
+ * here: the payload is a picture a model invented, and the failure it can cause
+ * is not a promise the user did not make but a picture they never saw. A
+ * spelling error in a poster, a face that resembles someone, a detail nobody
+ * asked for — none of it is inspectable by a regular expression, and all of it
+ * is unrecallable once it is on a third party's phone.
+ *
+ * So: the user's own chat goes without asking, because it reaches nobody. Every
+ * other recipient costs one tap.
+ */
+export function imageSendApproval(input: { toolInput?: { to?: unknown } } = {}): ApprovalDecision {
+  const to = input.toolInput?.to;
+  return typeof to === "string" && to.trim() ? "user-approval" : "not-applicable";
+}

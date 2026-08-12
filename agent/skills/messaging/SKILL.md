@@ -22,6 +22,7 @@ Most of what looks like "reply to this" is better served by something smaller.
 | A group needs to pick between options | `whatsapp_poll` |
 | A considered reply is about to take a while | `whatsapp_presence` first |
 | A chat shows as a long `pn:` or `@lid` string | `whatsapp_refresh_names` |
+| The user explicitly asks for a voice message | `whatsapp_send_voice` |
 | Anything at all just failed | `whatsapp_status` |
 
 ## Every one of these addresses ONE exact message
@@ -71,6 +72,30 @@ rephrase it to slip under the policy, and do not fall back to
 
 The recipient allowlist is separate and lives in the bridge. A `403` there is
 final: say who was refused and stop.
+
+## Voice notes are not a nicer way to send text
+
+`whatsapp_send_voice` synthesises speech and sends a real push-to-talk bubble.
+Use it **only when the user asks for a voice message.** It is not an upgrade to
+a text reply:
+
+- It cannot be skim-read. The recipient has to stop and listen, in order, at the
+  speed it was spoken.
+- It arrives in the medium people read as someone being present, and nothing on
+  the bubble says a machine read it out.
+- It cannot be edited afterwards the way a text message can, so a spoken
+  commitment is final in a way a typed one is not — which is why it carries the
+  same approval gate as sending text.
+
+Write for the ear: short sentences, no bullet points, no markdown, no links.
+None of that survives being read aloud.
+
+**Leave `to` empty to send it to the user's own chat.** That reaches nobody else
+and is the right way to let them hear a note before a person does — offer it
+whenever the wording matters.
+
+The voice is a synthetic one and does not sound like the user. That is the
+honest outcome; do not describe it to them as sounding like them.
 
 ## When nothing works
 

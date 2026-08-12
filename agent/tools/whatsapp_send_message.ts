@@ -27,9 +27,10 @@ export default defineTool({
     "Send a WhatsApp message. This is IRREVERSIBLE — the recipient sees it immediately. " +
     "Only recipients on the operator's allowlist can be messaged; anyone else is refused with a 403, which " +
     "is a deliberate guard and not something to work around. Prefer a chat name taken from " +
-    "whatsapp_list_chats: the name is matched by WhatsApp's own fuzzy search, and the result reports " +
-    "`resolvedRecipient` plus `exactMatch` so you can see who was actually messaged. If `exactMatch` is " +
-    "false, tell the user which chat it went to. Write the message in the user's voice and in the language " +
+    "whatsapp_list_chats: names are resolved against the contact roster, and a name that resolves to a " +
+    "DIFFERENT chat than the one asked for is refused outright rather than sent with a warning — so a " +
+    "success means it reached the chat you named. The result reports `resolvedName`. Write the message " +
+    "in the user's voice and in the language " +
     "of the conversation; never add a signature or disclaimer they did not ask for.",
   inputSchema: z.object({
     to: z
@@ -45,6 +46,22 @@ export default defineTool({
       .min(1)
       .max(4000)
       .describe("The exact text to send. Newlines are preserved as line breaks within one message."),
+    replyTo: z
+      .string()
+      .optional()
+      .describe(
+        "The `key` of the message this is a reply to, taken from whatsapp_read_chat or " +
+          "whatsapp_search_archive. Use it whenever you are answering something specific: in a group " +
+          "an unattached answer arrives as a non sequitur, because nobody can tell which of the last " +
+          "ten messages it addresses. Leave it out for a message that opens a subject.",
+      ),
+    replyToSender: z
+      .string()
+      .optional()
+      .describe(
+        "Who wrote the message being replied to, as their identity key. Only needed in a GROUP, where " +
+          "it is what attributes the quote to the right person. Ignored in a one-to-one chat.",
+      ),
   }),
   /**
    * Commitment-shaped messages stop for a human; ordinary ones do not.
@@ -55,9 +72,14 @@ export default defineTool({
    */
   approval: sendApproval,
 
-  async execute({ to, message }, ctx) {
+  async execute({ to, message, replyTo, replyToSender }, ctx) {
     try {
-      return await bridge.sendMessage(to, message, ctx.abortSignal);
+      // `{}` is the options slot that now carries `quoted`; the signal stays last.
+      // A quote is only attached when a message was actually named: an empty
+      // ContextInfo marks the message as a reply to nothing, which renders as a
+      // broken quote bubble rather than as a plain message.
+      const quoted = replyTo ? { messageId: replyTo, sender: replyToSender } : undefined;
+      return await bridge.sendMessage(to, message, { quoted }, ctx.abortSignal);
     } catch (error) {
       if (error instanceof BridgeError) {
         return {

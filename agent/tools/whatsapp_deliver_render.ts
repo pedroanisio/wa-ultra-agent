@@ -111,9 +111,10 @@ export default defineTool({
         );
         return {
           ok: true as const,
-          destination: sent.to ?? to,
+          // `to` was the DOM path's echo of the recipient and is no longer
+          // returned; `resolvedName` is the chat the roster actually matched.
+          destination: sent.resolvedName ?? to,
           self: false as const,
-          exactMatch: sent.exactMatch ?? true,
           kind: artifact.kind,
           bytes: bytes.byteLength,
           unverified: !health.verified,
@@ -135,7 +136,6 @@ export default defineTool({
         ok: true as const,
         destination: written.chat,
         self: true as const,
-        exactMatch: true,
         kind: artifact.kind,
         bytes: bytes.byteLength,
         unverified: !health.verified,
@@ -171,9 +171,6 @@ export default defineTool({
         ? `${what} (${size}) is in the user's own chat — it is on their phone now.`
         : `${what} (${size}) was SENT to "${output.destination}". It cannot be recalled.`,
     ];
-    if (!output.self && !output.exactMatch) {
-      lines.push(`The name matched loosely: it went to "${output.destination}". Tell the user which chat.`);
-    }
     if (output.unverified) {
       lines.push(
         "No diagnostics file was found for that session, so the render was NOT machine-checked. Say so.",

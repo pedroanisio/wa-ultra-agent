@@ -379,6 +379,42 @@ turning screenshots back into vectors; the allowlist is in
 
 Configuration lives in the `frameforge` section of `.env.example`.
 
+## Generating a picture
+
+A page is not the same request as a picture. When what is wanted does not exist
+yet — an illustration for a message, a sticker, a logo, a card — the
+`image-generation` skill draws one with OpenAI's image model.
+
+It is two tools, and the split is the design. `whatsapp_generate_image` draws the
+picture, stores it, hands it back as a content part and **sends nothing**;
+`whatsapp_send_image` sends the stored image by its id. The gap between them is
+where the model looks at what it made.
+
+That gap is the verification layer (PALS's Law). A generated image *is* model
+output and fails the way model output fails — text in the picture comes out
+misspelled or as letter-shaped noise, counts come out wrong, things appear that
+nobody asked for — and the API reports none of it, because the response is a
+`200` with a picture in it. There is no diagnostic to read here as there is for a
+render, so the check is the looking, and a tool that generated and sent in one
+call would have sent the picture before anyone could look.
+
+What *is* checked in code is the envelope: the response is decoded rather than
+forwarded, and bytes that are not a PNG, JPEG or WebP — a link instead of a
+payload, an empty string, an error page from something in front of the API — are
+refused before they can become a broken attachment on somebody's phone.
+
+Sending to the user's own chat is unremarkable; sending to anyone else pauses for
+approval, because a generated image arrives in the same bubble a photograph
+arrives in and the recipient has nothing to tell them a machine drew it. That is
+the user's call, so they see it first. Pictures of real people are out of scope
+by instruction, and anything whose words must be correct is a document, not an
+image — image models cannot spell.
+
+Set `OPENAI_API_KEY` and it works; leave it unset and the tools are simply
+unavailable, which is a working state. Only the prompt is uploaded — no message,
+no contact and no image from a chat. Configuration is in the **Generated images**
+section of `.env.example`.
+
 ## Tests
 
 ```bash

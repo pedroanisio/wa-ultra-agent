@@ -169,17 +169,21 @@ test("a PDF for a contact goes out as a document, through the allowlisted route"
   }
 });
 
-test("a loose name match is reported, because the send already happened", async () => {
+test("the chat it actually landed in is what gets reported", async () => {
   await session("report", CLEAN, { name: "document.pdf", bytes: Buffer.from("%PDF-1.7") });
-  const fake = capture({ sent: true, to: "Ana Paula", at: "now", exactMatch: false });
+  // A near miss is refused by the bridge now rather than warned about here, so
+  // a reply that comes back at all is one that reached the chat. What is left to
+  // get wrong is reporting the string the tool was HANDED: `resolvedName` is the
+  // chat, and the two differ whenever the roster spells the name differently.
+  const fake = capture({ id: "1", sentAt: "now", requestedRecipient: "ana", resolvedName: "Ana Paula" });
   try {
     const deliver = await tool();
     const result = await deliver.execute(
-      { uri: "frameforge://session/report/document.pdf", to: "Ana", force: false },
+      { uri: "frameforge://session/report/document.pdf", to: "ana", force: false },
       ctx,
     );
 
-    assert.match(deliver.toModelOutput(result).value, /matched loosely/);
+    assert.equal(result.ok, true);
     assert.match(deliver.toModelOutput(result).value, /Ana Paula/);
   } finally {
     fake.restore();

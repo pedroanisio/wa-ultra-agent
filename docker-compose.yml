@@ -198,6 +198,26 @@ services:
       # leaves voice notes listed but unreadable, which is a working state.
       # Unset URL leaves voice notes listed but unread, which is a working
       # state — so this does NOT use ${VAR:?} and refuse to start.
+      # Speech synthesis, for voice notes. ElevenLabs is preferred when its key
+      # is present — it is the difference between a voice and a narrator — and
+      # OpenAI is the fallback. Neither set means voice notes are unavailable,
+      # which is a working state: nothing else depends on them.
+      # Three spellings are in circulation; all are read, first non-empty wins.
+      ELEVENLABS_API_KEY: "${ELEVENLABS_API_KEY:-}"
+      ELEVEN_LABS_API_KEY: "${ELEVEN_LABS_API_KEY:-}"
+      XI_API_KEY: "${XI_API_KEY:-}"
+      # The id of a voice on your ElevenLabs account, NOT its display name.
+      # GET https://api.elevenlabs.io/v1/voices lists them.
+      WA_ELEVENLABS_VOICE_ID: "${WA_ELEVENLABS_VOICE_ID:-}"
+      # A voice NAME works too, resolved against the account (a unique prefix is
+      # enough). An ambiguous one is refused rather than guessed.
+      WA_ELEVENLABS_VOICE: "${WA_ELEVENLABS_VOICE:-}"
+      # Must handle Portuguese. An English-only model does not refuse it, it
+      # reads it with an English mouth — which ships and sounds wrong.
+      WA_ELEVENLABS_MODEL: "${WA_ELEVENLABS_MODEL:-eleven_multilingual_v2}"
+      # Force one provider when both keys are present. Normally unset.
+      WA_SPEECH_PROVIDER: "${WA_SPEECH_PROVIDER:-}"
+      WA_SPEECH_VOICE: "${WA_SPEECH_VOICE:-}"
       WA_TRANSCRIBE_URL: "${WA_TRANSCRIBE_URL:-}"
       WA_TRANSCRIBE_MODEL: "${WA_TRANSCRIBE_MODEL:-gpt-transcribe}"
       # Only needed for a non-OpenAI endpoint. When WA_TRANSCRIBE_URL points at
@@ -205,6 +225,16 @@ services:
       # never sent anywhere else.
       WA_TRANSCRIBE_KEY: "${WA_TRANSCRIBE_KEY:-}"
       OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      # Image generation, from the same key. Unset leaves it unavailable, which
+      # is a working state — no other tool depends on it. Only the prompt is
+      # uploaded; no message and no image from a chat ever is.
+      WA_IMAGE_MODEL: "${WA_IMAGE_MODEL:-gpt-image-1}"
+      WA_IMAGE_QUALITY: "${WA_IMAGE_QUALITY:-medium}"
+      WA_IMAGE_URL: "${WA_IMAGE_URL:-}"
+      # Scratch space for a picture between being drawn and being sent. Inside
+      # the container and deliberately not on a volume: a generated image is
+      # kept only long enough to be looked at and sent.
+      WA_IMAGE_DIR: "${WA_IMAGE_DIR:-/tmp/wa-images}"
       # Read-only calendar feed. The URL is a credential in its own right.
       WA_CALENDAR_ICS_URL: "${WA_CALENDAR_ICS_URL:-}"
       # The document renderer. Unset is a working state: the connection simply

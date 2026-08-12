@@ -34,6 +34,17 @@ ENV NODE_ENV=production \
     PORT=3000 \
     HOST=0.0.0.0
 
+# ffmpeg, for one thing only: turning synthesised speech into the OGG/Opus a
+# WhatsApp voice note actually is. Nothing else in the image needs it, and the
+# alternative — an audio library in npm — would be a decoder written in
+# JavaScript to do what the system codec already does correctly.
+#
+# `--no-install-recommends` matters here: the full recommends pull is roughly
+# 400 MB of X11 and fonts for a container that never draws anything.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
 # .output is the self-contained Nitro bundle; .eve carries the compiled agent
 # manifest naming the tools and the whatsapp skill.
 COPY --from=builder --chown=node:node /app/.output ./.output

@@ -21,9 +21,12 @@ Because there is no confirmation step, two habits matter more:
 
 - **Use exact names.** Take the chat name from `whatsapp_list_chats` rather than
   a name the user typed loosely. Search is fuzzy: "Ana" opens "Ana Paula".
-- **Read `exactMatch` in the result.** When it is false, tell the user which
-  chat the message actually went to. It has already been sent, so this is a
-  report, not a question.
+- **A near-miss is refused, not reported.** The bridge used to send on a loose
+  name match and hand back `exactMatch: false` for you to mention afterwards.
+  It no longer does: if the name resolves to a chat that is not the one asked
+  for, the send fails with a 409 and nothing goes out. So there is no warning to
+  read — there is either a sent message or an error naming both chats, and the
+  error is the one to relay.
 
 Send once. If a call errors, check `whatsapp_status` before retrying — a send
 that timed out may still have been delivered, and resending duplicates it.
