@@ -1,3 +1,13 @@
+---
+disclaimer:
+  notice: >-
+    No information within this document should be taken for granted.
+    Any statement or premise not backed by a real logical definition
+    or verifiable reference may be invalid, erroneous, or a hallucination.
+  generated_by: "Human-authored; reviewed with Claude Opus 5 via Claude Code"
+  date: "2026-08-12"
+---
+
 # whatsapp-agent
 
 An eve agent with access to your personal WhatsApp, through WhatsApp's own
@@ -567,6 +577,11 @@ default.
 | `GET /health` | Liveness. `{ok, transport}`. No auth — it answers before the token check, so it must reveal nothing about the account |
 | `GET /status` | `{archive, transport}` — what this service holds, and whether a transport is configured |
 | `GET /transport/status` | The transport's own state: paired, connected, queue depth, dropped |
+| `POST /transport/connect` | Bring the protocol session up without waiting for the next retry |
+| `GET /transport/contacts` | The roster the transport itself resolves — **the only names `/send` will match.** Check a name here before putting it on `WA_SEND_ALLOWLIST`; the archive can file the same person under a different one |
+| `POST /transport/pair/phone` | `{phone}` → a pairing code you type into the handset. Short-lived and useless without the phone, so it is safe over loopback |
+| `GET /transport/pair/qr` | The rotating QR payload, as an event stream. Proxied so the agent's UI can render it **without holding the transport token** — that token also sends messages, and this route cannot |
+| `POST /transport/drain` | `{limit}` → drain the inbound outbox once, on demand. The interval drain is automatic; this is the one whose outcome you can see |
 | `POST /send` | `{to, message, quoted}` → sends over the protocol (allowlisted only). `quoted: {messageId, sender}` makes it a reply to that message rather than just a message into the chat |
 | `POST /send/media` | `{to, dataBase64, mimetype, kind, caption, filename, width, height, durationSeconds}` → an attachment, for an allowlisted recipient. `kind` is `image` (default), `video`, `audio`, `voice`, `document` or `sticker` |
 | `POST /send/reaction` | `{to, messageId, emoji}` → reacts to a message. An **empty** emoji removes the reaction; that is WhatsApp's own way of undoing one, not a missing field |
@@ -582,6 +597,12 @@ default.
 | `GET /media?key=` | One message's media, by the protocol's own message id |
 | `POST /history` | `{chat, oldestId, oldestTimestamp, count}` → ask your phone for older messages |
 | `GET /archive/search` | Keyword search, with `sender` / `since` / `until` / `kind` / `outgoing` / `order` |
+| `GET /archive/chats` | `?limit=` → the archived conversations, newest first. Reads SQLite, never WhatsApp |
+| `GET /archive/messages?chat=` | Saved messages for one chat. **Pass `newest=1`** — without it a limit of 20 over a long chat returns its twenty *oldest* messages, which reads as an empty conversation |
+| `GET /archive/context?key=` | The messages either side of one saved message, so a search hit can be read in context. `before` / `after` set the span |
+| `GET /archive/attention` | Everything currently needing attention — overdue, upcoming, owed, unanswered. `horizonDays` sets how far ahead "upcoming" reaches |
+| `POST /archive/extractions/resolve` | `{id, status}` → mark one obligation `done` or `dropped` |
+| `POST /archive/names/refresh` | Re-resolve chats still filed under a provisional `pn:` / `@lid` key. Names arrive late on this protocol, so a chat read just after pairing can be nameless. Relabels only; sends nothing |
 | `GET /archive/stats` | Counts **and `span`** — the oldest and newest message the archive holds, the days between, and how many messages carry no usable timestamp and so fall outside that range |
 | `GET /archive/extractions` | Obligations, with `since` / `until` windowing **when something was said** (`dueBefore` windows when it is due — a different question) |
 | `GET /archive/facts` · `POST /archive/facts` | Facts, each citing a message. Retracted ones are excluded |
@@ -590,6 +611,8 @@ default.
 | `GET /archive/prune` · `POST /archive/prune` | Apply the retention policy. **Defaults to a dry run** — pass `{"dryRun": false}` to actually delete |
 | `GET /archive/transcript` · `POST /archive/transcript` | A voice note's transcript, filed against its message |
 | `GET /people/dossier?name=` | One person: activity, aliases, facts, obligations |
+| `GET /people/resolve?name=` | Which chat a loose name refers to. Answers with one exact name, or the candidates when there is more than one — it never picks |
+| `GET /people/roster` | Everyone the archive knows, as the resolver sees them |
 | `GET /people/aliases?origin=` | Every alias and where it came from — which nicknames the agent taught itself |
 | `GET /twin?chat=` | One conversation's twin: measured behaviour, arcs, goals, contexts, staleness |
 | `POST /twin/model` | One modelling pass. Rejected whole if any item cites an unread message |
@@ -602,13 +625,16 @@ All except `/health` need `Authorization: Bearer $WA_BRIDGE_TOKEN`.
 
 ## Known limits
 
-- **Selectors are unversioned.** WhatsApp Web ships obfuscated classes that
-  change without notice. Every hook lives in `src/selectors.js` as an ordered
-  list of candidates, so a rename degrades one selector instead of breaking the
-  service — but a redesign will eventually need edits there. Archiving asserts
-  the hooks it depends on before it walks a chat and refuses with a `503` naming
-  the dead one, because the alternative failure is silent: a broken `messageRow`
-  reads every conversation as empty and reports the archive as complete.
+- **The protocol is unversioned, and that is now the only such risk.** This
+  limit used to be about CSS selectors: `src/selectors.js` held an ordered list
+  of hooks into WhatsApp Web's obfuscated markup, and a redesign would break
+  them. **That file is deleted** along with the rest of the browser path, so
+  there are no selectors to rot. What replaced the risk rather than removing it
+  is whatsmeow tracking an unofficial protocol: a protocol change breaks the
+  transport, not a stylesheet change. The failure mode is better — a transport
+  that cannot decode is loud and reports `events.unrecognisedTypes`, where a
+  dead selector was silent, reading every conversation as empty and reporting
+  the archive as complete.
 - **History is as deep as your phone.** Backfill is a request to the phone
   (`POST /history`), so the reachable depth is whatever it still holds — not
   whatever WhatsApp's servers hold. A short answer is a fact about the phone,

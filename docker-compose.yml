@@ -9,9 +9,9 @@ services:
   # what arrives in a durable outbox. The bridge drains that queue into the
   # archive; the agent never talks to this service.
   #
-  # Optional. Leave WA_TRANSPORT_TOKEN unset and the bridge keeps reading the DOM
-  # exactly as before — but then this service refuses to start, so comment it out
-  # too rather than running it unconfigured.
+  # REQUIRED, not optional. The DOM path this used to fall back to was deleted:
+  # with WA_TRANSPORT_TOKEN unset the transport refuses to start and the bridge
+  # has no way to receive or send anything at all. There is no "as before".
   whatsapp-transport:
     build: ./whatsapp-transport
     restart: unless-stopped
@@ -79,9 +79,9 @@ services:
       # UTC. Inside it the bridge reads nothing and reports nothing — a self-note
       # is itself an interaction. Unset means no quiet hours, which is a choice.
       WA_QUIET_HOURS: "${WA_QUIET_HOURS:-23:00-07:00}"
-      # Where to drain messages from. Unset means "there is no transport": the
-      # bridge reads the DOM as before and every /transport/* route answers 503.
-      # Setting it moves reception onto the protocol and sends through it too.
+      # Where to drain messages from. Unset means "there is no transport", and
+      # since the browser path was removed that leaves the bridge inert: every
+      # /transport/* route answers 503 and nothing is received or sent.
       WA_TRANSPORT_URL: "${WA_TRANSPORT_URL:-}"
       # The same secret the transport refuses to start without. Not defaulted from
       # WA_BRIDGE_TOKEN: two services sharing one token means rotating either one

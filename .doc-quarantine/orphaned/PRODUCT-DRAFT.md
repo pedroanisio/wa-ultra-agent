@@ -8,6 +8,17 @@ disclaimer:
   date: "2026-08-11"
 ---
 
+> **QUARANTINED 2026-08-12 — verification basis broken.**
+>
+> This document marks claims "✅ verified" against commit `640fba3` on branch
+> `master`. **Neither exists in this repository** (`git cat-file -t 640fba3`
+> fails; the default branch is `main`). Every ✅ mark is therefore unfalsifiable
+> and must be treated as UNVERIFIED until re-grounded against a real commit.
+>
+> The naming and product-framing work is unaffected and remains reusable.
+> See `quarantine-summaries.md`.
+
+
 # Product draft
 
 **Status.** A proposal, not a decision. Every claim about the current code was checked

@@ -1,0 +1,153 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "report": "doc-hygiene-report.md",
+  "summaries": "quarantine-summaries.md",
+  "generated_at": "2026-08-12T08:50:00-03:00",
+  "generated_by": "Claude Opus 5 (1M context) via Claude Code — doc-hygiene skill",
+  "repo": {
+    "name": "whatsapp-agent",
+    "commit": "06dede8",
+    "branch": "feat/model-registry-openai-luna",
+    "working_tree": "dirty",
+    "history_span": ["2026-08-10", "2026-08-12"]
+  },
+  "disclaimer": "Classifications are heuristic hypotheses derived from git metadata and structural comparison, not semantic understanding. Review every proposal before acting. No file has been moved or deleted.",
+  "totals": {
+    "artifacts": 21,
+    "markdown": 20,
+    "config_as_doc": 1,
+    "active": 15,
+    "drifted": 4,
+    "deprecated": 1,
+    "orphaned": 1,
+    "stale": 0
+  },
+  "proposals": [
+    {
+      "id": 1,
+      "path": "spec-draft.md",
+      "state": "DEPRECATED",
+      "confidence": "HIGH",
+      "lines": 775,
+      "commits": 1,
+      "last_modified": "2026-08-11T07:42:09-03:00",
+      "co_committed_with_code": false,
+      "evidence": [
+        {
+          "type": "explicit_supersession",
+          "source": "SPEC.md:3",
+          "quote": "Status: revision of `spec-draft.md`, re-grounded on this repository (eve `0.31.3`, 2026-08-10), then reconciled against the built code on 2026-08-10."
+        }
+      ],
+      "superseded_by": "SPEC.md",
+      "recommended_action": "archive",
+      "destination": ".doc-quarantine/deprecated/spec-draft.md",
+      "tldr": "Original architecture proposal, written before the transport approach was settled. Argues the tool surface — not the WhatsApp integration — is the product, a thesis the finished system kept. Its proposed mechanism was not kept: Meta WhatsApp Business Platform webhooks + Cloud API + WhatsApp Flows, with an OpenAI Responses-API tool runtime. The project instead built its own Go protocol transport speaking WhatsApp directly. Superseded in full by SPEC.md. Residual value is historical: the only record of which architecture was rejected and why."
+    },
+    {
+      "id": 2,
+      "path": "PRODUCT-DRAFT.md",
+      "state": "ORPHANED",
+      "confidence": "HIGH",
+      "lines": 279,
+      "commits": 2,
+      "last_modified": "2026-08-11T22:17:42-03:00",
+      "co_committed_with_code": false,
+      "evidence": [
+        {
+          "type": "missing_git_object",
+          "reference": "640fba3",
+          "check": "git cat-file -t 640fba3",
+          "result": "does not exist in this repository",
+          "impact": "Every claim marked '✅ verified' is unfalsifiable — the stated verification basis cannot be resolved."
+        },
+        {
+          "type": "missing_branch",
+          "reference": "master",
+          "actual": "main",
+          "impact": "Document cites a branch that does not exist in this repository."
+        }
+      ],
+      "superseded_by": null,
+      "recommended_action": "archive_or_reverify",
+      "destination": ".doc-quarantine/orphaned/PRODUCT-DRAFT.md",
+      "tldr": "Product-framing proposal translating the system's engineering vocabulary for a non-engineering audience. Explicitly self-labelled 'A proposal, not a decision'. Its problem is its epistemic device: every claim is marked verified against `master` at `640fba3`, a commit absent from this repository and a branch that does not exist here — so no verification mark can be checked by anyone. The naming and framing work remains reusable; only the verification marks are invalidated."
+    }
+  ],
+  "not_quarantined": [
+    {
+      "path": "CORPUS-FINDINGS.md",
+      "reason": "Point-in-time analysis artifact; self-declares snapshot date 2026-08-10. Judging by freshness is a category error.",
+      "recommendation": "Move to reports/ with date in filename so its nature is structural."
+    },
+    {
+      "path": "SURFACE_GAP_AUDIT.md",
+      "reason": "Point-in-time audit; anchor commit 5e8f88b verified present in repo.",
+      "recommendation": "Move to reports/ with date in filename; commit it (currently untracked)."
+    },
+    {
+      "path": "agent/skills/web-search/SKILL.md",
+      "reason": "Untracked but pairs with untracked working tool agent/tools/whatsapp_search_web.ts. New work, not dead weight.",
+      "recommendation": "Commit alongside the tool."
+    }
+  ],
+  "drift_findings": [
+    {
+      "doc": "SPEC.md",
+      "check": "6a. module references",
+      "verdict": "DRIFT",
+      "phantom_tools": ["whatsapp_get_unread", "whatsapp_merge_arcs"],
+      "missing_tools": [
+        "whatsapp_calendar", "whatsapp_console_pending", "whatsapp_edit_message",
+        "whatsapp_generate_image", "whatsapp_poll", "whatsapp_presence",
+        "whatsapp_react", "whatsapp_refresh_names", "whatsapp_retract_fact",
+        "whatsapp_revoke_message", "whatsapp_search_web", "whatsapp_send_image",
+        "whatsapp_send_voice", "whatsapp_tictactoe"
+      ],
+      "documented": 25,
+      "actual": 37
+    },
+    {
+      "doc": "README.md",
+      "check": "4a. route completeness",
+      "verdict": "DRIFT",
+      "documented": 33,
+      "actual": 47,
+      "phantom_routes": [],
+      "undocumented_routes": [
+        "/archive/attention", "/archive/chats", "/archive/context",
+        "/archive/extractions/resolve", "/archive/messages", "/archive/names/refresh",
+        "/people/alias", "/people/resolve", "/people/roster",
+        "/transport/connect", "/transport/contacts", "/transport/drain",
+        "/transport/pair/phone", "/transport/pair/qr"
+      ],
+      "undocumented_anywhere_in_repo": [
+        "/archive/chats", "/archive/names/refresh",
+        "/transport/connect", "/transport/contacts", "/transport/pair/phone"
+      ]
+    },
+    {
+      "doc": ".env.example",
+      "check": "5a. config completeness",
+      "verdict": "DRIFT",
+      "phantom_keys": [],
+      "undocumented_keys": [
+        "WA_AGENT_URL", "WA_BIND_HOST", "WA_CONSOLE_IDLE_MS", "WA_CONSOLE_MAX_TURNS",
+        "WA_CONSOLE_PUSH_TOKEN", "WA_CONSOLE_QUEUE_PATH", "WA_CONTEXT_WINDOW_TOKENS",
+        "WA_DATE_ORDER", "WA_ELEVENLABS_URL", "WA_LIVE_MODEL_TEST",
+        "WA_SPEECH_MODEL", "WA_SPEECH_URL", "WA_TOOL_BYTE_BUDGET"
+      ],
+      "excluded_system_vars": ["TMPDIR", "PORT", "NODE_ENV"],
+      "fixed_this_session": {
+        "commit": "06dede8",
+        "detail": "WA_SEND_ALLOWLIST comment claimed substring matching; the gate is whole-name equality (recipients.js:193)."
+      }
+    },
+    {
+      "doc": "CLAUDE.md",
+      "check": "project overview",
+      "verdict": "DRIFT",
+      "detail": "Unfilled template boilerplate; '<!-- [PROJECT] Replace this block -->' marker still present; documents `python -m lib.meta_reader` FLAM tooling with no lib/ directory and no Python in the repo."
+    }
+  ]
+}

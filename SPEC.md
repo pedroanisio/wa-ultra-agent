@@ -1,3 +1,13 @@
+---
+disclaimer:
+  notice: >-
+    No information within this document should be taken for granted.
+    Any statement or premise not backed by a real logical definition
+    or verifiable reference may be invalid, erroneous, or a hallucination.
+  generated_by: "Human-authored; reviewed with Claude Opus 5 via Claude Code"
+  date: "2026-08-12"
+---
+
 # whatsapp-agent — capability spec
 
 **Status:** revision of `spec-draft.md`, re-grounded on this repository (eve `0.31.3`, 2026-08-10),
@@ -64,9 +74,12 @@ The axis that matters for a ban is the **action** pattern, not observation. So t
 | Detecting that something changed | None — a DOM callback plus one `$$eval` | No. Runs continuously. |
 | Reading *what* changed | A chat open plus scrollbacks | Yes — cooldown, quiet hours, fan-out cap, interaction budget |
 
-Implemented in `whatsapp-bridge/src/watch.js` (rules, browser-free) and `serial.js` (the lock, moved
-out of `server.js` because the watcher is a second, non-HTTP path to the same browser). Wired to
-`agent/schedules/inbox-watch.md`.
+**Historical — `watch.js` was deleted with the browser path.** It held these rules for a watcher
+that polled the rendered chat list, and `serial.js` held the lock that kept it from driving the page
+concurrently with an HTTP request. Neither problem exists now: reception is pushed into a durable
+outbox by the transport, so there is no second path to the same browser to serialise, and no polling
+to pace. The pacing rules above are kept because they still describe **sending**, which remains rate
+limited. Wired to `agent/schedules/inbox-watch.md`.
 
 **This does reverse a stated constraint.** Reacting to an event spends browser interactions
 unattended, which §7's Level ladder and the daily digest both previously refused outright. The
@@ -127,7 +140,11 @@ The `/twin/*` group is archive-only: SQLite in, SQLite out, no page touched, so 
 from the interaction budget (§3.3) or can be refused for rate limits. That is what makes modelling a
 conversation something a schedule may do; reading one is not.
 
-Selector strategy is in `whatsapp-bridge/src/selectors.js`: never key on a class (WhatsApp ships
+**Historical — `selectors.js` was deleted with the browser path.** The strategy below is kept
+because it records *why* the DOM was never a safe source of truth, which is the argument that
+justified moving to the protocol transport:
+
+Selector strategy was in `whatsapp-bridge/src/selectors.js`, since deleted: never key on a class (WhatsApp ships
 obfuscated names), prefer element ids → `data-testid` → ARIA. Each hook is an ordered candidate
 list, so one upstream rename degrades a selector instead of breaking the service.
 
@@ -238,6 +255,19 @@ parameter, not a throughput parameter** — see §0.1. Design for:
 - a one-time historical backfill that is explicitly resumable and runs slower than the baseline;
 - hard caps on interactions per hour, enforced in the bridge, not the agent.
 
+The agent-facing half is one tool:
+
+```ts
+whatsapp_archive_chat({ chat, mode?: "top-up" | "backfill" })   // ✅
+```
+
+`top-up` stops as soon as it recognises a message already saved; `backfill` keeps going into
+history it has never seen. Each call does a bounded amount of work and returns `hasMore`, so the
+resumability above is expressed in the tool's return value rather than left to a caller's
+bookkeeping — and re-running it is free, because saved messages are recognised and skipped.
+`budgetExhausted` is how the §0.1 rate cap becomes visible to the agent instead of appearing as an
+unexplained stall.
+
 ### 3.4 Contact roster — `GET /contacts` ✖ not buildable
 
 **Abandoned, not deferred.** This asked for an enumeration of contacts and groups so §5.4 could
@@ -251,9 +281,13 @@ that make a display name behave like an identity are in `people.js`: rank by nam
 (never by recency, which is what opens the group "We" when asked for "Helena Braga"), and report
 ambiguity instead of guessing.
 
-### 3.5 Health of the scrape layer ✅
+### 3.5 Health of the scrape layer — historical
 
-**The pattern has a name.** `selectors.js` + `message-kind.js` + `history.js` are an
+**The scrape layer is gone.** Everything in this section describes the browser-era bridge and is
+retained as the reasoning that led to its removal, not as a description of what runs. `message-kind.js`
+and `history.js` survive, now fed by the protocol transport instead of a rendered page.
+
+**The pattern has a name.** The now-removed `selectors.js` + `message-kind.js` + `history.js` were an
 **Anti-Corruption Layer** in Evans's sense — WhatsApp's vocabulary on one side, this project's
 `{key, kind, outgoing, sent_at_iso}` on the other:
 
@@ -269,7 +303,7 @@ Naming it converts a coincidence into a commitment and gives review one rule: **
 three files should know a CSS selector**, so an upstream redesign breaks one place instead of five.
 
 **That rule does not hold yet, and the gap is measured rather than assumed.** `whatsapp.js` performs
-73 DOM references inside its `page.evaluate` and `$$eval` callbacks, and `session.js` reaches for
+73 DOM references inside its `page.evaluate` and `$$eval` callbacks, and the deleted `session.js` reached for
 `#pane-side` directly. `whatsapp.js` *does* import `SELECTORS` and `first()`, so the entry points go
 through the layer; what leaks is the DOM walking inside evaluate callbacks. It is therefore enforced
 as a **ratchet** rather than an assertion — `test/anti-corruption-layer.test.js` closes the set of
@@ -379,8 +413,20 @@ whatsapp_search_archive({                                                  // �
 })
 
 whatsapp_get_context({ key: string; before?: number; after?: number })     // ✅
-whatsapp_get_unread({ since?: string })                                    // ✅ (via list_chats)
+
+whatsapp_edit_message({ to, messageId, message })                          // ✅
+whatsapp_revoke_message({ to, messageId })                                 // ✅ delete for everyone
+whatsapp_react({ to, messageId, emoji })                                   // ✅ empty emoji un-reacts
+whatsapp_poll({ to, name?, options?, messageId?, vote? })                   // ✅ create, or vote in one
+whatsapp_presence({ to, state })                                           // ✅ composing / paused
+whatsapp_refresh_names()                                                   // ✅ relabels provisional keys
+whatsapp_console_pending()                                                 // ✅ drains the `/eve` queue
 ```
+
+The draft listed a `whatsapp_get_unread({ since })`. **It was never built and is not planned.**
+`whatsapp_list_chats` already returns an unread count per chat, so a second tool would have been a
+second way to ask one question — and the spec carrying its name implied a capability that nothing
+implemented. Unread state comes from `whatsapp_list_chats`.
 
 `whatsapp_search_archive` is the highest-value tool in the system, and it is worth recording how it
 failed rather than only that it now works. Every filter above was implemented in `store.search` and
@@ -455,7 +501,7 @@ failure this feature exists to prevent. So:
 1. Resolve the Self chat **once at login** and cache its exact title string.
 2. Before typing, read the open chat with the existing `openChatTitle(page)` and compare
    **exactly** — `===`, never `includes()`. Note `openChatTitle` reads the header's *innerText
-   first line*, not a `[title]` attribute: `selectors.js` records that the only `[title]` in that
+   first line*, not a `[title]` attribute: the removed `selectors.js` recorded that the only `[title]` in that
    header is the button label `"Profile details"`, so a title-based check silently reads the wrong
    string.
 3. If the comparison fails, **refuse and report**. Never fall back to `openChat()`, which types
@@ -475,8 +521,24 @@ and a self-note cannot reach anyone but you. `WA_ALLOW_SEND=false` remains the d
 **one message**, not twelve.
 
 **Side benefit.** Self-notes are ingested like any other message, so the agent's own output becomes
-part of personal state with provenance — *"what did I draft for Fabio last week?"* becomes
-answerable.
+part of personal state with provenance — *"what did I draft last week?"* becomes answerable.
+
+**The self chat is also a console.** Because it is a channel the user already has open on a phone
+they are already holding, it doubles as the input side: `/eve` mode routes what they type to the
+agent, and `whatsapp_console_pending` drains anything that arrived while the agent was unreachable.
+
+```ts
+whatsapp_tictactoe({ move? })   // ✅
+```
+
+A game is in the spec for one reason: it is the smallest honest test that the console loop is
+*actually* bidirectional. The user types `b2` in their own chat, the tool reads the chat, plays the
+move, answers it and writes the new board back — with the board state living in the chat itself
+rather than in the agent's memory. The model does not decide moves, track the board or judge
+legality; the tool does all three. Calling it with no argument takes whatever turn is pending and is
+safe to repeat, reporting `played: false` when nothing has been typed since the last board. That
+idempotence is the part worth specifying: a scheduled run that posts a duplicate final board is the
+failure this shape prevents.
 
 ### 5.3 Media ✅
 
@@ -487,6 +549,26 @@ capabilities — show it to the model, or transcribe it:
 whatsapp_view_media({ chat, fromEnd, kind, from?, time? })       // image | sticker | gif | document
 whatsapp_transcribe_voice({ chat, fromEnd, kind, from?, time? }) // voice | audio
 ```
+
+Media **out** is three more, and the split in the first pair is the load-bearing part:
+
+```ts
+whatsapp_generate_image({ prompt, size?, quality? })   // ✅ draws it; sends NOTHING, returns an id
+whatsapp_send_image({ id, to?, caption? })             // ✅ sends the one you looked at
+whatsapp_send_voice({ text, to?, voice? })             // ✅ a real PTT bubble, not an attachment
+```
+
+Generating and sending are separate tools on purpose. A generated image is model output: text in it
+comes out misspelled, counts come out wrong, and things appear that nobody asked for — and the API
+reports none of it as an error. Forcing the model to look at the result before it can send is the
+verification step PALS's Law demands, expressed as a tool boundary rather than an instruction that
+can be skipped. Anything whose words must be correct is a page (§5.11), not a picture.
+
+`whatsapp_send_voice` synthesises speech and re-encodes it to Opus/OGG with a duration measured
+from the encoded bytes — WhatsApp renders exactly that as a voice note, and anything else as a file
+with a paperclip. The duration is measured rather than carried over from the input because the
+encode can change the length, and the figure drawn under the waveform is a claim about the file
+that exists, not the one that was uploaded.
 
 `media_get`, `media_describe_image` and `media_extract_document` are all `whatsapp_view_media`: it
 returns the bytes as a content part, so a vision-capable model reads the photo or PDF directly
@@ -537,6 +619,15 @@ forever after, and it is a real person's life being described.
 ### 5.5 Commitments and waiting-for ✅
 
 The core product. Both sides of every obligation.
+
+```ts
+whatsapp_attention({ horizonDays? })   // ✅ the assembled view: overdue, upcoming, owed, unanswered
+```
+
+`whatsapp_attention` is the one that answers *"what needs me today"*, and its correct answer is very
+often **nothing**. It reports `total: 0` plainly rather than lowering its bar to produce a list,
+because a daily digest that manufactures an item to justify itself trains the user to stop reading
+it. Its coverage is bounded by what `whatsapp_extract_actions` has processed, which it states.
 
 Built as one pair of tools over one table rather than two parallel APIs — the two sides differ by
 `type`, not by machinery, and a second table would have doubled the provenance surface for nothing:
@@ -596,9 +687,16 @@ Bias the extractor toward silence and make its precision an eval gate (§7).
 ```ts
 memory_remember  →  whatsapp_remember_fact   // ✅ built, provenance-enforced (§5.4)
 memory_search    →  whatsapp_person          // ◐ recall by subject only, not free-text
-memory_forget                                // 📋 not built
+memory_forget    →  whatsapp_retract_fact    // ✅ built — a tombstone, not a delete
 memory_timeline({ entityId, start?, end? })  // 📋 not built — needs `entities` (§4)
 ```
+
+`memory_forget` is built as `whatsapp_retract_fact` and the naming difference is deliberate. It does
+not erase: the fact stops being recalled immediately, but the record that it was once believed is
+kept, so an answer given last week remains explicable. A required `reason` distinguishes the three
+cases that look identical afterwards — the fact was wrong, it went out of date, or it never was what
+the cited message said. Deleting the row would destroy exactly the evidence needed to audit a past
+answer.
 
 The provenance-carrying half is built and the entity-graph half is not, which is the right order:
 `facts` rows exist and cite their sources, so nothing recorded now has to be re-derived later.
@@ -628,10 +726,28 @@ Calendar (`search_events`, `get_availability`, `create_event`, `update_event`), 
 (`search`, `read`, `get_thread`, `draft`, `send`), files (`search`, `get`, `extract`, `store`,
 `link_to_entity`), web (`search`, `fetch`).
 
-**Web** needed no work: `web_search` and `web_fetch` are eve built-ins and were already available.
-What *did* need building is the draft's own rule — `personal knowledge ≠ internet knowledge` — now
-in `instructions.md` and gated by an eval. Answering a question about someone's life from a search
-result, in the same confident voice used for their own messages, is the quiet failure here.
+**Web** is `whatsapp_search_web` (Brave), and the earlier claim here that eve's built-in
+`web_search` "needed no work" was wrong — it is recorded rather than deleted because the reason it
+was wrong is the useful part. eve's `web_search` selects an AI Gateway provider (`exa` or
+`parallel`), and a direct provider model — which `agent.ts` uses — falls back to that provider's own
+server-side search. Neither path can be pointed at a Brave subscription, so the key gets its own
+tool.
+
+```ts
+whatsapp_search_web({ query, count?, freshness? })   // ✅ Brave
+whatsapp_calendar({ date?, start?, end? })           // ✅ read-only, see below
+```
+
+Two rules are enforced there rather than left to judgement: Brave's `<strong>` highlight markup is
+stripped (it is built to be rendered as HTML, and nothing downstream renders HTML — handed on
+untouched, the model quotes `&lt;strong&gt;` into somebody's chat), and a result with no openable
+link is dropped, because a snippet the user cannot check is a claim wearing a citation. Output is
+labelled untrusted every time: a search result is precisely the case where a stranger chooses the
+words knowing an agent may read them.
+
+What *also* needed building is the draft's own rule — `personal knowledge ≠ internet knowledge` —
+now in `instructions.md` and gated by an eval. Answering a question about someone's life from a
+search result, in the same confident voice used for their own messages, is the quiet failure here.
 
 **Calendar** is built, read-only, over a secret `.ics` URL rather than the Google Calendar API. That
 was the deciding constraint: the API needs an OAuth app registered, a consent screen and token

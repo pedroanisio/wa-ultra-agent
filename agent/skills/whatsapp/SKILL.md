@@ -192,35 +192,33 @@ run say nothing at all.
 
 ## Messages that arrive on their own
 
-`whatsapp_inbox_events` reports what has landed since the last check. The bridge
-watches the chat list passively and queues each change; the tool claims that
-queue and the bridge tops up the archive for whichever chats its own limits let
-it open.
+**There is no `whatsapp_inbox_events` tool.** This section used to describe one,
+and the mechanism it described — a bridge polling the rendered chat list and
+queueing each change — went with the browser when the DOM path was deleted. It is
+recorded here rather than quietly removed because a procedure that names a
+missing tool is an instruction to call nothing, and the next reader would
+otherwise reinvent it.
 
-You are not the one deciding how much to read. By the time the tool returns, the
-reads have happened and were bounded — several messages in one chat coalesce into
-one read, a chat inside its cooldown is not reopened, at most a few chats per
-wake, and every read draws from the same interaction budget an archive does.
+Reception is now **push**. The transport holds the protocol socket, so a message
+arrives as an event into a durable outbox and the bridge drains it on an
+interval. Nothing needs claiming, and nothing needs acknowledging: by the time
+you are asked, the archive already holds it.
 
-Four rules:
+So what has arrived is an ordinary question about the archive:
 
-- **`events: []` means nothing new.** One line if asked; on a scheduled run,
-  silence.
-- **`quiet: true` means stop.** The bridge is inside quiet hours and did nothing
-  deliberately. Write nothing, not even a self-note — writing one opens a chat and
-  types, which is exactly what the window prevents. Do not look for another way to
-  deliver it.
-- **A `preview` is a row snippet, not a message.** 160 characters, sender prefix
-  included. Never present it as a quotation. Where `read` shows the archive was
-  topped up you can search for the real wording; where a cooldown held the read,
-  say what arrived and from whom and stop there.
-- **Acknowledge last.** Pass `ack` with the keys only *after* the user has been
-  told. An unacked event is reported again, which is recoverable; an event acked
-  before delivery is gone.
+- `whatsapp_list_chats` — what is new, with unread counts and a one-line preview.
+  This is the answer to "who messaged me".
+- `whatsapp_read_chat` — what a conversation actually says.
+- `whatsapp_console_pending` — only for what the user typed *to you* in `/eve`
+  mode and that never reached you. It is the backstop, not the mechanism, and
+  **reading it empties it**, so answer everything it returns.
 
-A refusal here is the system working. A cooldown, a quiet window, or an exhausted
-interaction budget is a correct answer, and the limits exist because unattended
-browser activity is what gets the account banned. Never work around one.
+Two rules survive the change, because they were never about the browser:
+
+- **Nothing new is a real answer.** An empty chat list is one line if asked, and
+  silence on a scheduled run.
+- **A preview is a row snippet, not a message.** Never present one as a
+  quotation. If the wording matters, read the chat or search the archive.
 
 ## Names: resolve before you send
 

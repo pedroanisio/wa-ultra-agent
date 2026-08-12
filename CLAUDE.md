@@ -1,3 +1,13 @@
+---
+disclaimer:
+  notice: >-
+    No information within this document should be taken for granted.
+    Any statement or premise not backed by a real logical definition
+    or verifiable reference may be invalid, erroneous, or a hallucination.
+  generated_by: "Human-authored; reviewed with Claude Opus 5 via Claude Code"
+  date: "2026-08-12"
+---
+
 # CLAUDE.md — Project Guidelines
 
 <!--
@@ -42,17 +52,35 @@ Replace `<RELATIVE_PATH_TO_DISCLAIMER>` with the correct path for the file's dep
 
 ## Project Overview
 
-<!-- [PROJECT] Replace this block with a 1–3 sentence description and a directory tree. -->
-
-**Project Name** — brief description of purpose and scope.
+**whatsapp-agent** — an eve agent with access to a real personal WhatsApp account,
+over WhatsApp's own multi-device protocol. It reads the user's conversations,
+helps them catch up, drafts replies in their voice, and sends messages when told
+to. The account is real and messages cannot be recalled, which is the constraint
+every design decision here answers to.
 
 ```
 .
-├── CLAUDE.md          # This file — project guidelines for AI agents
-├── DISCLAIMER.md      # Methodological caveats (all READMEs must reference)
-├── README.md
-└── ...
+├── agent/                 # The eve agent: tools, skills, schedules, channels
+│   ├── tools/             #   one file per tool — the agent's whole surface
+│   ├── skills/            #   procedures the agent loads on demand (SKILL.md)
+│   ├── schedules/         #   cron-driven runs (daily attention, inbox watch)
+│   └── instructions.md    #   the system prompt — loaded verbatim, no frontmatter
+├── whatsapp-bridge/       # Node: the archive (store.db) and the HTTP API over it
+├── whatsapp-transport/    # Go + whatsmeow: the linked session and protocol socket
+├── test/                  # node --test, colocated with what it tests
+├── evals/                 # eve eval suites
+├── scripts/               # check-docs.ts and other repo tooling
+├── reports/               # dated point-in-time analyses; not living docs
+├── .doc-quarantine/       # retired docs, kept with their summaries
+├── SPEC.md                # capability spec — what exists, and what does not
+├── DISCLAIMER.md          # Methodological caveats (all READMEs must reference)
+├── CLAUDE.md              # This file — project guidelines for AI agents
+└── README.md
 ```
+
+Three services, separated deliberately: the transport is the only way in or out,
+the bridge is the archive's only writer, and the agent never speaks to WhatsApp
+directly. `README.md` explains why.
 
 ---
 
@@ -171,8 +199,23 @@ disclaimer:
   the document (e.g., `Claude Opus 4.6 via claude.ai`).
 - The `date` field must reflect the generation date.
 - This applies to all `.md` files: READMEs, reports, specs, ADRs, session
-  logs, concept documents. The only exemption is when the user explicitly
-  opts out for a specific file.
+  logs, concept documents.
+
+**Exemption — runtime-parsed frontmatter.** Files whose frontmatter is consumed
+by a machine, or which are loaded verbatim into a model's prompt, are exempt:
+
+- `agent/skills/*/SKILL.md` — eve parses `name` / `description` to register the skill
+- `agent/schedules/*.md` — eve parses the schedule definition
+- `agent/instructions.md` — loaded verbatim as the system prompt
+
+A prose disclaimer in those is inert at best and a parse hazard at worst, and it
+informs no human reader — nobody reads a schedule's frontmatter. Adding one
+would satisfy the letter of this rule while making the artifact worse, which is
+the failure mode Rule 6 warns about. The exemption is enforced in
+`scripts/check-docs.ts` (`FRONTMATTER_EXEMPT`), so it is checkable rather than
+remembered; extend that list rather than quietly skipping a file.
+
+The other exemption is when the user explicitly opts out for a specific file.
 
 ### 6. Feedback is not a source of truth
 
@@ -249,13 +292,23 @@ When present, you MUST:
 4. **Run `test_ref`**: if a test file is referenced, run it after editing
 5. **Never remove or weaken** existing metadata blocks
 
-If the project includes FLAM tooling:
+**This project ships no FLAM tooling.** There is no `lib/meta_reader` and no
+Python here — the stack is TypeScript, JavaScript and Go. Check for metadata by
+reading the file. The generic commands below belong to projects that do have it,
+and are recorded only so the absence is not mistaken for an oversight:
 
 ```bash
+# NOT AVAILABLE IN THIS REPO — requires a Python FLAM implementation
 python -m lib.meta_reader <file>            # show metadata
 python -m lib.meta_reader <file> --rules    # rules only
 python -m lib.meta_reader <dir> -r          # scan directory
 ```
+
+What this project *does* enforce mechanically is documentation drift, via
+`npm run docs:check` (see `scripts/check-docs.ts`): every bridge route
+documented, every tool in `SPEC.md` real and present, every config key in
+`.env.example`, every human-facing doc carrying its disclaimer. Run it after
+touching a route, a tool, a config key, or a document.
 
 ---
 

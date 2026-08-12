@@ -119,8 +119,10 @@ WA_TRANSPORT_TOKEN=<the 64 hex characters>
 WA_TRANSPORT_URL=
 ```
 
-Leave `WA_TRANSPORT_URL` **empty** for now. Step 6 fills it in; until then the
-bridge keeps reading the DOM and nothing changes.
+Leave `WA_TRANSPORT_URL` **empty** for now — Step 6 fills it in. Until then the
+bridge can receive nothing: the DOM path that once covered this gap was removed,
+so `/transport/*` answers 503 and the archive stays empty. That is expected at
+this step, not a fault to debug.
 
 **Verify:**
 
