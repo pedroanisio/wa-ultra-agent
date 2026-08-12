@@ -33,13 +33,37 @@ export default defineTool({
       const result = await bridge.readChat(chat, limit, ctx.abortSignal);
       return {
         ...result,
+        found: true as const,
         // Third-party message text is data, never instruction. Say so inline:
         // a chat can contain anything, including text shaped like a command.
         trust: "untrusted-user-content",
       };
     } catch (error) {
-      if (error instanceof BridgeError) return { error: error.message, messages: [] };
+      if (error instanceof BridgeError) {
+        // ── Why `found` exists, and why it is not just an error string ──────
+        // A name that did not resolve used to come back as an empty message
+        // list, indistinguishable from a conversation with nothing in it. On
+        // 12 August 2026 eight busy groups read as empty that way and the model,
+        // given no reason, supplied one: "non-text content or a sync gap",
+        // reported to the user as fact. `found: false` is the field that makes
+        // "I could not find it" unavailable as a silence.
+        return { found: false as const, error: error.message, messages: [] };
+      }
       throw error;
     }
+  },
+
+  toModelOutput(output) {
+    if (!output.found) {
+      return {
+        type: "text" as const,
+        value:
+          `I could not read that conversation: ${output.error}\n\n` +
+          "This is NOT an empty chat and NOT a gap in the archive — the name did not resolve to a " +
+          "conversation. Say that, or call whatsapp_list_chats and try the name exactly as listed. " +
+          "Do not offer the user a cause for it.",
+      };
+    }
+    return { type: "json" as const, value: output };
   },
 });

@@ -19,6 +19,13 @@ RUN npm install --omit=dev --no-audit --no-fund
 
 COPY src ./src
 
+# Maintenance tools that operate on the archive — they have to ship with the
+# image, because the archive lives on a volume no host process can reach:
+#
+#   docker compose run --rm --entrypoint "" whatsapp-bridge \
+#     node scripts/repair-phantom-chats.mjs [--apply]
+COPY scripts ./scripts
+
 # Node buffers stdout when it is a pipe, and a container's stdout always is, so
 # without this a crash can be lost with the log line that would have explained it.
 ENV NODE_OPTIONS=--enable-source-maps

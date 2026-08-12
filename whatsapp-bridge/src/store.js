@@ -436,7 +436,7 @@ CREATE TABLE IF NOT EXISTS chat_touches (
  * silently re-keys all of them and the next modelling pass forks every stored
  * thread instead of continuing it. It is a one-way door; the comment is cheaper.
  */
-function contentKey(...parts) {
+export function contentKey(...parts) {
   return createHash("sha256").update(parts.join(" ")).digest("hex").slice(0, 16);
 }
 
@@ -799,6 +799,36 @@ export function openStore(
     const error = new Error(message);
     error.statusCode = 400;
     return error;
+  };
+
+  /**
+   * The id of a chat that ALREADY EXISTS, refusing to invent one.
+   *
+   * ── The corruption this closes ──────────────────────────────────────────
+   * `chatId` is an upsert, and that is correct where messages arrive: ingest
+   * meets a conversation for the first time and files it. It is wrong
+   * everywhere else. The interaction twin and the proposal writer passed the
+   * agent's own string — a display name — and each pass MINTED a chat row
+   * addressed by that name: nine of them in this archive, holding zero
+   * messages, carrying every arc and proposal for conversations whose real
+   * rows held thousands of messages and no model at all.
+   *
+   * Derived tables cannot create the thing they describe. A pass over a chat
+   * nobody archived is a pass over nothing, and it is refused here rather than
+   * silently given a chat of its own to be right about.
+   */
+  const existingChatId = (address) => {
+    const row = db.prepare("SELECT id FROM chats WHERE name = ?").get(String(address ?? ""));
+    if (!row) {
+      const error = new Error(
+        `No conversation is archived under "${address}", so nothing derived can be filed against ` +
+          "it. Pass the chat's address as `/archive/chats` lists it — a display name that was " +
+          "never resolved is not an address, and storing one creates a second, empty conversation.",
+      );
+      error.statusCode = 409;
+      throw error;
+    }
+    return row.id;
   };
 
   const requireMessage = (key) => {
@@ -1698,7 +1728,7 @@ export function openStore(
         );
       }
 
-      const id = chatId(chat);
+      const id = existingChatId(chat);
       const at = now();
       const counts = {
         arcs: { inserted: 0, updated: 0 },
@@ -1905,7 +1935,7 @@ export function openStore(
           }
           for (const key of basis) requireMessage(key);
 
-          const id = chatId(item.chat);
+          const id = existingChatId(item.chat);
           const arc = item.arcTitle
             ? db.prepare("SELECT id FROM arcs WHERE key = ?").get(arcKeyFor(item.chat, item.arcTitle))
             : undefined;

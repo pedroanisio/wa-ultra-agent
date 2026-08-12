@@ -479,6 +479,10 @@ export const bridge = {
   readChat: (chat: string, limit: number, signal?: AbortSignal) =>
     call<{
       chat: string;
+      /** The address the name resolved to. Never the name itself: see chat-address.js. */
+      resolved: string;
+      /** How it resolved — `key`, `name` or `words`. An approximate match says so. */
+      matched: "key" | "name" | "words";
       messages: WhatsAppMessage[];
       note?: string;
     }>(

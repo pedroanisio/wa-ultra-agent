@@ -16,7 +16,7 @@ import {
   startDrain,
 } from "./transport.js";
 import { openStore, retentionFromEnv } from "./store.js";
-import { foldName } from "./recipients.js";
+import { resolveChatAddress } from "./chat-address.js";
 import { readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
@@ -142,9 +142,21 @@ export async function transportMedia(key) {
   };
 }
 
-/** Ask the phone for messages older than one already held. */
+/**
+ * Ask the phone for messages older than one already held.
+ *
+ * The chat is resolved for the same reason every other chat-taking entry point
+ * resolves it: the transport addresses conversations by JID, the agent knows
+ * them by name, and a name forwarded unresolved is a request the phone cannot
+ * answer — which arrives back as "nothing older", indistinguishable from a chat
+ * that really has nothing older. Same defect as the archive read; same fix.
+ */
 export function transportHistory({ chat, oldestId, oldestFromMe, oldestTimestamp, count }) {
-  return transport().history({ chat, oldestId, oldestFromMe, oldestTimestamp, count });
+  // Resolved BEFORE the transport is touched: a name that names nothing is the
+  // caller's mistake either way, and reporting it as "no transport configured"
+  // sends the reader to the wrong problem.
+  const key = requireChatKey(chat);
+  return transport().history({ chat: key, oldestId, oldestFromMe, oldestTimestamp, count });
 }
 
 export function transportPairPhone(phone) {
@@ -702,7 +714,11 @@ function badRequest(message) {
  * that parsed them and the store that implements them. See archive-query.js.
  */
 export function searchArchive({ query, ...filters }) {
-  return { query, chat: filters.chat, hits: store().search(query, filters) };
+  // The chat filter is an ADDRESS at the store, and a name everywhere above it.
+  // Left unresolved it narrowed the search to a chat that does not exist, and a
+  // search that found nothing looked exactly like a subject nobody had raised.
+  const chat = filters.chat ? requireChatKey(filters.chat) : filters.chat;
+  return { query, chat, hits: store().search(query, { ...filters, chat }) };
 }
 
 /** Recent conversations, from the archive. Replaces the DOM's rendered list. */
@@ -722,65 +738,62 @@ export function archiveContext({ key, before, after }) {
 /** Stored messages for one chat, each carrying the key an extraction must cite. */
 /**
  * Resolve whatever the caller called a chat into the key the archive stores it
- * under.
+ * under, or null.
  *
  * ── The bug this fixes ──────────────────────────────────────────────────────
  * The archive files every conversation under its protocol address —
- * `120363216555895408@g.us` — and the agent asks for "We". Nothing matched, so
+ * `120363000000000002@g.us` — and the agent asks for "Duo". Nothing matched, so
  * reading a group by name returned zero messages and the agent reported the
  * group as unarchived while 809 of its messages sat in the table.
  *
- * Names are compared with `foldName`, the same fold the send path uses, so a
- * circumflex nobody types and an emoji WhatsApp renders as decoration cannot be
- * the reason a conversation is unreachable. Ambiguity is refused rather than
- * guessed: reading the wrong person's chat is a smaller harm than writing to
- * them, but it is still the wrong answer given confidently.
+ * The rules live in `chat-address.js` so they can be tested without a database,
+ * and so every route that takes a chat string answers the question the same way.
+ * Ambiguity is refused rather than guessed: reading the wrong person's chat is a
+ * smaller harm than writing to them, but it is still the wrong answer given
+ * confidently.
  */
 export function resolveArchiveChat(query) {
-  const asked = String(query ?? "").trim();
-  if (!asked) return null;
+  return resolveChatAddress(store().chats({ limit: 10_000 }), query).key;
+}
 
-  const chats = store().chats({ limit: 10_000 });
-  const byKey = chats.find((c) => c.key === asked);
-  if (byKey) return byKey.key;
+/**
+ * The same, for callers that cannot proceed without an answer.
+ *
+ * ── Why an unresolved name must not fall through ────────────────────────────
+ * It used to: `resolveArchiveChat(chat) ?? chat` handed the raw name to the
+ * store, which matches chats on their address, so the query ran against a chat
+ * that does not exist and came back empty. Every caller then reported an empty
+ * conversation. The agent, told a busy group held nothing, offered the user a
+ * cause it had invented — "non-text content or a sync gap" — because nothing in
+ * the answer said the name had simply not been found.
+ *
+ * ARCHITECTURAL REQUIREMENT (PALS's LAW): LLMs will always produce some form of
+ * error. Absence of output verification is a design defect, not a runtime bug.
+ * A resolution that failed must SAY it failed; anything else asks the model to
+ * explain a silence, and it always will.
+ */
+export function requireChatKey(query) {
+  const { key } = resolveChatAddress(store().chats({ limit: 10_000 }), query);
+  if (key) return key;
 
-  const wanted = foldName(asked);
-  const exact = chats.filter((c) => c.displayName && foldName(c.displayName) === wanted);
-  if (exact.length === 1) return exact[0].key;
-  if (exact.length > 1) {
-    const error = new Error(
-      `"${asked}" matches ${exact.length} conversations (${exact.map((c) => c.displayName).join(", ")}). ` +
-        "Refusing to choose. Use the chat's key, which is unique.",
-    );
-    error.statusCode = 409;
-    throw error;
-  }
-
-  // Every word you typed, in any order — `familia ulian` finds `Familia (Ulian)`.
-  const words = foldName(asked)
-    .replace(/[^\p{L}\p{N}]+/gu, " ")
-    .split(" ")
-    .filter(Boolean);
-  if (words.length === 0) return null;
-  const loose = chats.filter((c) => {
-    if (!c.displayName) return false;
-    const have = new Set(
-      foldName(c.displayName)
-        .replace(/[^\p{L}\p{N}]+/gu, " ")
-        .split(" ")
-        .filter(Boolean),
-    );
-    return words.every((word) => have.has(word));
-  });
-  return loose.length === 1 ? loose[0].key : null;
+  const error = new Error(
+    `No conversation in the archive answers to "${String(query ?? "").trim()}". ` +
+      "This is a name that did not resolve, NOT an empty conversation. Call /archive/chats " +
+      "(whatsapp_list_chats) and use a name exactly as it is listed there, or the chat's key.",
+  );
+  error.statusCode = 404;
+  throw error;
 }
 
 export async function archiveMessages({ chat, limit, newest = false }) {
   // Resolved, then reported back as asked: the caller gets both, so a wrong
-  // resolution is visible rather than silent.
-  const key = resolveArchiveChat(chat) ?? chat;
+  // resolution is visible rather than silent. `matched` says HOW it resolved,
+  // so an approximate match can be named in the answer instead of passing for
+  // an exact one.
+  const { key, matched } = resolveChatAddress(store().chats({ limit: 10_000 }), chat);
+  if (!key) requireChatKey(chat);
   const messages = store().messagesFor(key, { limit, newest });
-  return { chat, resolved: key, messages: await withSenderNames(messages) };
+  return { chat, resolved: key, matched, messages: await withSenderNames(messages) };
 }
 
 /**
@@ -904,11 +917,16 @@ export function addFact({ subject, statement, sourceMessageKey, confidence }) {
 
 /** Stored facts, each joined to the message that produced it. */
 export function listFacts({ subject, chat, limit }) {
-  return { facts: store().factsWithSource({ subject, chat, limit }) };
+  return { facts: store().factsWithSource({ subject, chat: chat ? requireChatKey(chat) : chat, limit }) };
 }
 
-export function listExtractions(filters) {
-  return { items: store().extractions(filters) };
+export function listExtractions(filters = {}) {
+  return {
+    items: store().extractions({
+      ...filters,
+      ...(filters.chat ? { chat: requireChatKey(filters.chat) } : {}),
+    }),
+  };
 }
 
 /* ------------------------------------------------------------------ *
@@ -929,6 +947,20 @@ export function listExtractions(filters) {
  * pass records the last message it considered so staleness is a count rather
  * than a guess.
  */
+/**
+ * ── Why the chat is RESOLVED here, and why that is not cosmetic ─────────────
+ * This function is where the archive was corrupted. It passed the agent's
+ * string — a display name — straight to the store, which inserted it as a chat
+ * ADDRESS. Nine conversations grew a second, empty row keyed by their own name,
+ * carrying every arc, context and proposal the twin had produced, while the real
+ * chat row with the messages carried none. Reads by that name then landed on the
+ * shadow: "Alpha + Pais" had 19 modelled arcs over 0 archived messages.
+ *
+ * Resolving first makes the address the identity of a modelling pass, which the
+ * content keys (`arcKeyFor`, and the context and proposal keys) are derived
+ * from — so a pass run against the name and one run against the key continue the
+ * same arcs instead of forking them.
+ */
 export function saveInteractionModel({ chat, throughMessageKey, considered, arcs, contexts }) {
   if (!String(chat || "").trim()) throw badRequest("chat is required.");
   if (!throughMessageKey) {
@@ -938,7 +970,7 @@ export function saveInteractionModel({ chat, throughMessageKey, considered, arcs
     );
   }
   return store().saveInteractionModel({
-    chat: String(chat).trim(),
+    chat: requireChatKey(chat),
     throughMessageKey,
     considered,
     arcs,
@@ -949,7 +981,7 @@ export function saveInteractionModel({ chat, throughMessageKey, considered, arcs
 /** The assembled twin: what is counted, what was read, and how stale it is. */
 export function interactionTwin({ chat, arcStatus, horizonDays }) {
   if (!String(chat || "").trim()) throw badRequest("chat is required.");
-  return store().twin(String(chat).trim(), { arcStatus, horizonDays });
+  return store().twin(requireChatKey(chat), { arcStatus, horizonDays });
 }
 
 /** Conversations whose archive has moved on since they were last modelled. */
@@ -971,11 +1003,16 @@ export function resolveArc({ id, status }) {
  */
 export function saveProposals({ items }) {
   if (!Array.isArray(items)) throw badRequest("items must be an array.");
-  return store().addProposals(items);
+  // Same reason as `saveInteractionModel`: a proposal filed under a display name
+  // mints a chat row keyed by that name, and the move then belongs to a
+  // conversation that holds no messages.
+  return store().addProposals(
+    items.map((item) => (item?.chat ? { ...item, chat: requireChatKey(item.chat) } : item)),
+  );
 }
 
 export function listProposals({ chat, status, limit } = {}) {
-  return { proposals: store().proposals({ chat, status, limit }) };
+  return { proposals: store().proposals({ chat: chat ? requireChatKey(chat) : undefined, status, limit }) };
 }
 
 export function resolveProposal({ id, status }) {
