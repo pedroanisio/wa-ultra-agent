@@ -359,39 +359,27 @@ export interface MediaPayload {
 }
 
 
-/**
- * One observed change to the chat list.
+/*
+ * ── What used to be here ────────────────────────────────────────────────────
  *
- * `preview` is the row's snippet, not the message — up to 160 characters, with a
- * group sender prefix when there is one. Enough to say what arrived and from
- * whom; never enough to quote. Anything more requires the archive.
+ * `InboxEvent` and `ReactionResult` — the response contract of
+ * `whatsapp_inbox_events`, which reported arrivals and rationed the reads they
+ * triggered. Both were removed with the browser, and both outlived it here as
+ * exported types nothing referenced.
+ *
+ * They are called out rather than silently dropped because their fields are the
+ * clearest surviving description of a system this project no longer has, and
+ * every one of them was a promise: `quiet`/`quietHours` said the bridge would
+ * refuse to act overnight, `deferred`/`deferredWhy` said a read had been held
+ * back by a cooldown, `budgetRemaining` said interactions were being counted.
+ * The bridge emits none of those fields — nothing in `whatsapp-bridge/src`
+ * writes `quiet` at all — because there is nothing left to ration: the
+ * transport pushes into a durable outbox, the bridge drains it, and reading the
+ * archive costs nothing WhatsApp can see.
+ *
+ * A dead exported type is not inert. It is the shape the next person writes
+ * against, and it would have them build a client for a route that answers 404.
  */
-export interface InboxEvent {
-  key: string;
-  chat: string;
-  kind: "message" | "mention" | "unread-cleared" | "own-message";
-  preview: string;
-  unread: number;
-  observedAt: string;
-  /** How many times this event has been claimed. Above 1 means a retry. */
-  attempts?: number;
-}
-
-export interface ReactionResult {
-  /** True when the bridge refused to act because it is inside quiet hours. */
-  quiet: boolean;
-  reason?: string;
-  quietHours?: string;
-  /** Everything the user should be told about. Empty means say nothing. */
-  events: InboxEvent[];
-  /** Chats the bridge topped up before returning, and how that went. */
-  read: Array<{ chat: string; inserted?: number; scanned?: number; error?: string }>;
-  /** Events held back from a read — never held back from being reported. */
-  deferred: number;
-  deferredWhy?: string[];
-  budgetRemaining?: number;
-  note?: string;
-}
 
 export class BridgeError extends Error {
   /**

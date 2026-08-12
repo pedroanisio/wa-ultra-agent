@@ -44,11 +44,13 @@ open a chat: modelling and proposing both read the stored archive, and if the
 archive is behind, that is a note to the user, not a reason to start scraping on
 a timer. And it must not propose a move it cannot ground in the twin.
 
-> **Why this is allowed on a clock at all.** `daily-attention` refuses to spend
-> browser interactions on a timer, and that rule stands. Nothing in steps 1–5
-> touches WhatsApp: `whatsapp_twin`, `whatsapp_model_interaction` and
-> `whatsapp_next_best` all read and write SQLite only. The single self-note in
-> step 6 is the one interaction this run can cost, it happens only when there is
-> something real to say, and it is the same trade the daily digest already makes.
-> If the bridge reports quiet hours, skip the note and let next week's run carry
-> it — the modelling is already saved.
+> **Why this is allowed on a clock at all.** `daily-attention` refuses to sweep
+> WhatsApp on a timer, and that rule stands. Nothing in steps 1–5 touches it:
+> `whatsapp_twin`, `whatsapp_model_interaction` and `whatsapp_next_best` all
+> read and write SQLite only. The single self-note in step 6 is the one thing
+> this run sends, it happens only when there is something real to say, and it is
+> the same trade the daily digest already makes.
+>
+> There are no quiet hours to check. The bridge has never reported them on this
+> transport, and a run that waits for a signal nobody sends waits forever — so
+> if the note is worth writing, write it.

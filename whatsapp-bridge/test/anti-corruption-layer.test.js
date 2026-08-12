@@ -51,6 +51,19 @@ const DOM_KNOWLEDGE =
 /** Driving a browser, as opposed to merely describing one. */
 const BROWSER_DRIVER = /\bplaywright\b|\bchromium\b|page\.evaluate\(|page\.goto\(|browser\.newPage\(/g;
 
+/**
+ * What marks a comment as recording history rather than describing the present.
+ *
+ * The two prose checks below both need it, and both need it GENEROUS. The
+ * removal of the browser is the most important thing this codebase has to
+ * explain, so a comment that cannot name what went is a comment that cannot
+ * explain why anything is shaped the way it is. Past tense counts: "a chat that
+ * predates the transport … was scraped from a sidebar" (store.js) is a true
+ * statement about rows already in the archive, not a claim about what runs.
+ */
+const IS_HISTORY =
+  /\b(remove\w*|delete\w*|gone|went with|no longer|supersed\w*|replac\w*|used to|once\b|obsolete|historical|instead of|rather than|predates?|was|were|had\b|without a browser|browser[- ]free)\b|~~/i;
+
 function sourceFiles() {
   return readdirSync(SOURCE_DIR)
     .filter((name) => name.endsWith(".js"))
@@ -99,6 +112,87 @@ test("ACL: the browser driver's modules are gone and stay gone", () => {
         "returned, the transport is the place to answer it.",
     );
   }
+});
+
+test("ACL: no module explains itself in terms of the browser", () => {
+  // The code stopped driving a browser; several module headers did not. `serial.js`
+  // opened "One browser, one keyboard" and justified itself by a `commitSend`
+  // function that no longer exists anywhere in the tree — so the one artefact that
+  // explains why every send is serialised explained it with a reason that is not
+  // true. That is worse than no comment: the next person to touch it reasons from
+  // a mechanism that was deleted, and the tests cannot contradict them.
+  //
+  // A header may still SAY the browser is gone. What it may not do is describe it
+  // in the present tense as this module's setting.
+  //
+  // The triggers are deliberately narrow, and each exclusion is a real sentence
+  // this had to stop failing on. "a browser that navigated away" (transport.js)
+  // and "closed the page" (server.js) are about the OPERATOR's browser reading
+  // the QR stream — a browser this service does not drive and never did. Only
+  // the definite article carries the claim: "the browser" is this bridge's.
+  const CLAIMS_A_BROWSER = /\b(the browser|one browser|the composer|rendered rows?|scrap(e|es|ed|ing))\b/i;
+
+  const offences = [];
+  for (const { name, body } of sourceFiles()) {
+    const lines = body.split("\n");
+    lines.forEach((line, i) => {
+      // Comments only. Live code naming a variable `page` is the ACL tests above.
+      if (!/^\s*(\/\/|\/\*|\*)/.test(line)) return;
+      if (!CLAIMS_A_BROWSER.test(line)) return;
+      const window = lines.slice(Math.max(0, i - 3), i + 1).join("\n");
+      if (IS_HISTORY.test(window)) return;
+      offences.push(`${name}:${i + 1}: ${line.trim()}`);
+    });
+  }
+
+  assert.deepEqual(
+    offences,
+    [],
+    "A module comment describes the browser as this bridge's setting. It has none — " +
+      "the transport speaks the protocol and this service reads its outbox. Rewrite the " +
+      "comment around what the module actually does, or mark the mention as history:\n" +
+      offences.join("\n"),
+  );
+});
+
+test("ACL: no comment cites a departed function as if it were still there", () => {
+  // `serial.js` cited `commitSend` — from the prepare/commit send dance that went
+  // with the DOM path — to explain why sends are serialised. A cross-reference
+  // that resolves to nothing is the most confidently wrong kind of comment there
+  // is: it reads as a pointer, and the reader spends their time looking.
+  //
+  // Naming one while SAYING it is gone is the opposite, and is why three of these
+  // still appear in this tree. "`readChat` once ended in `.filter((m) => m.text)`"
+  // is the clearest available explanation of why nothing may be dropped, and
+  // deleting the name would leave the rule with no reason attached to it.
+  const DEPARTED_SYMBOLS = ["commitSend", "prepareSend", "openChatTitle", "openChat", "ingestChat", "readChat"];
+  const DEFINED = (symbol) =>
+    new RegExp(
+      `(function\\s+${symbol}\\b|const\\s+${symbol}\\b|${symbol}\\s*[,}].*from|export\\s+(async\\s+)?function\\s+${symbol}\\b|${symbol}\\s*[:=]\\s*(async\\s*)?\\()`,
+    );
+
+  const whole = sourceFiles().map((f) => f.body).join("\n");
+  const dangling = [];
+
+  for (const { name, body } of sourceFiles()) {
+    const lines = body.split("\n");
+    lines.forEach((line, i) => {
+      for (const symbol of DEPARTED_SYMBOLS) {
+        if (!new RegExp(`\\b${symbol}\\b`).test(line)) continue;
+        if (DEFINED(symbol).test(whole)) continue; // live symbol, not a ghost
+        const window = lines.slice(Math.max(0, i - 3), i + 1).join("\n");
+        if (IS_HISTORY.test(window)) continue; // named as gone — the point of naming it
+        dangling.push(`${name}:${i + 1} cites ${symbol}`);
+      }
+    });
+  }
+
+  assert.deepEqual(
+    dangling,
+    [],
+    "Comments point at functions that no longer exist:\n" + dangling.join("\n") +
+      "\nCite something a reader can open, say plainly that it was removed, or drop the name.",
+  );
 });
 
 test("ACL: the bridge does not depend on Playwright", () => {

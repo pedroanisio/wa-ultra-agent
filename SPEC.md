@@ -255,6 +255,14 @@ parameter, not a throughput parameter** — see §0.1. Design for:
 - a one-time historical backfill that is explicitly resumable and runs slower than the baseline;
 - hard caps on interactions per hour, enforced in the bridge, not the agent.
 
+**Historical — none of the three is implemented, and two are no longer needed.** They paced a walk
+that opened chats in a browser. Reception is now pushed into a durable outbox and drained into the
+archive, so there is no walk to pace and no per-read cost to cap. What survives the change is the
+backfill: `POST /history` asks the phone for older messages and is the one read that still leaves
+this machine. It is called on demand, not on a schedule, and nothing rate-limits it — stated plainly
+because a reader who takes the caps above as built would believe there is a bound where there is
+none.
+
 The agent-facing half is one tool:
 
 ```ts
@@ -1070,7 +1078,7 @@ The draft's taxonomy is good structure. It is a mapping onto `eve/tools/approval
 | Level | Examples | Policy |
 |---|---|---|
 | **0 — Read** | search messages, read chat, read calendar | autonomous |
-| **0.5 — Unattended read** | open a chat and top up the archive on an *event*, with nobody at the keyboard (§0.1.1) | autonomous, **but bounded in the bridge** — per-chat cooldown, quiet hours, fan-out cap, interaction budget. Bounded in code, never by instruction. |
+| **0.5 — Unattended read** | ~~open a chat and top up the archive on an *event*~~ — **no longer exists.** Reception is pushed into a durable outbox and drained into the archive, so an unattended read is a SQLite query and collapses into level 0. The cooldown, quiet hours, fan-out cap and interaction budget that bounded it were deleted with the browser; **nothing enforces them today**, and this row is kept only so that "bounded in the bridge" is not read as a live guarantee. |
 | **1 — Private mutation** | create task, store fact, write memory | autonomous |
 | **1.5 — Self-note** | write a draft, digest, transcript or reminder to your own chat (§5.2) | **autonomous** — the recipient is a constant and no third party can receive it |
 | **2 — Reversible external** | create calendar event, draft email, draft reply | autonomous **+ notify**; reversible only if genuinely undoable |

@@ -1,25 +1,33 @@
 /**
- * One browser, one keyboard: operations must not interleave.
+ * Self-notes go out one at a time, so a multi-line note arrives as one note.
  *
- * Two concurrent sends would each click a composer and then type into whichever
- * conversation the other one opened last. Serialising every operation is what
- * makes the recipient check in `commitSend` meaningful.
+ * `/send/self` and `/send/self/media` take a LIST of messages and send them in
+ * order. Two of those running concurrently would interleave at the recipient —
+ * the user's own chat, read on a phone, where a paragraph of one note landing
+ * between two lines of another is not a race condition anyone can diagnose. It
+ * reads as the agent being confused. So both paths queue here, and the queue is
+ * the whole mechanism: there is no lock to take and nothing to time out.
  *
- * ── Why this is its own module ──────────────────────────────────────────────
- * It used to live in server.js, which was correct while every path to the
- * browser was an HTTP request. The watcher broke that assumption: it is woken by
- * a DOM mutation, not by a caller, so a mutex owned by the HTTP layer would let
- * a snapshot read land in the middle of an `openChat` — reading a half-filtered
- * pane, or competing for the keyboard with a send.
+ * ── What this used to be ────────────────────────────────────────────────────
+ * A mutex over a browser. Two concurrent sends would each click a composer and
+ * type into whichever conversation the other one opened last, and a watcher woken
+ * by a DOM mutation could read a half-filtered pane mid-send — so every path to
+ * the page went through here, whatever woke it. The header said so, and cited a
+ * `commitSend` that had already been deleted, which left the one artefact
+ * explaining why sends are serialised explaining it with a mechanism that no
+ * longer existed.
  *
- * The lock belongs to the browser, not to the transport. Everything that touches
- * the page goes through here, whatever woke it.
+ * The reason narrowed rather than vanished, and it is worth keeping the
+ * distinction: this no longer protects a shared resource — the transport handles
+ * concurrent sends perfectly well — it protects an ORDERING the reader can see.
+ * `trySerial`/`isBusy` went with the watcher; they answered "is the browser
+ * busy", and nothing is.
  */
 
 let chain = Promise.resolve();
 let queued = 0;
 
-/** Queue `fn` behind everything already waiting for the browser. */
+/** Queue `fn` behind every send already waiting. Rejections do not break the chain. */
 export function serial(fn) {
   queued++;
   const run = chain.then(fn, fn);
@@ -34,22 +42,5 @@ export function serial(fn) {
   return run;
 }
 
-/** Whether anything holds or is waiting for the browser. */
-export const isBusy = () => queued > 0;
-
-/**
- * Run `fn` only if the browser is idle right now; otherwise skip it entirely.
- *
- * For work worth doing when convenient and worthless when queued. The watcher's
- * snapshot is exactly that: if an operation is in flight then the pane is
- * mid-change, so a reading taken behind it would be discarded anyway — and the
- * mutation that triggered this is still visible in the next snapshot. Queueing
- * would only build a backlog of stale reads behind a slow send.
- *
- * Resolves `{ skipped: true }` rather than throwing, because "not now" is the
- * expected outcome during any burst of activity, not a failure.
- */
-export function trySerial(fn) {
-  if (isBusy()) return Promise.resolve({ skipped: true });
-  return serial(fn).then((value) => ({ skipped: false, value }));
-}
+/** How many sends are queued or in flight. Zero means the chain is idle. */
+export const pending = () => queued;

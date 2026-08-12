@@ -127,15 +127,15 @@ const server = createServer(async (req, res) => {
   // calls, and it reveals nothing about the account.
   //
   // It used to return `{ok:true}` unconditionally, which made it a check on the
-  // HTTP server rather than on the thing this service exists to hold. A browser
-  // that could not launch reported healthy indefinitely and Docker never
-  // restarted it — the same silent-failure shape as an uninstalled pane watcher.
+  // HTTP server rather than on the thing this service exists to hold: whatever
+  // had actually failed reported healthy indefinitely and Docker never restarted
+  // it. So it reports whether a transport is configured, which is the one fact
+  // that decides whether this service can do anything at all.
   //
-  // Deliberately NOT firecrawl's version of this, which opens a context and a
-  // page per call: there is one session here, every operation queues behind
-  // `serial()`, and an unauthenticated endpoint that drives the browser is both
-  // a way to stall real work and a way to spend interactions from outside. This
-  // reports state the session already knows and touches nothing.
+  // It performs no work to find that out — no request to the transport, no read
+  // of the archive. An unauthenticated endpoint that did real work would be a way
+  // to stall this service from outside, and health checks run on a timer forever.
+  //
   // Liveness only, and deliberately coarse: it answers before the token check,
   // so it must never disclose whether an account is linked. Whether the
   // transport is paired and connected is behind the token, on /transport/status.
@@ -256,8 +256,9 @@ const server = createServer(async (req, res) => {
     /* -------------------------------------------------------------- *
      * The protocol transport.
      *
-     * None of these touch the browser, so none are serialised. They are 503 when
-     * no transport is configured, which is a statement about this installation
+     * None of these are serialised: `serial()` exists to keep a multi-message
+     * self-note in order, and none of these write one. They are 503 when no
+     * transport is configured, which is a statement about this installation
      * rather than an error.
      * -------------------------------------------------------------- */
 

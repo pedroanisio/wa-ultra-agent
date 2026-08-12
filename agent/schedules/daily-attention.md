@@ -25,10 +25,13 @@ Two things this run must not do. It must not send anything to another person —
 the only message it may write is the self-note. And it must not archive or
 extract anything: this reads what is already stored.
 
-That second rule is unchanged, but its reasoning has narrowed. Unattended
-browser interactions are no longer refused outright — `inbox-watch` spends them
-when a message actually arrives, under a per-chat cooldown, quiet hours and a
-fan-out cap. What is still refused is spending them *on a timer*: a digest that
-crawls chats every morning whether or not anything happened is activity
-uncorrelated with any real event, which is the pattern that looks automated.
-Reacting to an arrival is not that. Sweeping on a clock is.
+That second rule is unchanged, and it now costs nothing to keep. Reading the
+archive is a SQLite query: no chat is opened, nothing is requested from WhatsApp,
+and there is no cooldown, quiet window or interaction budget to spend, because
+the browser that made reading expensive is gone. Reception is push — the
+transport receives, the bridge drains into the archive — so everything this run
+needs is already stored before it wakes.
+
+What the rule still buys is a different thing: a digest assembled only from what
+is stored cannot report something the archive does not hold, and cannot quietly
+become a crawler if someone later adds one.

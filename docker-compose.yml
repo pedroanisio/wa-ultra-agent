@@ -76,9 +76,15 @@ services:
       # The archive of ingested messages. Defaults to /data/store.db in the
       # image, so it lands on the volume rather than inside a container layer.
       WA_STORE_PATH: "${WA_STORE_PATH:-/data/store.db}"
-      # UTC. Inside it the bridge reads nothing and reports nothing — a self-note
-      # is itself an interaction. Unset means no quiet hours, which is a choice.
-      WA_QUIET_HOURS: "${WA_QUIET_HOURS:-23:00-07:00}"
+      # WA_QUIET_HOURS was here, and is deliberately not replaced. It gated a
+      # window in which the bridge would refuse to read or write, back when
+      # reading meant driving a browser and every action was rationed. Nothing
+      # has read it since that went: no file under whatsapp-bridge/src consults
+      # it, so setting it silenced nothing. Left as a knob it would be worse than
+      # absent — an operator would set it, believe the agent could not message
+      # them overnight, and be wrong. Scheduled runs are paced by their own cron
+      # expressions in agent/schedules/, which is the honest place to say when
+      # this system may speak.
       # Where to drain messages from. Unset means "there is no transport", and
       # since the browser path was removed that leaves the bridge inert: every
       # /transport/* route answers 503 and nothing is received or sent.
