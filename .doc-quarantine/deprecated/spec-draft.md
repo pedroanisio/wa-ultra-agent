@@ -69,7 +69,7 @@ whatsapp.get_unread(
 
 `search_messages()` is probably the single most important tool. The agent needs to answer things like:
 
-> "What did Helena tell me about Valentina's school trip?"
+> "What did Helena tell me about Zaira's school trip?"
 
 > "Find the restaurant Fabio recommended six months ago."
 
@@ -108,7 +108,7 @@ School meeting changed from Tuesday to Thursday, 17:30.
 Actions detected:
 - Add school meeting to calendar
 - Tell Helena
-- Bring Valentina's science project
+- Bring Zaira's science project
 
 Deadline:
 Thursday 17:30
@@ -149,7 +149,7 @@ Helena
  └── entities
       ├── Santander
       ├── Esfera
-      ├── Valentina
+      ├── Zaira
       └── Guilherme
 ```
 
@@ -204,7 +204,7 @@ Then a completely ordinary family conversation becomes automated.
 
 ```text
 Helena:
-"Can you take Valentina to the dentist Wednesday at 16:30?"
+"Can you take Zaira to the dentist Wednesday at 16:30?"
 ```
 
 Agent internally:
@@ -221,7 +221,7 @@ And WhatsApp shows:
 
 ```text
 Added:
-Dentist — Valentina
+Dentist — Zaira
 Wed 16:30
 
 Leave by 15:55 based on the address.
@@ -417,7 +417,7 @@ document.extract()
 create task
 create calendar event
 store document
-associate with Valentina
+associate with Zaira
 ```
 
 **That** is the experience I'd aim for.
@@ -479,10 +479,10 @@ EPISODIC MEMORY
 ENTITY MEMORY
 Fabio → person
 FAZ.AI → company
-Valentina → person
+Zaira → person
 
 FACT MEMORY
-"Valentina's school is X"
+"Zaira's school is X"
 
 COMMITMENT MEMORY
 "Joao promised X to Y"
@@ -756,7 +756,7 @@ The answer can be:
 
 ```text
 1. Fabio is waiting for the FAZ.AI proposal you promised Friday.
-2. Valentina's school authorization is due tomorrow.
+2. Zaira's school authorization is due tomorrow.
 3. Helena asked whether you're free Thursday evening; you haven't replied.
 4. Fernando sent the numbers you were waiting for.
 5. Your dentist appointment conflicts with the 14:00 meeting.
