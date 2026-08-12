@@ -1,7 +1,9 @@
-# Three services. `whatsapp-transport` speaks WhatsApp's multi-device protocol
-# (Go, whatsmeow) and is the ONLY way this system reaches WhatsApp — the browser
-# driver it replaced is gone. `whatsapp-bridge` owns the archive and is its only
-# writer. `agent` is the eve agent; its tools call the bridge and nothing else.
+# Three services, plus one that is off by default. `whatsapp-transport` speaks
+# WhatsApp's multi-device protocol (Go, whatsmeow) and is the ONLY way this
+# system reaches WhatsApp — the browser driver it replaced is gone.
+# `whatsapp-bridge` owns the archive and is its only writer. `agent` is the eve
+# agent; its tools call the bridge and nothing else. `frameforge` renders
+# documents, holds no credential, and starts only under `--profile frameforge`.
 services:
   # Speaks WhatsApp's multi-device protocol directly (Go, whatsmeow) and queues
   # what arrives in a durable outbox. The bridge drains that queue into the
@@ -110,6 +112,71 @@ services:
     networks:
       - internal
 
+  # The document renderer. Optional, and off by default: it starts only with
+  # `--profile frameforge`, so a stack that never makes a poster never runs it.
+  #
+  # The image is built from the FrameForge checkout, which is a different
+  # repository — `make docker-build` there, or set WA_FRAMEFORGE_IMAGE to a tag
+  # you already have. Its own distribution speaks stdio; the command below runs
+  # the same server over HTTP, which is what an MCP client connection needs.
+  #
+  # It touches no WhatsApp credential and reaches no network but this one. What
+  # it shares with the agent is `frameforge-work`: renders land in
+  # /work/sessions/<id>/ and the agent reads them back from the same path, so a
+  # rendered page can be sent without a second copy over the wire.
+  frameforge:
+    image: "${WA_FRAMEFORGE_IMAGE:-frameforge:latest}"
+    profiles:
+      - frameforge
+    restart: unless-stopped
+    # The stock image speaks stdio and binds localhost. scripts/frameforge-http.py
+    # is the one launcher that asks FastMCP for its HTTP transport — the same file
+    # used to run this outside compose — and the image's entrypoint runs a
+    # `python ...` command inside its own venv.
+    #
+    # `--host 0.0.0.0` is every interface INSIDE this container, and this service
+    # publishes no port and sits on the internal network, so "every interface"
+    # here is narrower than the host-gateway bind the script defaults to. That is
+    # what ALLOW_ANY is acknowledging; do not copy it to a host-run server.
+    #
+    # `--allowed-host` names what callers actually dial. The bind address and the
+    # Host header differ here, and the SDK's DNS-rebinding check reads the header:
+    # without this, every call is refused with a 421 the client reports as a
+    # broken socket rather than as a refusal.
+    command:
+      - python
+      - /opt/frameforge/frameforge-http.py
+      - --host=0.0.0.0
+      - --port=8110
+      - --allowed-host=frameforge:8110
+    environment:
+      FRAMEFORGE_HTTP_ALLOW_ANY: "yes"
+      # Where renders are written. The image's own default, restated because the
+      # agent's WA_FRAMEFORGE_SESSION_ROOT must agree with it exactly.
+      FRAMEFORGE_MCP_SESSION_ROOT: "/work/sessions"
+    volumes:
+      - frameforge-work:/work
+      # Read-only: the launcher is this stack's wiring, not the image's.
+      - ./scripts/frameforge-http.py:/opt/frameforge/frameforge-http.py:ro
+    expose:
+      - "8110"
+    # Deliberately NOT published to the host: this runs model-authored Python in
+    # a subprocess, so its only reachable surface is this internal network.
+    healthcheck:
+      # The image's own healthcheck imports a module this version renamed, and a
+      # TCP probe is the honest question anyway: is the HTTP server listening?
+      test:
+        - CMD
+        - python
+        - -c
+        - "import socket; socket.create_connection(('127.0.0.1', 8110), 3).close()"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    networks:
+      - internal
+
   agent:
     build: .
     restart: unless-stopped
@@ -140,8 +207,21 @@ services:
       OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
       # Read-only calendar feed. The URL is a credential in its own right.
       WA_CALENDAR_ICS_URL: "${WA_CALENDAR_ICS_URL:-}"
+      # The document renderer. Unset is a working state: the connection simply
+      # fails when a tool is called, and nothing else in the agent depends on it.
+      WA_FRAMEFORGE_MCP_URL: "${WA_FRAMEFORGE_MCP_URL:-http://frameforge:8110/mcp}"
+      # Must match the renderer's FRAMEFORGE_MCP_SESSION_ROOT: it is the same
+      # directory, mounted in both containers, and a render this agent cannot
+      # find is a document the user never receives.
+      WA_FRAMEFORGE_SESSION_ROOT: "${WA_FRAMEFORGE_SESSION_ROOT:-/work/sessions}"
       PORT: "3000"
       HOST: "0.0.0.0"
+    volumes:
+      # Read-only, and read-only is the point: the renderer writes its sessions
+      # here and this agent only ever picks up the finished page. Nothing breaks
+      # when the frameforge profile is not running — the directory is empty and
+      # whatsapp_deliver_render says the render is gone.
+      - frameforge-work:/work:ro
     ports:
       - "127.0.0.1:3000:3000"
     networks:
@@ -152,6 +232,9 @@ volumes:
   # Holds session.db (the linked session) and outbox.db (undrained messages).
   # Treat it as you would a private key.
   whatsapp-transport-data:
+  # Render scratch space, shared between the renderer (read-write) and the agent
+  # (read-only). Ephemeral by nature: sessions are overwritten and cleaned up.
+  frameforge-work:
 
 networks:
   internal:

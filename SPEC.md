@@ -764,6 +764,63 @@ hands and one fewer way for the twin to disagree with the messages.
   and guesses are dropped at the confidence floor. This is a limit, not a gap to close with a
   cleverer prompt: mind-reading that reads as insight is the worst possible output here.
 
+### 5.11 Documents — when the answer is a page ✅
+
+Some requests are not messages. A week on one sheet, a price list to send a client, a poster for a
+door, a diagram: the deliverable has a shape, and a WhatsApp text cannot carry it. The agent builds
+one with [FrameForge](https://github.com/pedroanisio/frameforge) — a document model with a Python
+SDK, served over MCP — and delivers the rendered page into a chat.
+
+```ts
+// The renderer is an MCP connection (agent/connections/frameforge.ts), not a tool file:
+//   describe_capabilities · get_guide · list_fonts · fit_text                    // look it up
+//   run_sdk_code · render_frameforge_yaml                                        // author + render
+//   design_audit · get_session_resource                                          // verify
+//   list_sessions · cleanup_sessions · list/migrate_deprecated_forms             // housekeeping
+
+whatsapp_deliver_render({                                                  // ✅
+  uri: string        // frameforge://session/<id>/page/<n>.png | .../document.pdf
+  caption?: string
+  to?: string        // omit for the user's own chat — the default, and the right one
+  force?: boolean    // send despite a reported defect; reports what was overridden
+})
+```
+
+**The verification gate is the point of this section.** A render that returns `ok: true` can still
+be unusable, and in ways a glance at the page cannot catch: an object that painted no ink is
+invisible rather than absent, text below the WCAG floor is faithful and unreadable, a clipped column
+has silently lost its last line. FrameForge measures all four and writes them to the session's
+`diagnostics.json`. The delivery tool re-reads that file **from disk** and refuses a defective page.
+
+That indirection is deliberate and is PALS's Law applied at a seam. The model is asked to check the
+same signals, and a model that has just looked at a thumbnail it likes will sometimes report that it
+did. Asking the artifact instead of the author is the only version of the check that is worth
+anything.
+
+#### Why the renderer is a container and not a host process
+
+Delivery is a **file** operation: `whatsapp_deliver_render` resolves a `frameforge://` URI to a path
+under a session root that the agent and the renderer both mount. A renderer running anywhere the
+agent cannot read — the host, another machine — renders perfectly and delivers nothing, with no
+error until the send. The compose service (`--profile frameforge`, one shared volume) is what makes
+the URI mean something on this side.
+
+The URI is also model-supplied, so `agent/lib/frameforge.ts` treats it as a boundary: the session id
+is matched against the server's own grammar, only a page PNG or the assembled PDF resolves at all
+(diagnostics and working YAML are refused by name), and the resolved path is re-checked against the
+root.
+
+#### Known weaknesses
+
+- **The diagnostics are the *session's last* render.** Sessions are single-writer and overwritten in
+  place, so a second render under one `session_id` moves the gate's evidence with it. One document,
+  one session id.
+- **A session with no `diagnostics.json` delivers unchecked.** It is reported as unverified rather
+  than treated as clean, but "reported" means a line in the tool result the model has to pass on.
+- **PDF export depends on an optional backend** that a given image may not carry.
+  `describe_capabilities(topic="backends")` answers before a promise is made; nothing enforces that
+  the promise waits for the answer.
+
 ---
 
 ## 6. Autonomy, approval, and the injection boundary

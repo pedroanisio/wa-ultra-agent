@@ -32,6 +32,10 @@ that way, and never bake either into an image.
 | `whatsapp-bridge` | The archive (`store.db`) and the HTTP API over it. Its only writer |
 | `agent` | The eve agent; its tools call the bridge over the internal network |
 
+A fourth, `frameforge`, is optional and off unless you ask for it by profile —
+the document renderer, which holds no WhatsApp credential at all. See
+[Making documents, not just messages](#making-documents-not-just-messages).
+
 The split is not decoration. eve compiles to a Nitro server that is replaced on
 every deploy, while a linked WhatsApp session must survive exactly one login and
 then persist. The archive has to outlive both.
@@ -321,6 +325,59 @@ guard working: read the chat again and use the new position.
 If a row's kind cannot be identified it is reported as `unknown` rather than
 dropped. Inspect it with `/archive/messages` and extend the signal table in
 `whatsapp-bridge/src/message-kind.js`.
+
+## Making documents, not just messages
+
+Some answers are a page: a week on one sheet, a price list, a menu for a door, a
+diagram. The `frameforge` skill wires the agent to
+[FrameForge](https://github.com/pedroanisio/frameforge), a document renderer that
+runs as its own MCP server. The agent authors the page in FrameForge's Python
+SDK, renders it, **looks at the rendered PNG**, corrects it, and sends the result
+into WhatsApp with `whatsapp_deliver_render`.
+
+It is off by default and touches no WhatsApp credential. To turn it on:
+
+```bash
+# 1. Build the image from the FrameForge checkout (a separate repository)
+cd /path/to/frameforge && make docker-build     # tags `frameforge`
+
+# 2. Start the stack with the profile
+cd /path/to/whatsapp-agent
+docker compose --profile frameforge up -d
+```
+
+FrameForge's own distribution speaks stdio, and an eve connection needs a URL, so
+`scripts/frameforge-http.py` asks FastMCP for its HTTP transport and nothing
+else — FrameForge itself is unpatched. Compose mounts that script into the stock
+image; run it directly to serve a renderer outside the stack (`--host`, `--port`,
+`--allowed-host`, and it refuses to bind every interface without being told to).
+
+The renderer and the agent share one volume: renders land in
+`/work/sessions/<id>/` and the agent reads the finished page from the same path,
+so nothing is copied over the wire. **That volume is the delivery path**, not an
+optimisation — a renderer running somewhere the agent cannot read files can
+render everything and deliver nothing.
+
+The service is not published to the host at all: it runs model-authored Python in
+a subprocess (`"sandboxed": false`, by FrameForge's own report), so the internal
+network is its only reachable surface. Point `WA_FRAMEFORGE_MCP_URL` anywhere
+else and that reasoning stops holding — give it a token, and mount its session
+root here.
+
+**A render that succeeded is not a render that is usable.** FrameForge measures
+what a thumbnail cannot show: objects that painted no ink, text below the
+contrast floor, text stacked on text, content clipped off the edge of its frame.
+`whatsapp_deliver_render` re-reads those diagnostics from disk before sending and
+refuses a defective page — the model's own opinion of the picture it just looked
+at is not the gate (PALS's Law). `force: true` sends anyway and reports what was
+overridden, so an intentional overlap is possible and a quiet one is not.
+
+The tools the model sees are a filtered subset — author, render, verify, read an
+artifact. FrameForge ships thirty-five, most of them a computer-vision lane for
+turning screenshots back into vectors; the allowlist is in
+`agent/connections/frameforge.ts`, and adding to it is meant to be a decision.
+
+Configuration lives in the `frameforge` section of `.env.example`.
 
 ## Tests
 
