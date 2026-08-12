@@ -214,7 +214,7 @@ The draft proposed building several subsystems that are framework primitives her
 | `agent.observe(event)` | `defineHook` | `agent/hooks/<slug>.ts` |
 | `memory.*` layers | **Not `defineState`** — see §4. `defineState` is *per-session* working memory only | `eve/context` |
 | Daily "what needs my attention" | `defineSchedule` | `agent/schedules/<name>.ts` |
-| `intelligence.extract_actions(messages)` | A **subagent in task mode** with an `outputSchema` — single-shot, structured return, isolated context | `agent/subagents/extract.ts` |
+| `intelligence.extract_actions(messages)` | ~~A **subagent in task mode** with an `outputSchema`~~ — **not what was built.** `generateObject` inside a tool gives the validated return outright and the isolated context turned out not to be needed; see §5.6 | `agent/lib/extraction.ts` (there is no `agent/subagents/`) |
 | Provenance / trust tagging | Already implemented — `trust: "untrusted-user-content"` | `agent/tools/whatsapp_read_chat.ts` |
 | Procedural knowledge | Skills | `agent/skills/<name>/SKILL.md` |
 | Correctness gates | `defineEval` | `evals/*.eval.ts` |

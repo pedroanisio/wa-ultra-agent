@@ -10,6 +10,19 @@ disclaimer:
 
 # Corpus findings for whatsapp-agent
 
+> **Snapshot of 2026-08-10, kept for its citations, not its verdicts.** The
+> codebase moved underneath it two days later: the Playwright/DOM half of the
+> bridge was deleted, so §7's central subject — `selectors.js` as an
+> Anti-Corruption Layer against WhatsApp's markup, and the ratchet holding it —
+> describes files that no longer exist. The invariant it argued for was not
+> abandoned; it was reached by removing the thing that violated it, and
+> `whatsapp-bridge/test/anti-corruption-layer.test.js` is now a plain assertion
+> rather than a ratchet.
+>
+> What survives unchanged is the literature: every claim here cites a document
+> and a sentence ordinal, and those citations are still resolvable. Read it for
+> what the corpus says, not for what this repository currently looks like.
+
 What the doc-ray corpus (885 documents) says that bears on this codebase — validations,
 gaps, and one thing the code does that the literature names better than we do.
 

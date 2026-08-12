@@ -321,13 +321,18 @@ both it is a shopping note and nothing replies to it. Entering one state from
 another leaves the first, because two open sessions in one chat would make the
 next `5` ambiguous.
 
-**The console is not the only thing that can answer this chat.** The agent also
-has a scheduled tic-tac-toe (`ttt`, `agent/schedules/tictactoe.md`), which keeps
-its board in the chat as a `#ttt` token rather than in a session file. Both read
-a bare digit as a move, so `GET /self/chat` reports the open console state and
-the scheduled game stands down whenever there is one — whoever is in a session
-owns the keyboard. That game also takes one turn at a time and drops a turn it
-finds already answered, which is what stops the same board being posted twice.
+**The console is not the only thing that can answer this chat.** The agent has a
+tic-tac-toe of its own (`whatsapp_tictactoe`, addressed as `ttt`), which keeps
+its board in the chat as a `#ttt` token rather than in a session file. Both it
+and the console read a bare digit as a move, so `GET /self/chat` reports the open
+console state and the agent's game stands down whenever there is one — whoever is
+in a session owns the keyboard.
+
+It answers when someone asks it to, not on a clock. **The five-minute schedule
+that used to poll for `ttt` was retired**: it duplicated this console, which
+answers the same chat as each message arrives, and two overlapping ticks posted
+the same board twice. If you want a game that replies by itself on the phone,
+that is `/game` above.
 
 **A match is a session driven by events.** One arriving message is one event; the
 board lives in the session, not in the model, and a decided match exits by itself

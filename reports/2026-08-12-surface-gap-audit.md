@@ -22,6 +22,24 @@ disclaimer: >
 
 # Surface-Gap Audit — whatsapp-agent
 
+> **CLOSED 2026-08-12.** All five findings were fixed the same day and this is
+> retained as the record of what was wrong, not as outstanding work. #2–#5 and
+> the `SKILL.md` half of #1 were closed in `da153ae`; the rest of #1 — the
+> `whatsapp_inbox_events` response contract still exported from
+> `agent/lib/bridge.ts`, promising quiet hours and an interaction budget that
+> nothing enforced — in `857cac8`, along with root causes the audit did not
+> reach: `WA_QUIET_HOURS`, a dead `whatsapp-bridge/src/media.js`, and SPEC §6.2's
+> claim that unattended reads were "bounded in code".
+>
+> Two of its own limitations are also closed. §6 recorded that no CI existed;
+> `.github/workflows/ci.yml` now runs typecheck, `npm run docs:check`, and all
+> three test suites on every push and PR. The drift the report found is enforced
+> against by `scripts/check-docs.ts`, `test/doc-surface.test.ts` and two prose
+> guards in `whatsapp-bridge/test/anti-corruption-layer.test.js`.
+>
+> **Do not read the tables below as a to-do list.** Its own disclaimer says it:
+> re-run the audit against current code before acting on any verdict.
+
 ## 1. Audit metadata
 
 - **Repository**: `/home/admin/codebases/agents/whatsapp-agent`

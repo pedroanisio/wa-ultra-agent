@@ -1291,11 +1291,17 @@ export async function sendSelfImage({
  * Which console state the self chat is in, if any.
  *
  * Reported so that a second responder can stand down. The self chat has one
- * keyboard and now has two things listening to it: this bridge's console, which
- * answers `/game` deterministically as each message arrives, and the agent's
- * tic-tac-toe tool, which answers `ttt` on a schedule. Both read bare digits as
+ * keyboard and two things listening to it: this bridge's console, which answers
+ * `/game` deterministically as each message arrives, and the agent's tic-tac-toe
+ * tool, which answers `ttt` when a turn asks it to. Both read bare digits as
  * moves, so while the console holds a session the digits are ITS input and
  * anything else answering them is talking over it.
+ *
+ * The tool used to be woken by a five-minute schedule, which is what made this
+ * check urgent — two responders on a timer will eventually overlap. That
+ * schedule was retired for exactly that reason, so the race is now narrower:
+ * one agent turn against one console message. The check stays, because "narrower"
+ * is not "gone" and the failure is a board posted twice into somebody's notebook.
  */
 export function consoleState() {
   return loadConsoleSession()?.state ?? null;

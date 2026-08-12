@@ -16,6 +16,8 @@
  *   - every route the bridge serves is documented somewhere,
  *   - every tool on disk is in the spec, and the spec names no tool that is not,
  *   - every config key the code reads appears in .env.example,
+ *   - every path under agent/ that a document names is really on disk,
+ *   - every npm script resolves to something that can run,
  *   - every human-facing document carries the disclaimer CLAUDE.md mandates.
  *
  * A failure prints exactly what is missing and exits non-zero. The prose stays
@@ -24,6 +26,7 @@
  * Run: `npm run docs:check`
  */
 
+import { existsSync } from "node:fs";
 import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 
@@ -287,6 +290,54 @@ async function checkScripts() {
 }
 
 /* ------------------------------------------------------------------ *
+ * 3b. Paths into agent/ that documentation names
+ *
+ * Tools were already covered both ways; skills and schedules were not, and the
+ * gap was not theoretical. `README.md` described "a scheduled tic-tac-toe
+ * (`ttt`, `agent/schedules/tictactoe.md`)" and the coordination dance between
+ * it and the bridge console — a file that does not exist, for a five-minute
+ * schedule that `agent/skills/tictactoe/SKILL.md` says was retired for posting
+ * the same board twice. It survived a surface-gap audit and a doc-hygiene pass
+ * because both checked tools, routes and config keys, and a schedule is none of
+ * those.
+ *
+ * The rule generalises past this one case: `agent/` is a manifest directory —
+ * eve registers what is on disk — so any `agent/<kind>/<name>` a document names
+ * is a claim about the built manifest, and it is checkable by looking.
+ * ------------------------------------------------------------------ */
+async function checkAgentPaths() {
+  const docs: Array<[string, string]> = [];
+  for await (const file of walk(join(ROOT, "agent"))) {
+    if (file.endsWith(".md")) docs.push([file.slice(ROOT.length), await readFile(file, "utf8")]);
+  }
+  for (const rel of ["README.md", "SPEC.md", "HOWTO-TRANSPORT-SETUP.md", "CLAUDE.md"]) {
+    docs.push([rel, await read(rel)]);
+  }
+
+  // A line may name a path while saying it is gone — that is how the removal of
+  // anything gets explained. Same allowance the ACL prose guards make.
+  const DISCLAIMED = /\b(remove\w*|delete\w*|gone|retired?|no longer|used to|superseded?|does not exist|never built)\b|~~/i;
+
+  const offences: string[] = [];
+  for (const [rel, body] of docs) {
+    body.split("\n").forEach((line, i) => {
+      if (DISCLAIMED.test(line)) return;
+      for (const [, ref] of line.matchAll(/`(agent\/(?:schedules|skills|tools|hooks|channels|connections)\/[\w./-]+)`/g)) {
+        if (!existsSync(join(ROOT, ref))) offences.push(`${rel}:${i + 1} names ${ref}`);
+      }
+    });
+  }
+
+  fail(
+    "agent-paths",
+    "documented paths under agent/ that are not on disk",
+    [...new Set(offences)].sort(),
+    "Build it, correct the path, or say on that line that it was removed. eve registers what is on disk, " +
+      "so a path here is a claim about the manifest.",
+  );
+}
+
+/* ------------------------------------------------------------------ *
  * 4. Frontmatter disclaimer (CLAUDE.md §5)
  *
  * Exemptions are not laziness. A SKILL.md, a schedule and instructions.md all
@@ -344,6 +395,7 @@ async function* walk(dir: string): AsyncGenerator<string> {
 await checkRoutes();
 await checkTools();
 await checkSkillTools();
+await checkAgentPaths();
 await checkEnv();
 await checkScripts();
 await checkFrontmatter();
