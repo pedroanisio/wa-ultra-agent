@@ -194,6 +194,29 @@ services:
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
       WA_BRIDGE_URL: "http://whatsapp-bridge:8099"
       WA_BRIDGE_TOKEN: "${WA_BRIDGE_TOKEN:?set WA_BRIDGE_TOKEN in .env}"
+      # ── How long a turn may take before the runtime runs it a SECOND time ──
+      #
+      # eve's local world delivers a queued turn by POSTing it to this same
+      # process and awaiting the handler's entire HTTP response. Both undici
+      # timeouts on that request default to 30_000 ms — and a turn is not an HTTP
+      # request, it is a model thinking with tools. Every turn slower than that
+      # had its delivery abandoned mid-flight, was REDELIVERED, and was executed
+      # again while the first execution was still running:
+      #
+      #   11:52:50 started · 11:53:21 'Queue delivery failed at the transport
+      #   (loop 2), retrying' · 11:53:26 're-executing inline steps' ·
+      #   11:53:28 answered in 37.9s · 11:53:33 answered again
+      #
+      # The user paid for two runs and read two different answers to one
+      # question. Ten minutes is above any turn this agent has taken (the
+      # slowest observed is a render at ~2 min) and far below the queue's own
+      # 256-attempt backstop.
+      #
+      # This does not make delivery exactly-once — nothing does; the contract is
+      # at-least-once. `agent/lib/delivery-guard.ts` is what makes a redelivery
+      # harmless. This is what makes it rare.
+      WORKFLOW_LOCAL_HEADERS_TIMEOUT_MS: "${WORKFLOW_LOCAL_HEADERS_TIMEOUT_MS:-600000}"
+      WORKFLOW_LOCAL_BODY_TIMEOUT_MS: "${WORKFLOW_LOCAL_BODY_TIMEOUT_MS:-600000}"
       # The UI gate. An agent that can read and send your WhatsApp must never
       # be reachable without a password, so the channel throws when this is unset.
       WA_UI_PASSWORD: "${WA_UI_PASSWORD:?set WA_UI_PASSWORD in .env}"

@@ -1,8 +1,18 @@
-import { defineChannel, POST } from "eve/channels";
+import { defineChannel, GET, POST } from "eve/channels";
 
 import { MODEL } from "../lib/model.ts";
 
 import { bridge } from "../lib/bridge.ts";
+import { createDeliveryGuard } from "../lib/delivery-guard.ts";
+import { silenceAction } from "../lib/silent-turn.ts";
+import {
+  snapshot as turnSnapshot,
+  stepCompleted,
+  toolFinished,
+  toolStarted,
+  turnEnded,
+  turnStarted,
+} from "../lib/turn-log.ts";
 
 /**
  * The self-chat console, pushed rather than polled.
@@ -213,6 +223,16 @@ async function recentTranscript(): Promise<string> {
 }
 export default defineChannel({
   routes: [
+    /**
+     * What the agent is doing, right now.
+     *
+     * Unauthenticated on purpose and safe to be: it reports timings, tool names
+     * and outcomes, never a word of anybody's correspondence. It exists so the
+     * question "is it working or is it stuck" has an answer that does not
+     * require reading container logs.
+     */
+    GET("/turns", async () => Response.json(turnSnapshot())),
+
     POST("/message", async (request, { from }) => {
       const expected = process.env.WA_CONSOLE_PUSH_TOKEN;
       if (!expected) {
@@ -265,7 +285,7 @@ export default defineChannel({
         session = freshSession(Date.now());
         const retryPrompt = await composePrompt(retryText, await recentTranscript());
         const retried = await from(session.address).send(retryPrompt, { auth: null });
-        pendingRequests.set(retried.id, { text: retryText, retried: true });
+        lastPushed = { text: retryText, retried: true };
         session = { ...session, warmed: true };
       };
 
@@ -273,7 +293,10 @@ export default defineChannel({
       // only reachable from the bridge, and the bridge only pushes what the
       // account owner typed into their own chat.
       const sent = await from(session!.address).send(prompt, { auth: null });
-      pendingRequests.set(sent.id, { text, retried: false });
+      // Consumed by the `turn.started` handler, which is the first place the
+      // turn's own id exists. Set immediately before the send so the pairing is
+      // unambiguous even under back-to-back messages.
+      lastPushed = { text, retried: false };
 
       // Only after the send lands. Setting it earlier would mark the session
       // warm on a turn that never reached it, and the next message — the retry —
@@ -309,6 +332,29 @@ export default defineChannel({
    * path that works. Do not remove one without the other.
    */
   events: {
+    /** The turn now has an id: bind the request to it and open the record. */
+    "turn.started"(event, _channel, ctx) {
+      const key = turnKey(event, ctx);
+      const pushed = lastPushed;
+      lastPushed = undefined;
+      if (pushed) pendingRequests.set(key, pushed);
+      turnStarted(key, pushed?.text.length ?? 0);
+    },
+
+    /** Which tools a turn reached for, and when. */
+    "actions.requested"(event, _channel, ctx) {
+      const e = event as { data?: { actions?: ReadonlyArray<{ name?: string }>; turnId?: string } };
+      for (const action of e?.data?.actions ?? []) {
+        toolStarted(turnKey(event, ctx), String(action?.name ?? "unknown"));
+      }
+    },
+
+    /** How each one ended: the timing that says "stuck on a render" out loud. */
+    "action.result"(event, _channel, ctx) {
+      const e = event as { data?: { status?: string; error?: { message?: string } } };
+      toolFinished(turnKey(event, ctx), String(e?.data?.status ?? "done"), e?.data?.error?.message);
+    },
+
     /**
      * eve wants to compact: this conversation is too big to keep growing.
      *
@@ -342,17 +388,79 @@ export default defineChannel({
      * So the last text of the turn wins, and it is flushed when the turn ends.
      * Keyed by `turnId` because nothing guarantees turns do not overlap.
      */
-    "message.completed"(event) {
+    "message.completed"(event, _channel, ctx) {
+      stepCompleted(turnKey(event, ctx));
       const reply = extractText((event as { message?: unknown })?.message);
-      if (reply) pendingReplies.set(turnIdOf(event), reply);
+      if (reply) pendingReplies.set(turnKey(event, ctx), reply);
     },
 
-    /** The turn is over: send what it ended up saying, once. */
-    async "turn.completed"(event) {
-      const key = turnIdOf(event);
+    /**
+     * The turn is over: send what it ended up saying — or say that it said
+     * nothing.
+     *
+     * ── Why the silent case is not "do nothing" ──────────────────────────────
+     * It was, and that is the bug. `if (reply)` with no else meant a turn that
+     * produced no words produced no notification either, so the user's phone
+     * stayed exactly as quiet as if the message had never arrived. Measured:
+     * two `/eve` messages of "Hello", twenty-two minutes apart, both recorded as
+     * `silent in 0.0s steps=0`, both invisible on the phone.
+     *
+     * `composePrompt` does tell the model that silence is unacceptable. That
+     * instruction cannot cover this, because in the observed failure the model
+     * was never called at all — and PALS's LAW says the missing check, not the
+     * model's behaviour, is the defect. `lib/silent-turn.ts` is the check.
+     */
+    async "turn.completed"(event, _channel, ctx) {
+      const key = turnKey(event, ctx);
+      // ── Why this is here and not around `deliverToWhatsApp` ──────────────
+      // Queue delivery is at-least-once: a turn whose delivery times out at the
+      // transport is REDELIVERED and re-executed, and the original keeps running
+      // to completion. Both then arrive here with the same key and the user gets
+      // two differently worded answers to one question, having paid for two
+      // model runs. Observed 12 August 2026, 30s apart — see lib/delivery-guard.ts.
+      //
+      // Claimed before anything is read: the second completion must leave this
+      // handler having done nothing at all, including consuming the request the
+      // first one needs to retry from.
+      if (!deliveries.claim(deliveryKey(event, ctx))) {
+        console.log(`[console] ${key.slice(0, 12)}… duplicate completion ignored (already answered)`);
+        return;
+      }
       const reply = pendingReplies.get(key);
       pendingReplies.delete(key);
-      if (reply) await deliverToWhatsApp(reply);
+      const request = pendingRequests.get(key);
+      pendingRequests.delete(key);
+      // "answered" and "silent" are different outcomes and were previously
+      // indistinguishable: a turn that ends without words looks exactly like one
+      // that never ran, which is the ambiguity this whole log exists to remove.
+      const record = turnEnded(key, reply ? "answered" : "silent", {
+        replyChars: reply?.length ?? 0,
+      });
+      if (reply) {
+        await deliverToWhatsApp(reply);
+        return;
+      }
+
+      const action = silenceAction({
+        steps: record?.steps ?? 0,
+        // Zero when the record is missing, which reads as "never reached the
+        // model" — the case that retries, and the safer of the two to guess.
+        elapsedMs: record ? (record.endedAt ?? record.startedAt) - record.startedAt : 0,
+        tools: (record?.tools ?? []).map((tool) => tool.name),
+        // No original request means no retry is possible, which is the same
+        // decision as "already retried" — so it is reported rather than looped.
+        retried: request?.retried ?? true,
+      });
+      if (action.kind === "none") return;
+
+      // Told BEFORE the retry runs. A fresh session plus a rehydrated
+      // transcript takes seconds, and an unexplained pause is the symptom
+      // being fixed, not an acceptable cost of fixing it.
+      await deliverToWhatsApp(action.body);
+
+      // A dead address stays dead: rotating is what makes the retry — and every
+      // later message — land somewhere that can actually accept a turn.
+      if (action.kind === "retry" && request) await retryInFreshSession(request.text);
     },
 
     /**
@@ -364,10 +472,26 @@ export default defineChannel({
      * cannot interpret, and it is the difference between "it broke" and "it
      * ignored me".
      */
-    async "turn.failed"(event) {
-      const key = turnIdOf(event);
+    async "turn.failed"(event, _channel, ctx) {
+      const key = turnKey(event, ctx);
+      // Same claim as the completed path, and the same guard: a re-executed turn
+      // that fails twice is one failure to report, not two. It shares the guard
+      // with `turn.completed` on purpose — a turn that answered and was then
+      // re-run into a failure must not follow its answer with an error about it.
+      if (!deliveries.claim(deliveryKey(event, ctx))) {
+        console.log(`[console] ${key.slice(0, 12)}… duplicate failure ignored (already answered)`);
+        return;
+      }
       const partial = pendingReplies.get(key);
       pendingReplies.delete(key);
+
+      turnEnded(key, "failed", {
+        error: String(
+          (event as { message?: unknown })?.message ??
+            (event as { error?: { message?: unknown } })?.error?.message ??
+            "",
+        ),
+      });
 
       const detail = String(
         (event as { message?: unknown })?.message ??
@@ -473,17 +597,60 @@ async function composePrompt(text: string, transcript: string): Promise<string> 
  */
 const pendingRequests = new Map<string, { text: string; retried: boolean }>();
 
+/** The request most recently pushed, awaiting the turn id it belongs to. */
+let lastPushed: { text: string; retried: boolean } | undefined;
+
 /** Re-run a request in a brand-new session, once. */
 let retryInFreshSession: (text: string) => Promise<void> = async () => {};
 
 /** Last assistant text per turn, awaiting the end of that turn. */
 const pendingReplies = new Map<string, string>();
 
-/** A turn's id, however the event carries it; one shared slot if it carries none. */
-function turnIdOf(event: unknown): string {
+/**
+ * Which turns have already been answered on the phone.
+ *
+ * Process-wide rather than per-session, because the duplicate it exists to stop
+ * is a re-execution of the SAME run — same session, same turn id, same key. See
+ * `lib/delivery-guard.ts` for the incident and the timeout behind it.
+ */
+const deliveries = createDeliveryGuard();
+
+/**
+ * One key for a turn, across every event that mentions it.
+ *
+ * Session AND turn, because `turnId` is `turn_0` for the first turn of EVERY
+ * session — keying on it alone collides the moment a session rotates, which
+ * this channel now does deliberately. The first version of this keyed the start
+ * by session id and the end by turn id, so no turn ever matched its own start:
+ * the log said "answered (no start recorded)" and the overflow retry could not
+ * find the text it was meant to resend.
+ */
+function turnKey(event: unknown, ctx?: { session?: { id?: string } }): string {
   const e = event as { turnId?: unknown; data?: { turnId?: unknown } } | null;
-  const id = e?.turnId ?? e?.data?.turnId;
-  return typeof id === "string" && id ? id : "single";
+  const turn = e?.turnId ?? e?.data?.turnId;
+  const session = ctx?.session?.id ?? "?";
+  return `${session}:${typeof turn === "string" && turn ? turn : "single"}`;
+}
+
+/**
+ * The key the delivery guard de-duplicates on — or nothing at all.
+ *
+ * ── Why this is not `turnKey` ───────────────────────────────────────────────
+ * `turnKey` substitutes `single` for a missing turn id, which is right for a log
+ * (a turn with no id still needs a line) and catastrophic for a guard: two
+ * different turns in one session would share `<session>:single`, and the second
+ * one's answer would be suppressed as a duplicate. Silence is the failure this
+ * channel exists to prevent, and it must not be reintroduced by the fix for
+ * saying things twice.
+ *
+ * So an unidentifiable turn yields no key, and `claim("")` always returns true:
+ * a possible duplicate reaches the user, an unprovable one is never swallowed.
+ */
+export function deliveryKey(event: unknown, ctx?: { session?: { id?: string } }): string {
+  const e = event as { turnId?: unknown; data?: { turnId?: unknown } } | null;
+  const turn = e?.turnId ?? e?.data?.turnId;
+  if (typeof turn !== "string" || turn === "") return "";
+  return `${ctx?.session?.id ?? "?"}:${turn}`;
 }
 
 /**

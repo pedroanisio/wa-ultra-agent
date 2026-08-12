@@ -74,6 +74,14 @@ It reaches no one but them, so it needs no approval, and it puts the text on the
 phone they are actually holding, where they can copy it into a real conversation
 themselves.
 
+**Except when you are already answering them in `/eve`.** There, your reply is
+delivered to that same chat automatically the moment the turn ends, so calling
+`whatsapp_write_self` with your answer sends it TWICE — the user reads the same
+thing in two bubbles, in two different wordings, and cannot tell which one you
+meant. In `/eve`, just answer; `whatsapp_write_self` is for a note you want left
+in the chat as an artefact, not for the reply itself. The turn's own prompt says
+this too, and it wins over this section when the two disagree.
+
 That is the right home for anything addressed to someone who is not allowlisted,
 and for anything they should word themselves. The `body` you write is what they
 will copy, so it must be the finished text alone — nothing before it, nothing
