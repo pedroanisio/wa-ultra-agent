@@ -750,6 +750,26 @@ Closing an arc is deliberately *not* a tool. Arc status is a modelling judgement
 so it moves when the conversation is re-modelled — which keeps one fewer vocabulary in the agent's
 hands and one fewer way for the twin to disagree with the messages.
 
+#### The archive's own period ✅
+
+An agent that cannot say what window it looked at cannot be believed about what it found. Asked
+"what period are you considering?", this one could answer only with a count — 8,824 messages in 203
+conversations — and asked for the oldest date it said it could not see one. Both true, both useless,
+and neither fixable in a prompt: the number was not in the tool surface.
+
+`GET /archive/stats` now carries `span` — `{oldest, newest, days, dated, undated}` — and
+`whatsapp_status` reports it. `undated` is the load-bearing field: a message whose timestamp never
+parsed is stored without one and is invisible to `MIN`/`MAX`, so a range quoted without it is a claim
+about part of the archive wearing the clothes of a claim about all of it. On the live archive that is
+75 messages out of 8,828.
+
+The same gap had a second half. "Check the last 45 days" had no filter behind it: `dueBefore` windows
+the day an item is **due**, and most items carry no due date at all, so a window applied there
+silently discards everything that was merely promised. `whatsapp_obligations` now takes
+`since`/`until`, which window the day the thing was **said** — and it reports the archive's span
+beside the result, so a window reaching past what has been read is answered with "that is all there
+is" rather than an empty list.
+
 #### Known weaknesses
 
 - **Title-based arc identity forks on a genuine rewording.** The normaliser snaps case, accents,

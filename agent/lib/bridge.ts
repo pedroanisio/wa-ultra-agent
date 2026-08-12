@@ -64,6 +64,24 @@ export interface ArchiveHit {
   snippet?: string;
 }
 
+/**
+ * The period the archive actually covers.
+ *
+ * `undated` is the honest part: a message whose timestamp could not be parsed
+ * is stored without one and is invisible to the bounds, so a span quoted
+ * without it is a claim about part of the archive worn as a claim about all of
+ * it.
+ */
+export interface ArchiveSpan {
+  /** ISO timestamp of the oldest dated message, or null when nothing is dated. */
+  oldest: string | null;
+  newest: string | null;
+  /** Whole days between the two, at least 1 when both exist. */
+  days: number;
+  dated: number;
+  undated: number;
+}
+
 export interface ArchiveSearchParams {
   query: string;
   chat?: string;
@@ -428,7 +446,7 @@ async function call<T>(path: string, init: RequestInit = {}, signal?: AbortSigna
 export const bridge = {
   status: (signal?: AbortSignal) =>
     call<{
-      archive: { chats: number; messages: number };
+      archive: { chats: number; messages: number; span?: ArchiveSpan };
       transport: "configured" | "unset";
     }>("/status", {}, signal),
 
@@ -868,6 +886,9 @@ export const bridge = {
       status?: string;
       overdue?: boolean;
       dueBefore?: string;
+      /** When the item was SAID, not when it is due. */
+      since?: string;
+      until?: string;
       limit?: number;
     },
     signal?: AbortSignal,

@@ -511,6 +511,8 @@ default.
 | `GET /media?key=` | One message's media, by the protocol's own message id |
 | `POST /history` | `{chat, oldestId, oldestTimestamp, count}` → ask your phone for older messages |
 | `GET /archive/search` | Keyword search, with `sender` / `since` / `until` / `kind` / `outgoing` / `order` |
+| `GET /archive/stats` | Counts **and `span`** — the oldest and newest message the archive holds, the days between, and how many messages carry no usable timestamp and so fall outside that range |
+| `GET /archive/extractions` | Obligations, with `since` / `until` windowing **when something was said** (`dueBefore` windows when it is due — a different question) |
 | `GET /archive/facts` · `POST /archive/facts` | Facts, each citing a message. Retracted ones are excluded |
 | `POST /archive/facts/retract` | `{id, reason}` → withdraws a fact. A tombstone, not a delete; a reason is required |
 | `POST /archive/facts/restore` | `{id}` → undoes a retraction made in error |
