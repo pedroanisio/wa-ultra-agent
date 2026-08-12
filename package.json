@@ -9,14 +9,16 @@
   "scripts": {
     "build": "eve build",
     "agent:dev": "eve dev",
-    "bridge:dev": "cd whatsapp-bridge && npm run start:xvfb",
+    "bridge:dev": "cd whatsapp-bridge && npm start",
     "transport": "whatsapp-transport/scripts/transport",
     "transport:dev": "whatsapp-transport/scripts/transport up",
     "transport:doctor": "whatsapp-transport/scripts/transport doctor",
     "transport:test": "cd whatsapp-transport && go test ./...",
     "test": "node --test",
+    "docs:check": "node scripts/check-docs.ts",
     "typecheck": "tsc",
-    "eval": "eve eval"
+    "eval": "eve eval",
+    "changelog": "node scripts/gen-changelog.ts"
   },
   "dependencies": {
     "@ai-sdk/anthropic": "^4.0.36",

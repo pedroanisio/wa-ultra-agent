@@ -1,0 +1,61 @@
+name: CI
+
+# Nothing here needs a WhatsApp session, a model key or a network. The test
+# suite is hermetic by design — every provider, binary and socket is injected —
+# so CI runs the same commands a developer runs, with no secrets configured.
+# If a job here ever needs a credential, that is a signal the test reaching for
+# it should have been faked instead.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  agent:
+    name: agent (TypeScript)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+      - run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      # Runs before the tests on purpose: a docs failure names the exact route,
+      # tool or config key that drifted, which is a faster read than a test
+      # failure and is usually the thing that actually broke.
+      - name: Documentation matches the code
+        run: npm run docs:check
+
+      - name: Tests
+        run: npm test
+
+  bridge:
+    name: bridge (JavaScript)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Tests
+        working-directory: whatsapp-bridge
+        run: node --test
+
+  transport:
+    name: transport (Go)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: whatsapp-transport/go.mod
+          cache-dependency-path: whatsapp-transport/go.sum
+      - name: Tests
+        working-directory: whatsapp-transport
+        run: go test ./...
