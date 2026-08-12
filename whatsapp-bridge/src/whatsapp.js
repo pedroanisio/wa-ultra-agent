@@ -773,13 +773,25 @@ export function resolveArchiveChat(query) {
  * explain a silence, and it always will.
  */
 export function requireChatKey(query) {
-  const { key } = resolveChatAddress(store().chats({ limit: 10_000 }), query);
+  const { key, candidates } = resolveChatAddress(store().chats({ limit: 10_000 }), query);
   if (key) return key;
+
+  // What it nearly matched, in the message rather than in a log. A refusal that
+  // knows "Alpha Fixture" is one word from what was asked and does not say so
+  // reads as "that person is not in the archive" — which was false, and sent a
+  // user hunting for a sync failure that did not exist.
+  const near = (candidates ?? [])
+    .map((chat) => `"${chat.displayName ?? chat.key}" (${chat.messages} messages)`)
+    .join(", ");
 
   const error = new Error(
     `No conversation in the archive answers to "${String(query ?? "").trim()}". ` +
-      "This is a name that did not resolve, NOT an empty conversation. Call /archive/chats " +
-      "(whatsapp_list_chats) and use a name exactly as it is listed there, or the chat's key.",
+      "This is a name that did not resolve, NOT an empty conversation." +
+      (near
+        ? ` The closest names in the archive are: ${near}. Ask again with one of those exactly, ` +
+          "or check with the user which one they meant — do not report the conversation as missing."
+        : " Call /archive/chats (whatsapp_list_chats) and use a name exactly as it is listed " +
+          "there, or the chat's key."),
   );
   error.statusCode = 404;
   throw error;

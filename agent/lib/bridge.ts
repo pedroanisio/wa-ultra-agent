@@ -481,8 +481,13 @@ export const bridge = {
       chat: string;
       /** The address the name resolved to. Never the name itself: see chat-address.js. */
       resolved: string;
-      /** How it resolved — `key`, `name` or `words`. An approximate match says so. */
-      matched: "key" | "name" | "words";
+      /**
+       * How it resolved. An approximate match says so rather than passing for
+       * an exact one: `key` and `name` are exact, `words` means every word asked
+       * for is in the chat's name, and `short-name` means the archive holds a
+       * SHORTER name than the one asked with — a push name against a full name.
+       */
+      matched: "key" | "name" | "words" | "short-name";
       messages: WhatsAppMessage[];
       note?: string;
     }>(

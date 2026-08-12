@@ -84,6 +84,79 @@ test("every shape of group name that read as empty now resolves to its messages"
 });
 
 /* ---------------------------------------------------------------- *
+ * The archive holds a shorter name than the user used.
+ *
+ * A user asked for their son by his full name and got "no chat under that
+ * name has ever been archived", with 349 of his messages in the table under
+ * the two-word push name his phone advertises. Referring to family by their
+ * whole name is not an edge case; it is how people talk about family.
+ * ---------------------------------------------------------------- */
+
+test("a full name finds the chat WhatsApp knows by a shorter one", () => {
+  const chats = [
+    chat(PERSON, "Alpha Fixture", 349),
+    chat(GROUP_A, "Familia (Fixture)", 196),
+    chat(GROUP_B, "Aulas do Alpha", 1),
+  ];
+
+  const { key, matched } = resolveChatAddress(chats, "Alpha Fixture de Sousa e Lima");
+
+  assert.equal(key, PERSON);
+  assert.equal(matched, "short-name", "an approximate match must not pass for an exact one");
+});
+
+test("a surname shared with the question is not a reference to it", () => {
+  // "…de Sousa e Lima" contains "Lima". A chat called "Lima" is a different
+  // person, and one shared word is a coincidence rather than a reference.
+  const chats = [chat(PERSON, "Lima", 40)];
+  assert.equal(resolveChatAddress(chats, "Alpha Fixture de Sousa e Lima").key, null);
+});
+
+test("a single-word chat still matches when it is the name you led with", () => {
+  const chats = [chat(PERSON, "Alpha", 349)];
+  const { key, matched } = resolveChatAddress(chats, "Alpha Fixture de Sousa e Lima");
+  assert.equal(key, PERSON);
+  assert.equal(matched, "short-name");
+});
+
+test("two conversations with equal claim on a fuller name are refused", () => {
+  const chats = [chat(PERSON, "Alpha Fixture", 349), chat(GROUP_A, "Alpha Fixture", 12)];
+  assert.throws(
+    () => resolveChatAddress(chats, "Alpha Fixture de Sousa e Lima"),
+    (error) => error.statusCode === 409,
+  );
+});
+
+/* ---------------------------------------------------------------- *
+ * A refusal must say what it nearly matched.
+ * ---------------------------------------------------------------- */
+
+test("an ambiguous first name is refused BY NAME, not reported as unarchived", () => {
+  const chats = [chat(PERSON, "Alpha Fixture", 349), chat(GROUP_B, "Aulas do Alpha", 1)];
+
+  assert.throws(() => resolveChatAddress(chats, "Alpha"), (error) => {
+    assert.equal(error.statusCode, 409);
+    assert.match(error.message, /Alpha Fixture/);
+    assert.match(error.message, /Aulas do Alpha/);
+    return true;
+  });
+});
+
+test("a name that resolves to nothing carries its near misses", () => {
+  const chats = [chat(PERSON, "Bia Fixture", 349), chat(GROUP_A, "Vizinhança", 12)];
+
+  const { key, matched, candidates } = resolveChatAddress(chats, "Bia Nogueira Fernandes");
+
+  assert.equal(key, null);
+  assert.equal(matched, "none");
+  assert.deepEqual(
+    candidates.map((c) => c.displayName),
+    ["Bia Fixture"],
+    "the one that shares a word is worth naming; the one that shares none is not",
+  );
+});
+
+/* ---------------------------------------------------------------- *
  * The properties that must survive the fix.
  * ---------------------------------------------------------------- */
 
@@ -130,8 +203,13 @@ test("a provisional row with no messages does not shadow the address that has th
 test("the fuzzy match still refuses to pick between two plausible chats", () => {
   const chats = [chat(GROUP_A, "Pais do Bloco", 80), chat(GROUP_B, "Moradores do Bloco", 936)];
   // "bloco" is a word in both names and an exact match for neither, so there is
-  // no answer — and the busier chat is not it.
-  assert.equal(resolveChatAddress(chats, "Bloco").key, null);
+  // no answer — and the busier chat is not it. Refused BY NAME, so the caller
+  // can ask which one rather than reporting the word as unknown.
+  assert.throws(() => resolveChatAddress(chats, "Bloco"), (error) => {
+    assert.equal(error.statusCode, 409);
+    assert.match(error.message, /Pais do Bloco.*Moradores do Bloco|Moradores do Bloco.*Pais do Bloco/);
+    return true;
+  });
   // An exact fold match still wins outright over a name that merely contains it.
   assert.equal(resolveChatAddress(chats, "pais do bloco").key, GROUP_A);
 });

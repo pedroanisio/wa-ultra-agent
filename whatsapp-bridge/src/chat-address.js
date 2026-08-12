@@ -94,6 +94,34 @@ function ambiguous(asked, candidates) {
 }
 
 /**
+ * The conversations worth naming when the answer is no.
+ *
+ * ── Why a failure carries candidates ────────────────────────────────────────
+ * A user asked for "Alpha Fixture de Sousa e Lima" — their son, by his full
+ * name, and then sent his contact card. The archive held 349 of his messages
+ * under the two-word push name WhatsApp had for him. The answer was "no chat
+ * under that name has ever been archived", which is a false statement about the
+ * archive built from a true statement about a string, and it sent the user
+ * looking for a sync problem that did not exist.
+ *
+ * A resolver that knows "Alpha Fixture" is one word away from what was asked
+ * and says nothing about it is withholding the answer. So every refusal carries
+ * what it nearly matched, ordered by how much of the question each one covers.
+ */
+function nearMisses(rows, asking, limit = 5) {
+  return rows
+    .filter((chat) => chat.displayName)
+    .map((chat) => {
+      const have = new Set(words(chat.displayName));
+      return { chat, shared: asking.filter((word) => have.has(word)).length };
+    })
+    .filter((scored) => scored.shared > 0)
+    .sort((a, b) => b.shared - a.shared || Number(b.chat.messages) - Number(a.chat.messages))
+    .slice(0, limit)
+    .map((scored) => scored.chat);
+}
+
+/**
  * The address a question about a conversation is really about.
  *
  * @param chats  Rows as `store.chats()` returns them: `{ key, displayName, messages }`.
@@ -126,7 +154,7 @@ export function resolveChatAddress(chats, asked) {
     return { key: chosen.key, matched: chosen.key === question ? "key" : "name" };
   }
 
-  // Every word you typed, in any order — `familia ulian` finds `Familia (Ulian)`
+  // Every word you typed, in any order — `vizinhos norte` finds `Vizinhos (Norte)`
   // only when the fold keeps both words, so this is a genuine fallback and not a
   // second spelling of the exact match.
   const asking = words(question);
@@ -139,7 +167,48 @@ export function resolveChatAddress(chats, asked) {
   });
 
   const narrowed = narrow(loose);
-  return narrowed.length === 1
-    ? { key: narrowed[0].key, matched: "words" }
-    : { key: null, matched: "none" };
+  if (narrowed.length === 1) return { key: narrowed[0].key, matched: "words" };
+  if (narrowed.length > 1) throw ambiguous(question, narrowed);
+
+  /**
+   * ── The other direction: WhatsApp holds a SHORTER name than you used ──────
+   *
+   * The rule above asks whether everything you typed is in the chat's name. It
+   * cannot match a person addressed more fully than WhatsApp knows them, and
+   * that is the commonest way anyone refers to family: the archive holds the
+   * two-word push name their phone advertises, and the user types the name on
+   * the birth certificate. 349 messages sat behind exactly that gap.
+   *
+   * So the containment is tried the other way round, with two guards, because
+   * this direction is the one that can be wrong. "Alpha Fixture de Sousa e
+   * Lima" contains "Lima", and a chat called "Lima" is not the answer:
+   *
+   *   · at least two words of the name must be covered — one shared surname is
+   *     a coincidence, two words is a reference;
+   *   · unless the single word is the FIRST one you typed, which for a person
+   *     is the given name and for a group is what it is called before it is
+   *     described.
+   *
+   * The winner must still cover strictly more of the question than anything
+   * else. A tie is two conversations with equal claim, and this refuses those
+   * the same way it refuses two identical names.
+   */
+  const shorter = rows
+    .filter((chat) => chat.displayName)
+    .map((chat) => {
+      const have = words(chat.displayName);
+      const covered = have.filter((word) => asking.includes(word));
+      return { chat, have, shared: covered.length };
+    })
+    .filter(({ have, shared }) => shared === have.length && shared > 0)
+    .filter(({ have, shared }) => shared >= 2 || have[0] === asking[0]);
+
+  if (shorter.length > 0) {
+    const best = Math.max(...shorter.map((s) => s.shared));
+    const winners = narrow(shorter.filter((s) => s.shared === best).map((s) => s.chat));
+    if (winners.length === 1) return { key: winners[0].key, matched: "short-name" };
+    if (winners.length > 1) throw ambiguous(question, winners);
+  }
+
+  return { key: null, matched: "none", candidates: nearMisses(rows, asking) };
 }
