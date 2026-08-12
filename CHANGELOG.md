@@ -20,6 +20,7 @@ and [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- check the documentation against the code, in CI (`76c0b38`)
 - the queue you can act on, instead of a phone and a curl (`7039e82`)
 - the archive can say what period it covers, and obligations can be windowed by it (`779b712`)
 - derive every model limit from a registry, and move to gpt-5.6-luna (`d89bcfe`)
@@ -30,11 +31,18 @@ and [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- the browser is gone from the code that outlived it (`857cac8`)
+- the identity guard could not see the names it was guarding (`0429620`)
+- the archive holds a shorter name than the one people use (`44cf78e`)
+- assemble the pairing placeholder, so the identity guard stops flagging it (`a9a4232`)
+- a conversation the archive holds must never read as empty (`7cecc68`)
+- one answer per turn, however many times the runtime runs it (`25a32a1`)
 - a turn that dies now says so, instead of leaving the chat silent (`5e8f88b`)
 - align the agent's tool surface with what the bridge actually returns (`d431b96`)
 
 ### Documentation
 
+- make every document describe the system that exists (`da153ae`)
 - say which name the send allowlist actually matches (`06dede8`)
 - update HOWTO-TRANSPORT-SETUP.md for contact name placeholders and add PRODUCT-DRAFT.md (`93d432b`)
 
