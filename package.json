@@ -23,6 +23,7 @@
     "@ai-sdk/openai": "^4.0.40",
     "ai": "^7.0.38",
     "eve": "^0.31.3",
+    "qrcode-generator": "^2.0.4",
     "zod": "4.4.3"
   },
   "devDependencies": {

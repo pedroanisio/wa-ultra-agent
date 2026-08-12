@@ -152,6 +152,18 @@ export function transportPairPhone(phone) {
   return transport().pairPhone(phone);
 }
 
+/**
+ * The rotating pairing code, as a live stream for something upstream to render.
+ *
+ * The bridge does not read it. It holds the transport's token and its consumer
+ * — the agent's web UI — deliberately does not, which is the only reason this
+ * proxy exists: rendering the code needs the stream, and handing out the token
+ * that reaches it would give the UI the whole transport, sending included.
+ */
+export function transportPairQr(signal) {
+  return transport().pairQrStream(signal);
+}
+
 export function transportConnect() {
   return transport().connect();
 }

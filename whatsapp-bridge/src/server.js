@@ -56,6 +56,7 @@ import {
   transportHistory,
   transportMedia,
   transportPairPhone,
+  transportPairQr,
   transportStatus,
 } from "./whatsapp.js";
 
@@ -280,6 +281,53 @@ const server = createServer(async (req, res) => {
     if (path === "/transport/pair/phone" && req.method === "POST") {
       const { phone } = await readJson(req);
       return send(res, 200, await transportPairPhone(phone));
+    }
+
+    /**
+     * The rotating QR payload, passed through as an event stream.
+     *
+     * ── Why the bridge carries this at all ──────────────────────────────────
+     * The agent's web UI renders the code, and the agent holds no transport
+     * token — deliberately, because that token also sends messages. Proxying
+     * the one stream is narrower than handing over the credential: this route
+     * can be watched, and it cannot send, connect or read a contact.
+     *
+     * ── Why it is not buffered ──────────────────────────────────────────────
+     * The stream never ends. WhatsApp rotates the code every ~20 s and each one
+     * arrives as a `data:` line, so anything that waits for the body to finish
+     * waits until pairing times out. Chunks are forwarded as they arrive, and
+     * the upstream read is aborted when this response closes — otherwise a
+     * browser that navigated away leaves a QR channel open on the transport and
+     * the next attempt to pair finds one already running.
+     */
+    if (path === "/transport/pair/qr") {
+      const upstream = new AbortController();
+      const stream = await transportPairQr(upstream.signal);
+
+      res.writeHead(200, {
+        "content-type": "text/event-stream",
+        "cache-control": "no-store",
+        connection: "keep-alive",
+        // Nothing here should be buffered by anything in between: a proxy that
+        // holds 4 KB before flushing delays the code past its own rotation.
+        "x-accel-buffering": "no",
+      });
+
+      res.on("close", () => upstream.abort());
+
+      try {
+        for await (const chunk of stream.body) {
+          if (res.writableEnded) break;
+          res.write(chunk);
+        }
+      } catch (error) {
+        // An abort is how this stream normally ends: the operator paired, or
+        // closed the page. Only report something that is not that.
+        if (!upstream.signal.aborted) {
+          res.write(`event: error\ndata: ${JSON.stringify({ error: String(error) })}\n\n`);
+        }
+      }
+      return res.end();
     }
 
     // Everything ingested so far. Cheap and browser-free: it reads SQLite, not

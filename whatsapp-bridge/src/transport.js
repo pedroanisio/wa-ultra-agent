@@ -410,6 +410,35 @@ export function createTransport({
     pairPhone: (phone) => request("/pair/phone", { method: "POST", body: { phone } }),
 
     /**
+     * The rotating pairing code, as the raw event stream.
+     *
+     * Deliberately NOT run through `request()`: that awaits `response.json()`,
+     * and this response never ends — WhatsApp rotates the code roughly every
+     * twenty seconds and the transport emits each one as an SSE `data:` line for
+     * as long as the caller listens. Parsing it as a document would hang until
+     * the pairing timed out.
+     *
+     * The `Response` is returned whole so the caller owns the body: the bridge
+     * pipes it to its own client, and aborting that request has to reach the
+     * transport, or a browser that navigated away leaves a QR channel open and
+     * the next attempt to pair finds one already running.
+     */
+    pairQrStream: async (signal) => {
+      const response = await fetchImpl(`${root}/pair/qr`, {
+        headers: { Authorization: `Bearer ${token}`, Accept: "text/event-stream" },
+        signal,
+      });
+      if (!response.ok) {
+        const detail = await errorDetail(response);
+        throw new TransportError(
+          `transport: GET /pair/qr failed (${response.status}): ${detail}`,
+          { statusCode: response.status },
+        );
+      }
+      return response;
+    },
+
+    /**
      * The roster, keyed by identity — never by raw JID, so no phone number
      * crosses the boundary. This is where a send gets its `to`.
      */

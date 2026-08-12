@@ -198,6 +198,15 @@ services:
       # be reachable without a password, so the channel throws when this is unset.
       WA_UI_PASSWORD: "${WA_UI_PASSWORD:?set WA_UI_PASSWORD in .env}"
       WA_UI_USERNAME: "${WA_UI_USERNAME:-me}"
+      # Where the web UI's Preferences screen writes.
+      #
+      # Unset — or with the mount below removed — Preferences is read-only: it
+      # still reports every setting and whether the running process agrees with
+      # the file, and every Save is refused with a message saying why. That is
+      # the correct posture for a deployment that does not want its
+      # configuration editable through a browser, and it is a supported state
+      # rather than a broken one.
+      WA_ENV_FILE: "${WA_ENV_FILE:-/app/.env}"
       # The bridge's push route. Its own secret, deliberately not WA_UI_PASSWORD:
       # this grants "the user said this", never a login to the agent's UI.
       WA_CONSOLE_PUSH_TOKEN: "${WA_CONSOLE_PUSH_TOKEN:-}"
@@ -289,6 +298,28 @@ services:
       # it at a path the image lacks and Docker creates it root-owned, which the
       # agent (uid 1000) cannot write to.
       - eve-workflow-data:/app/.eve/.workflow-data
+      # The configuration file itself, writable, so the UI's Preferences screen
+      # can change a setting without shell access to the host.
+      #
+      # ── What this widens, stated plainly ──────────────────────────────────
+      # Anyone holding WA_UI_PASSWORD can now change the send allowlist, the
+      # retention windows and every third-party endpoint. Before this mount that
+      # required a shell on the host. The narrowing is that only the keys in
+      # `agent/lib/ui-settings.ts` may be written — no token, no password, no
+      # provider key, no service URL — and a write of anything else is refused
+      # rather than appended.
+      #
+      # Two consequences worth knowing before you keep it:
+      #   · A write here changes what the NEXT start reads. Nothing applies to a
+      #     running process, and the screen says so per row rather than
+      #     pretending a toggle took effect.
+      #   · Remove this line and the whole screen becomes read-only, which is a
+      #     supported posture, not a broken one.
+      #
+      # `.env` must EXIST before the first `up`. Docker creates a missing bind
+      # source as a DIRECTORY, and a directory at /app/.env reads as an
+      # unreadable file for ever after — `cp .env.example .env` first.
+      - ./.env:/app/.env:rw
     ports:
       - "127.0.0.1:3000:3000"
     networks:

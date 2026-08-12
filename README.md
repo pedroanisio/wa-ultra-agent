@@ -193,6 +193,77 @@ curl -s -H "Authorization: Bearer $WA_BRIDGE_TOKEN" http://127.0.0.1:8099/status
 The session persists across restarts on the volume. WhatsApp expires linked
 devices after a long idle period, so expect to re-scan occasionally.
 
+## The web UI
+
+`http://127.0.0.1:3000/ui`, behind `WA_UI_USERNAME` / `WA_UI_PASSWORD` — the same
+credential and the same auth walk as the agent's API, because an endpoint that
+can read and send your WhatsApp must not have a second, weaker door.
+
+Five screens, and the unit of all of them is a **decision**, not a metric:
+
+| Screen | What it is for |
+|---|---|
+| **Queue** | Everything waiting — proposals, overdue promises, unanswered questions, what someone owes you — each with the conversation, the twin's two halves, and the actions that close it |
+| **Setup** | Eight gates in the order they can actually be satisfied, ending in a live QR you can scan |
+| **Preferences** | Every switch that is safe to change from a browser, with what it costs stated on the row |
+| **Edit & send** | The one moment the phone cannot give you: a draft, who it resolves to, and everything sending will do |
+| **Tools** | Which of the 37 tools the model can reach right now, and why the rest are dark |
+
+**A quiet day is an empty queue.** Not four zeroes — nothing. A page that always
+has something on it turns every friendship into a backlog, which is the same
+reason the daily digest sends nothing on a quiet day.
+
+**Both halves of the twin stay apart.** *Measured* is arithmetic over rows that
+were really read; *read* is a model's reading of the same messages. The agent is
+required to say which one it is speaking from, and on this screen that stops
+being a rule and becomes a layout.
+
+**The queue can send, and that is the point.** `twin/proposals` exists because
+something has to decide, and until now the only place to decide was the phone.
+The allowlist is unchanged and still enforced by the bridge — this page is
+another caller of `POST /send`, not a way around it. Two things it deliberately
+does not have: a free-text "message anyone" box, so every send starts from a
+conversation with its context on screen, and bulk actions, because accepting
+four proposals with one click is how this becomes a machine that talks to your
+friends on your behalf.
+
+### Pairing from the browser
+
+The transport streams a fresh QR payload every ~20 seconds. The bridge proxies
+that stream (`GET /transport/pair/qr`) and the agent re-encodes each payload as
+a module matrix the page paints — so the QR codec lives on one side of the wire
+and the browser only draws cells. The agent never holds `WA_TRANSPORT_TOKEN`:
+proxying one stream is strictly narrower than handing over a credential that
+also sends messages.
+
+Phone-number pairing is on the same screen and needs no QR at all.
+
+### What Preferences can and cannot write
+
+It writes `.env` — the same file the rest of this README tells you to edit —
+because a settings table in `store.db` would be a second source of truth that
+disagrees with the file the moment anyone edits it by hand. The edit is
+surgical: the line for a key is replaced and every comment survives, since
+`.env.example` is largely an explanation of what each switch costs.
+
+Two limits are structural rather than incidental:
+
+- **Only feature switches.** The writable set is `agent/lib/ui-settings.ts`:
+  the send gate and allowlist, retention windows, third-party endpoints and
+  their keys, the model id. Never `WA_UI_PASSWORD`, `WA_BRIDGE_TOKEN`,
+  `WA_TRANSPORT_TOKEN`, a service URL, or a provider key. A UI that can rotate
+  the secret guarding it, or point the agent at a different bridge, is not a
+  settings page. `test/ui-settings.test.ts` asserts their absence.
+- **A save changes the next start, never the running process.** Writing a file
+  cannot change a live process's environment, so every row shows what is *in
+  force* alongside what is *saved* and names the service to restart. A screen
+  that reported a send allowlist which was not being enforced would be the most
+  dangerous possible lie for this particular page to tell.
+
+Drop the `./.env:/app/.env:rw` mount from `docker-compose.yml` and the screen is
+read-only: it still reports everything, and every save is refused with a message
+saying why.
+
 ## Self-notes
 
 The agent can write to **your own chat** — drafts, summaries, transcripts,
