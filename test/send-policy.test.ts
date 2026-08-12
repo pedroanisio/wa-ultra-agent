@@ -83,3 +83,61 @@ test("a missing or malformed message asks rather than assumes", () => {
   assert.equal(sendApproval({ toolInput: {} }), "user-approval");
   assert.equal(sendApproval({}), "user-approval");
 });
+
+/**
+ * The field-name mismatch that made voice notes impossible.
+ *
+ * `sendApproval` read `toolInput.message`. `whatsapp_send_voice` names its
+ * field `text`. Every voice note therefore handed the policy an `undefined`,
+ * `commitsTheUser` failed closed on it as designed, and the answer was always
+ * `user-approval` — a gate the WhatsApp console cannot open, so the turn parked
+ * and the user saw nothing at all. Neither model, endpoint nor session was
+ * involved; it survived a provider switch untouched.
+ */
+test("a voice note to the user's own chat needs no approval", () => {
+  assert.equal(sendApproval({ toolInput: { text: "Good morning!" } }), "not-applicable");
+});
+
+test("a voice note reads the field it actually declares", () => {
+  // Innocuous words, addressed to a person: the gate must judge the WORDS, not
+  // fail closed because it was looking for a field this tool does not have.
+  assert.equal(
+    sendApproval({ toolInput: { to: "Ana", text: "The shop opens at ten." } }),
+    "not-applicable",
+  );
+});
+
+test("a spoken commitment to another person still needs approval", () => {
+  assert.equal(
+    sendApproval({ toolInput: { to: "Ana", text: "Sorry, I'll be there tomorrow." } }),
+    "user-approval",
+  );
+});
+
+test("a text message keeps being judged on its own field", () => {
+  assert.equal(
+    sendApproval({ toolInput: { to: "Ana", message: "Sorry, I promise I'll pay Friday." } }),
+    "user-approval",
+  );
+  assert.equal(
+    sendApproval({ toolInput: { to: "Ana", message: "ok" } }),
+    "not-applicable",
+  );
+});
+
+test("an addressed send with no words at all still fails closed", () => {
+  // The fail-closed default is right and stays: what was wrong was reading the
+  // wrong field, not what happens when there genuinely are no words to read.
+  assert.equal(sendApproval({ toolInput: { to: "Ana" } }), "user-approval");
+  assert.equal(sendApproval({ toolInput: { to: "Ana", text: "" } }), "user-approval");
+});
+
+test("no approval gate can be satisfied from the WhatsApp console", () => {
+  // Not an assertion about code — a note that `user-approval` on a console turn
+  // is an unanswerable prompt. Every case above that returns it must therefore
+  // be a case where a human at a browser or terminal is the intended approver.
+  assert.equal(
+    sendApproval({ toolInput: { to: "Ana", text: "I promise I'll send it tonight." } }),
+    "user-approval",
+  );
+});

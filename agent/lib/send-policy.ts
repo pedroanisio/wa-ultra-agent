@@ -87,16 +87,55 @@ export function commitsTheUser(text: unknown): boolean {
 }
 
 /**
- * The policy eve calls before `whatsapp_send_message` runs.
+ * The policy eve calls before `whatsapp_send_message` and `whatsapp_send_voice`
+ * run.
  *
  * `not-applicable` means "no approval needed from me", not "approved" — the
  * bridge's allowlist still has to agree, and it is the thing that actually
  * refuses. This only decides whether a human sees the words first.
+ *
+ * ── The failure this signature exists for ───────────────────────────────────
+ * It read `toolInput.message` only. `whatsapp_send_message` calls its field
+ * `message`; `whatsapp_send_voice` calls its field `text`. So every voice note
+ * handed this policy an `undefined`, `commitsTheUser` failed closed on a
+ * non-string exactly as it is written to, and the answer was ALWAYS
+ * `user-approval` — including for a note to the user's own chat, which reaches
+ * nobody and can commit no one.
+ *
+ * eve parks a turn awaiting approval, and the WhatsApp console has no way to
+ * present or answer one. So the turn ended with no words, no tool result and no
+ * error: "Send me a good morning voice note" produced silence, twice, on two
+ * different models, while "hello" in the same session answered in 1.9s. A
+ * field-name mismatch is not usually a silent, total feature outage; it is one
+ * when the thing it misreads fails closed and the gate it opens has no door.
+ *
+ * ── Why an empty recipient needs no approval ────────────────────────────────
+ * The same reason `imageSendApproval` gives: the user's own chat reaches nobody.
+ * A voice note with no `to` is the user hearing their own words before anyone
+ * else does, which is the step approval exists to create — asking them to
+ * approve it is asking them to approve listening to themselves.
+ *
+ * `whatsapp_send_message` is unaffected by that branch: its `to` is required, so
+ * it never arrives here without one.
  */
 export function sendApproval(
-  input: { toolInput?: { to?: unknown; message?: unknown } } = {},
+  input: { toolInput?: { to?: unknown; message?: unknown; text?: unknown } } = {},
 ): ApprovalDecision {
-  return commitsTheUser(input.toolInput?.message) ? "user-approval" : "not-applicable";
+  // Whichever field this tool names its words. Read together rather than by
+  // tool, so a third sender inherits the gate instead of slipping past it.
+  const body = input.toolInput?.message ?? input.toolInput?.text;
+  const hasWords = typeof body === "string" && body.trim() !== "";
+
+  const to = input.toolInput?.to;
+  const addressed = typeof to === "string" && to.trim() !== "";
+
+  // No recipient AND no words is not a self-send, it is a malformed call. The
+  // absence of a recipient only means "my own chat" on a request that is
+  // otherwise complete; on one that is not, it means nothing is known about
+  // where this is going, which is the case to ask about.
+  if (!addressed) return hasWords ? "not-applicable" : "user-approval";
+
+  return commitsTheUser(body) ? "user-approval" : "not-applicable";
 }
 
 /**

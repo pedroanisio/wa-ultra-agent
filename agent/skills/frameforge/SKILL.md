@@ -207,6 +207,25 @@ good is doing the one thing this system is built to distrust — and
 `whatsapp_deliver_render` reads the same diagnostics off disk and will refuse
 the send, so working around the check is not available either.
 
+## A refusal you do not report is a failure
+
+`whatsapp_deliver_render` re-reads the diagnostics and refuses a defective page.
+That is correct, and it is only half of the job. **Say what happened.** A page
+blocked for collisions and never mentioned is indistinguishable, from the user's
+side, from a request that never arrived — they are looking at their phone and
+nothing came.
+
+This is not hypothetical. A detailed infographic was authored, rendered, and
+refused for two overlapping labels (~303 units²). The refusal was right. The
+silence that followed meant the user learned nothing had worked only by asking.
+
+So: when a render is refused, reply with what is wrong and what you are doing
+about it — "two labels overlap in the legend, fixing and re-rendering" — and
+then fix it. The defect is usually small and mechanical: a box two units short,
+a description that starts before its title ends, content running past the
+canvas. Fix the document and render again. Only say you cannot do it after you
+have tried and the diagnostics still refuse.
+
 ## Sessions
 
 Every call writes into a session directory named by `session_id`, and a render

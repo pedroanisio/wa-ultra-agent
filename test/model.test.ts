@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { MODEL, MODELS, requestOptionsFor } from "../agent/lib/model.ts";
+import { MODEL, MODELS, reasoningFor } from "../agent/lib/model.ts";
 import { CONTEXT_WINDOW_TOKENS } from "../agent/lib/tool-output.ts";
 
 /**
@@ -47,22 +47,35 @@ test("effort is not sent to a model that rejects it", () => {
   // Haiku 4.5 errors on `effort`. Nothing sets it today, which is exactly when
   // a guard is cheap to add and expensive to retrofit.
   assert.equal(MODELS["claude-haiku-4-5"].supportsEffort, false);
-  assert.equal(requestOptionsFor(MODELS["claude-haiku-4-5"]).effort, undefined);
+  assert.equal(reasoningFor(MODELS["claude-haiku-4-5"]), undefined);
 });
 
 test("effort is sent to a model that supports it", () => {
-  const options = requestOptionsFor(MODELS["claude-sonnet-5"]);
-  assert.ok(options.effort, "a model that supports effort should be given one");
+  assert.ok(
+    reasoningFor(MODELS["claude-sonnet-5"]),
+    "a model that supports effort should be given one",
+  );
 });
 
 test("the effort level asked for is one the model actually accepts", () => {
   for (const spec of Object.values(MODELS)) {
-    const options = requestOptionsFor(spec);
-    if (!options.effort) continue;
+    const level = reasoningFor(spec);
+    if (!level) continue;
     assert.ok(
-      spec.effortLevels.includes(options.effort),
-      `${spec.id} was asked for effort "${options.effort}", which it does not accept`,
+      spec.effortLevels.includes(level),
+      `${spec.id} was asked for effort "${level}", which it does not accept`,
     );
+  }
+});
+
+test("the level asked for is one eve can actually forward", () => {
+  // `max` is a level the models accept and the framework has no word for: its
+  // vocabulary ends at `xhigh`, and a provider without `xhigh` is sent `max` in
+  // its place. Asking for it would be silently answered with something else.
+  for (const spec of Object.values(MODELS)) {
+    const level = reasoningFor(spec);
+    if (!level) continue;
+    assert.notEqual(level, "max", `${spec.id} was asked for a level eve cannot express`);
   }
 });
 
@@ -108,7 +121,29 @@ test("luna accepts effort, so effort is sent to it", () => {
   const luna = MODELS["gpt-5.6-luna"];
   assert.equal(luna.supportsEffort, true);
   assert.ok(luna.effortLevels.includes("medium"));
-  assert.ok(requestOptionsFor(luna).effort);
+  assert.ok(reasoningFor(luna));
+});
+
+/* ── Opus 5 ────────────────────────────────────────────────────────────
+ *
+ * The first entry that thinks without being asked. Every model before it
+ * treated an absent thinking parameter as off, so "send nothing" was a way of
+ * saying no; here it is a way of saying `high` and meaning it.
+ * ------------------------------------------------------------------ */
+
+test("Opus 5 is known, with the window it actually has", () => {
+  const opus = MODELS["claude-opus-5"];
+  assert.ok(opus, "the model must be in the table before it can be configured");
+  assert.equal(opus.provider, "anthropic");
+  assert.equal(opus.contextWindowTokens, 1_000_000);
+  assert.equal(opus.endpoint, "messages");
+});
+
+test("Opus 5 is asked to think at a level it accepts", () => {
+  const opus = MODELS["claude-opus-5"];
+  const level = reasoningFor(opus);
+  assert.ok(level, "a model that thinks by default should be told how hard, not left at high");
+  assert.ok(opus.effortLevels.includes(level));
 });
 
 test("switching provider moves the context guards with it", () => {

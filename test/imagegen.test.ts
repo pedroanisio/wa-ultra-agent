@@ -12,6 +12,7 @@ import {
   generateImage,
   imageRequest,
   loadImage,
+  previewFor,
   storeImage,
 } from "../agent/lib/imagegen.ts";
 
@@ -174,6 +175,37 @@ test("a rate limit is retried", async () => {
 
   assert.equal(attempts, 2);
   assert.equal(image.mimetype, "image/png");
+});
+
+/* ── the copy the model looks at ───────────────────────────────────── */
+
+test("the preview is a downscale, so looking at a picture does not cost the window", async () => {
+  const calls: Array<{ cmd: string; args: string[] }> = [];
+  const run = async (cmd: string, args: string[]) => {
+    calls.push({ cmd, args });
+    return { stdout: JPEG, stderr: "", code: 0 };
+  };
+
+  const preview = await previewFor(Buffer.alloc(400_000, 7), { run });
+
+  assert.deepEqual(preview, JPEG);
+  assert.equal(calls[0].cmd, "ffmpeg");
+  // The bytes to SEND are never the bytes shown: a scale and a JPEG re-encode
+  // are what make a 250 KB picture affordable to look at.
+  assert.ok(calls[0].args.some((arg) => arg.startsWith("scale=")), calls[0].args.join(" "));
+});
+
+test("a preview that cannot be made is null, not a crash and not the full image", async () => {
+  // ffmpeg missing or refusing is a reason to say the picture is UNSEEN. It is
+  // never a reason to fall back to the full-size bytes, which is the one
+  // outcome the budget exists to prevent.
+  const failing = async () => ({ stdout: Buffer.alloc(0), stderr: "no such file", code: 1 });
+  assert.equal(await previewFor(Buffer.alloc(400_000, 7), { run: failing }), null);
+
+  const throwing = async () => {
+    throw new Error("ffmpeg could not be started");
+  };
+  assert.equal(await previewFor(Buffer.alloc(400_000, 7), { run: throwing }), null);
 });
 
 /* ── where it waits until it is sent ───────────────────────────────── */

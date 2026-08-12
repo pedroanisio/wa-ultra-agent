@@ -218,6 +218,8 @@ const RETRYABLE = new Set([429, 500, 502, 503, 504]);
 export interface ImageDeps {
   fetch?: typeof globalThis.fetch;
   key?: string;
+  /** The downscaler behind `previewFor`. Injected so tests need no ffmpeg. */
+  run?: Runner;
   /** Backoff between retries. Zero in tests so they do not sleep. */
   retryDelayMs?: number;
 }
@@ -302,6 +304,97 @@ export async function generateImage(input: ImageInput, deps: ImageDeps = {}): Pr
 
   throw new ImageError(`Image generation failed (${last})`, "provider");
 }
+
+/* ------------------------------------------------------------------ *
+ * The copy the model looks at.
+ *
+ * The picture has to be SEEN — that is the entire reason generating and sending
+ * are separate calls — and the context window is a shared, finite resource that
+ * one tool result may only take a slice of (see `tool-output.ts`, and the turn
+ * that died at 1.1M tokens which produced it). A generated JPEG runs to a couple
+ * of hundred kilobytes, which base64-encodes to more than that slice.
+ *
+ * Both facts survive by showing a DIFFERENT image from the one that gets sent: a
+ * downscale, big enough to read a misspelled word in and small enough to cost
+ * almost nothing. The bytes on disk are untouched, so what the user receives is
+ * still full size.
+ * ------------------------------------------------------------------ */
+
+/** One shelled-out command. Injected so tests need no binaries. */
+export type Runner = (
+  cmd: string,
+  args: string[],
+  input?: Buffer,
+) => Promise<{ stdout: Buffer; stderr: string; code: number }>;
+
+/**
+ * How wide the preview is.
+ *
+ * 640 pixels, chosen against what the preview is FOR: spotting a misspelled
+ * word, a sixth finger, a logo nobody asked for. Smaller starts hiding exactly
+ * the defects this step exists to catch, which would make the check theatre.
+ */
+const PREVIEW_WIDTH = 640;
+
+/**
+ * The downscale. `-vf scale=640:-1` keeps the aspect ratio, `-q:v 6` is a
+ * middling JPEG quality — visibly lossy at full size, indistinguishable at the
+ * size a model reads it — and `image2` writes a single still rather than a
+ * one-frame video stream.
+ */
+export function previewArgs(): string[] {
+  return [
+    "-hide_banner", "-loglevel", "error",
+    "-i", "pipe:0",
+    "-vf", `scale=${PREVIEW_WIDTH}:-1:flags=lanczos`,
+    "-frames:v", "1",
+    "-q:v", "6",
+    "-f", "image2",
+    "-c:v", "mjpeg",
+    "pipe:1",
+  ];
+}
+
+/**
+ * A small JPEG of `bytes`, or `null` when one could not be made.
+ *
+ * Null rather than a fallback to the original, deliberately. A missing ffmpeg is
+ * a reason to tell the user the picture is unseen; it is never a reason to spend
+ * the context window that the guard exists to protect.
+ */
+export async function previewFor(bytes: Buffer, deps: { run?: Runner } = {}): Promise<Buffer | null> {
+  const run = deps.run ?? imageDeps.run ?? spawnRunner;
+  try {
+    const scaled = await run("ffmpeg", previewArgs(), bytes);
+    if (scaled.code !== 0 || scaled.stdout.length === 0) return null;
+    return scaled.stdout;
+  } catch {
+    // ffmpeg absent from the image, or killed. Not fatal to the generation.
+    return null;
+  }
+}
+
+/** The real runner: spawn, collect, never shell-interpolate. */
+const spawnRunner: Runner = async (cmd, args, input) => {
+  const { spawn } = await import("node:child_process");
+  return await new Promise((resolve, reject) => {
+    const child = spawn(cmd, args);
+    const stdout: Buffer[] = [];
+    let stderr = "";
+
+    child.stdout.on("data", (chunk) => stdout.push(chunk));
+    child.stderr.on("data", (chunk) => (stderr += String(chunk)));
+    child.on("error", (error) => reject(new Error(`${cmd} could not be started (${error.message})`)));
+    child.on("close", (code) => resolve({ stdout: Buffer.concat(stdout), stderr, code: code ?? 0 }));
+
+    child.stdin.on("error", () => {
+      // ffmpeg can exit before the whole image is written; the close handler
+      // above still reports the failure, and an unhandled EPIPE would not.
+    });
+    if (input) child.stdin.end(input);
+    else child.stdin.end();
+  });
+};
 
 /* ------------------------------------------------------------------ *
  * Where an image waits between being made and being sent.

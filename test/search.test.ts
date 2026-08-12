@@ -105,6 +105,26 @@ test("results are read out with the fields the API documents", () => {
   assert.equal(parsed.moreAvailable, true);
 });
 
+test("Brave's highlight markup is stripped, so it cannot be pasted into a chat", () => {
+  // This is what the API actually returns: the query's terms are wrapped for a
+  // results page, and apostrophes arrive as entities. Handed on untouched, the
+  // model repeats `<strong>` into a WhatsApp message.
+  const parsed = parseResults(
+    braveReply([
+      {
+        title: "Node.js &#x27;Krypton&#x27;",
+        url: "https://nodejs.org",
+        description: "Supported through <strong>April 2028</strong> &amp; beyond &#8212; see docs.",
+        extra_snippets: ["<b>LTS</b> since 24.11.0"],
+      },
+    ]),
+  );
+
+  assert.equal(parsed.hits[0].title, "Node.js 'Krypton'");
+  assert.equal(parsed.hits[0].description, "Supported through April 2028 & beyond — see docs.");
+  assert.deepEqual(parsed.hits[0].extraSnippets, ["LTS since 24.11.0"]);
+});
+
 test("a result with no URL is dropped, because a citation without a link is not one", () => {
   const parsed = parseResults(
     braveReply([
@@ -114,7 +134,8 @@ test("a result with no URL is dropped, because a citation without a link is not 
     ]),
   );
 
-  assert.deepEqual(parsed.hits.map((hit) => hit.url), ["https://example.test/"]);
+  // Reported exactly as published — not normalised into a root slash.
+  assert.deepEqual(parsed.hits.map((hit) => hit.url), ["https://example.test"]);
 });
 
 test("a search that found nothing is not the same as a response that made no sense", () => {

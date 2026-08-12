@@ -4,7 +4,7 @@ import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { storeImage } from "../agent/lib/imagegen.ts";
+import { imageDeps, storeImage } from "../agent/lib/imagegen.ts";
 
 /**
  * Generating a picture, and then sending it.
@@ -27,6 +27,12 @@ const sendTool = async () => (await import("../agent/tools/whatsapp_send_image.t
 const ctx = {} as never;
 
 const JPEG = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3, 4]);
+
+// The downscale that produces what the model looks at. Stubbed once for the
+// file: real ffmpeg would reject these eight synthetic bytes, and the tool would
+// then correctly report the picture as unseen — which is a different test from
+// the ones below.
+imageDeps.run = async () => ({ stdout: Buffer.from([0xff, 0xd8, 0xff, 0xe0, 9]), stderr: "", code: 0 });
 
 /**
  * One fake for both hops.
