@@ -1,7 +1,7 @@
 # whatsapp-agent
 
-An eve agent with access to your personal WhatsApp, through a long-running
-Playwright session on `web.whatsapp.com`.
+An eve agent with access to your personal WhatsApp, through WhatsApp's own
+multi-device protocol.
 
 ## Disclaimer
 
@@ -10,45 +10,46 @@ This work is subject to the methodological caveats and commitments described in 
 
 ## Read this first
 
-**This violates WhatsApp's Terms of Service.** Automating WhatsApp Web with a
-browser driver is not a supported integration, and accounts doing it are banned
-at WhatsApp's discretion — permanently, with no appeal, on the number you use.
+**This violates WhatsApp's Terms of Service.** An unofficial protocol client is
+not a supported integration, and accounts using one are banned at WhatsApp's
+discretion — permanently, with no appeal, on the number you use.
 The official route is WhatsApp Business Cloud (`eve add channel/chat-sdk-whatsapp`),
 but it only reaches business messaging, never your personal chats. If you want
 your own conversations, this is the only way, and the risk is real. Consider a
 secondary number.
 
-**The session profile is a credential.** `whatsapp-bridge/data/profile` (the
-`whatsapp-profile` volume in compose) contains a linked session. Anyone who
-copies that directory has your WhatsApp on their machine with no QR scan. It is
-gitignored; keep it that way, and never bake it into an image.
+**The session is a credential.** The `whatsapp-transport-data` volume holds
+`session.db`: a linked device. Anyone who copies it has your WhatsApp on their
+machine with no QR scan. The `whatsapp-profile` volume holds `store.db` — every
+message ever ingested — which is worth no less. Both are gitignored; keep them
+that way, and never bake either into an image.
 
-## Why there are two services
-
-The browser cannot live inside the agent. eve compiles to a Nitro server that is
-replaced on every deploy, while a linked WhatsApp session is a stateful,
-long-lived browser profile that survives exactly one login. So:
+## Why there are three services
 
 | Service | Holds |
 |---|---|
-| `whatsapp-bridge` | Playwright, Chromium under Xvfb, the linked session, a small HTTP API |
+| `whatsapp-transport` | Go + [whatsmeow](https://github.com/tulir/whatsmeow). The linked session, the protocol socket, a durable outbox |
+| `whatsapp-bridge` | The archive (`store.db`) and the HTTP API over it. Its only writer |
 | `agent` | The eve agent; its tools call the bridge over the internal network |
 
-The bridge is published on **loopback only** (`127.0.0.1:8099`), because linking
-and health checks need host access. Every route but `/health` requires the
-bearer token. Binding it to `0.0.0.0`, or tunnelling that port, puts a live
+The split is not decoration. eve compiles to a Nitro server that is replaced on
+every deploy, while a linked WhatsApp session must survive exactly one login and
+then persist. The archive has to outlive both.
+
+Both the bridge (`127.0.0.1:8099`) and the transport (`127.0.0.1:8100`) are
+published on **loopback only**, because pairing and health checks need host
+access. Every route but `/health` requires a bearer token — a different one per
+service, deliberately, so rotating either cannot silently unauthenticate the
+other. Binding either to `0.0.0.0`, or tunnelling those ports, puts a live
 WhatsApp account on the network.
 
-## Optionally, a third: the protocol transport
+## The transport is the only way in
 
-`whatsapp-transport` (Go, [whatsmeow](https://github.com/tulir/whatsmeow)) speaks
-WhatsApp's multi-device protocol directly. It replaces the Playwright half of the
-bridge — the browser, the selectors, the DOM walking — and **nothing else**. The
-archive, the interaction twin, people and obligations all stay in `store.js`,
-which remains the only writer of your correspondence, and the agent's tools are
-unchanged.
+There used to be a second one: a Playwright session driving `web.whatsapp.com`
+under Xvfb, reading messages out of the rendered DOM. **It has been removed.** It
+was not a fallback but a weaker duplicate, and every fact it produced was worse:
 
-| | DOM path | Protocol path |
+| | DOM path (removed) | Protocol path |
 |---|---|---|
 | Reception | poll a rendered chat list | pushed, into a durable outbox |
 | Message id | hash of the rendered content | the protocol's own id |
@@ -56,9 +57,16 @@ unchanged.
 | Identity | a fuzzy-matched display name | a stable per-person key |
 | Costs | Chromium, Xvfb, 1 GB of shared memory | one static binary |
 
+What went with it: `src/session.js`, `src/selectors.js`, `src/lifecycle.js`,
+`src/watch.js`, the `/debug/*` and `/events*` routes, `/qr`, `/chats`,
+`/messages`, `/ingest`, the prepare/commit send dance, and the Playwright
+dependency. `test/anti-corruption-layer.test.js` now asserts that none of it
+comes back — no source file may address WhatsApp's markup or drive a browser.
+
 **It does not reduce the ban risk.** Read this first, above, applies unchanged:
 an unofficial protocol client is no more sanctioned than an automated browser.
 What it removes is fragility, not exposure.
+
 
 ### Turning it on
 
@@ -67,8 +75,8 @@ openssl rand -hex 32   # a SECOND token, for WA_TRANSPORT_TOKEN
 ```
 
 Set `WA_TRANSPORT_TOKEN` and `WA_TRANSPORT_URL=http://whatsapp-transport:8100` in
-`.env`, then bring it up and link the account — this is a **separate** linked
-device from the browser session, with its own QR:
+`.env`, then bring it up and link the account. This consumes one of WhatsApp's
+four linked-device slots:
 
 ```bash
 docker compose up -d --build whatsapp-transport
@@ -93,8 +101,15 @@ curl -s -H "Authorization: Bearer $WA_BRIDGE_TOKEN" \
   http://127.0.0.1:8099/transport/status
 ```
 
-Leaving `WA_TRANSPORT_URL` unset keeps everything on the DOM path; the
-`/transport/*` routes answer `503` and say so.
+`WA_TRANSPORT_URL` is required. There is no second path to fall back to, so
+leaving it unset means the bridge has no way to receive anything and the
+`/transport/*` routes answer `503`.
+
+**Do not restart the transport while the phone still says "Logging in".** Pairing
+completes only after the new session stays connected long enough to finish its
+first login; tearing it down before that abandons the registration, and the next
+connect is refused with `401 logged out from another device` — which whatsmeow
+treats as a logout, deleting the session and wasting the scan.
 
 ### Two things to know before you rely on it
 
@@ -113,9 +128,30 @@ the two** — so the archive holds both and reports the count via
 on a self-asserted name that two people can share would be a guess about whose
 correspondence belongs to whom.
 
-Your existing archive is migrated in place on first start (schema v1 → v2, three
-added columns). Chats ingested from the DOM keep their names and are
-distinguishable from protocol-addressed ones.
+**Names arrive late.** whatsmeow caches its LID map on first use, and a cache
+filled seconds after pairing is filled empty — every contact then resolves to a
+provisional `pn:` digest instead of the durable key its messages carry, and the
+two never join. Restarting the transport once history sync has settled refills
+the cache; contacts flip from provisional to LID-keyed, and names start
+resolving. History-sync messages also carry no push name at all, so chat labels
+come from the contact store instead (see `Dispatcher.nameFor`).
+
+**What could not be described is named, not just counted.** `/transport/status`
+reports `events.unrecognisedTypes`: a tally of the protobuf arms this build has
+no vocabulary for, keyed by protocol field name and carrying no correspondence.
+The bare count that preceded it reached 446 on a real archive while saying
+nothing about *what* those messages were, so the gap could not be prioritised —
+the tally turns that number into a ranked list of what to implement next.
+
+**One person, one row.** whatsmeow's contact store is keyed by JID and a person
+routinely holds two — their phone JID and their LID — which resolve to the same
+identity. `/contacts` collapses them, because two rows for one person make that
+contact *unaddressable*: the resolver refuses them as ambiguous rather than
+guessing. On the account this was built against, that was 108 of 479 contacts.
+
+Your existing archive is migrated in place on first start (schema v1 → v3; v3
+adds `messages.target_key` — what a reaction, vote or pin is *about* — and
+`messages.unknown_type`).
 
 ## Setup
 
@@ -160,20 +196,80 @@ reminders — so they land on your phone and you copy-paste them into the real
 conversation yourself. Nothing reaches anyone else, so there is no allowlist and
 no confirmation step.
 
-It needs to know which chat is yours. Open your own chat in WhatsApp, copy the
-title from the conversation header verbatim, and set:
+There is nothing to configure about *which* chat is yours. The transport
+addresses the account's own JID, read from its device store and never taken from
+a caller, so no name is resolved and nothing can be mis-resolved.
 
-```bash
-WA_SELF_CHAT_NAME="Joao (You)"
+That is a real change. The old path typed the chat's title into a search box and
+clicked the first result, so `"Joao"` could open `"Joao Antunes"` — and the whole
+safety argument was a strict comparison against `WA_SELF_CHAT_NAME` to catch it.
+`POST /send/self` cannot address anyone else in the first place.
+
+`WA_ALLOW_SELF_NOTE=false` switches self-notes off outright; that switch is now
+the only gate.
+
+## The self chat is a console
+
+Your own chat is a notebook by default — write a note and nothing answers, which
+is the point. Send `/menu` and it becomes a console:
+
+```
+📋 *What I can do here*
+
+📋 *Session*
+  `/menu` — List everything available here.
+  `/quit` — Exit the state you are in and come back to the notebook.
+
+🎮 *Games*
+  `/game` — Enter a match. Reply with a cell number, 1–9. `/quit` abandons it.
+
+🤖 *Agent*
+  `/eve` — Send what you type straight to the agent until you `/quit`.
+
+🗂 *Archive*
+  `/status` — How much correspondence is held, and whether the transport is live.
 ```
 
-The comparison is **exact**. `"Joao"` will not match `"Joao (You)"`, and that
-strictness is the point: the alternative is a fuzzy search that could open a
-similarly-named contact and deliver a private draft to them. If the bridge
-cannot confirm your chat is the one open, it refuses to type.
+**You enter and exit states.** A state captures the conversation: inside `/game`
+a bare `5` is a move, and inside `/eve` it is a question for the agent. Outside
+both it is a shopping note and nothing replies to it. Entering one state from
+another leaves the first, because two open sessions in one chat would make the
+next `5` ambiguous.
 
-Leave `WA_SELF_CHAT_NAME` unset and self-notes are simply unavailable — that is
-the intended default. `WA_ALLOW_SELF_NOTE=false` switches them off outright.
+**The console is not the only thing that can answer this chat.** The agent also
+has a scheduled tic-tac-toe (`ttt`, `agent/schedules/tictactoe.md`), which keeps
+its board in the chat as a `#ttt` token rather than in a session file. Both read
+a bare digit as a move, so `GET /self/chat` reports the open console state and
+the scheduled game stands down whenever there is one — whoever is in a session
+owns the keyboard. That game also takes one turn at a time and drops a turn it
+finds already answered, which is what stops the same board being posted twice.
+
+**A match is a session driven by events.** One arriving message is one event; the
+board lives in the session, not in the model, and a decided match exits by itself
+so the chat is a notebook again without your typing `/quit`. The session is
+written to `console-session.json` beside the archive on every transition — not
+into `store.db`, which is your correspondence, and a half-finished game is not
+correspondence. A restart therefore resumes the match instead of abandoning it
+with the board still sitting in the chat inviting a move.
+
+**The state is signalled twice, on purpose.** Every reply carries its category's
+emoji, and entering a state also sends a block of that category's colour as an
+image. The emoji marks a line; the image marks the moment. A line of text is easy
+to scroll past and easier to miss in a notification preview, and entering a state
+is the one moment you must not be confused about — everything you type next is
+read by it. The block is generated in `src/swatch.js`, a hand-written PNG encoder
+of about sixty lines, because adding an image library to draw a rectangle to a
+service that has no dependencies would be the mistake this project just undid by
+deleting Playwright.
+
+Rules, legality and the opponent are code (`src/plugins.js`), never the model:
+the machine wins if it can and blocks if it must, but it is not solved, because a
+game you cannot win is not a feature. `/eve` is the only state that reaches a
+model, and it is explicit — the bridge queues what you typed at `/self/pending`
+and the agent answers through `/send/self`. The queue exists because the
+direction of this system is fixed: the agent calls the bridge and never the
+reverse, and the bridge holding the agent's password to push a message would
+invert that for one feature.
 
 ## Media
 
@@ -223,7 +319,7 @@ were read, and the bridge refuses if the row there has changed. A refusal is the
 guard working: read the chat again and use the new position.
 
 If a row's kind cannot be identified it is reported as `unknown` rather than
-dropped. Inspect it with `/debug/rows` and extend the signal table in
+dropped. Inspect it with `/archive/messages` and extend the signal table in
 `whatsapp-bridge/src/message-kind.js`.
 
 ## Tests
@@ -233,9 +329,9 @@ npm test
 ```
 
 Runs both suites with the Node test runner — no dependencies, no build step. The
-bridge's safety rules (`whatsapp-bridge/src/self-note.js`) are tested without a
-browser: the page-driving parts are injected, so the refusal paths can be
-exercised directly.
+bridge's safety rules (`whatsapp-bridge/src/self-note.js`,
+`whatsapp-bridge/src/plugins.js`) are tested without a transport: sending is
+injected, so every refusal path can be exercised directly.
 
 ## Enabling send
 
@@ -273,14 +369,23 @@ default.
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /health` | Is Chromium up? `{ok, browser}` — `starting` / `up` / `down`. `503` on `down`. No auth (it reveals nothing about the account). |
-| `GET /status` | `logged_in` / `logged_out` / `loading` |
-| `GET /qr` | PNG of the linking QR |
-| `GET /chats?limit=` | Recent conversations |
-| `GET /messages?chat=&limit=` | One conversation's recent messages |
-| `POST /send` | `{to, message}` → sends in one call (allowlisted only) |
-| `POST /send/prepare` | Stage `{to, message}` → token. Sends nothing. |
-| `POST /send/commit` | `{token}` → sends |
+| `GET /health` | Liveness. `{ok, transport}`. No auth — it answers before the token check, so it must reveal nothing about the account |
+| `GET /status` | `{archive, transport}` — what this service holds, and whether a transport is configured |
+| `GET /transport/status` | The transport's own state: paired, connected, queue depth, dropped |
+| `POST /send` | `{to, message, quoted}` → sends over the protocol (allowlisted only). `quoted: {messageId, sender}` makes it a reply to that message rather than just a message into the chat |
+| `POST /send/media` | `{to, dataBase64, mimetype, kind, caption, filename, width, height, durationSeconds}` → an attachment, for an allowlisted recipient. `kind` is `image` (default), `video`, `audio`, `voice`, `document` or `sticker` |
+| `POST /send/reaction` | `{to, messageId, emoji}` → reacts to a message. An **empty** emoji removes the reaction; that is WhatsApp's own way of undoing one, not a missing field |
+| `POST /send/revoke` | `{to, messageId}` → deletes a message for everyone |
+| `POST /send/edit` | `{to, messageId, message}` → replaces the text of a message already sent |
+| `POST /send/poll` | `{to, name, options, selectableCount}` → asks a question with fixed answers. At least two options |
+| `POST /send/poll/vote` | `{to, messageId, options}` → votes in a poll. `messageId` names the **poll**; the vote is encrypted against that poll's own secret, so a poll this account never received answers `422` rather than sending a vote nobody can read |
+| `POST /presence` | `{to, state}` → `composing` or `paused`. Allowlisted like a message, because it is a signal this account emits into somebody's chat |
+| `POST /send/self` | `{messages}` → writes to your own chat. No allowlist: the transport addresses the account's own JID from its device store, so there is no recipient to get wrong |
+| `POST /send/self/media` | `{dataBase64, mimetype, kind, caption, ...}` → an attachment to your own chat, same kinds as `/send/media` and the same absence of an allowlist |
+| `GET /self/chat` | Which chat is yours, as an identity key |
+| `GET /self/pending` | What you typed in `/eve` mode, for the agent to answer. Drains on read |
+| `GET /media?key=` | One message's media, by the protocol's own message id |
+| `POST /history` | `{chat, oldestId, oldestTimestamp, count}` → ask your phone for older messages |
 | `GET /archive/search` | Keyword search, with `sender` / `since` / `until` / `kind` / `outgoing` / `order` |
 | `GET /archive/facts` · `POST /archive/facts` | Facts, each citing a message. Retracted ones are excluded |
 | `POST /archive/facts/retract` | `{id, reason}` → withdraws a fact. A tombstone, not a delete; a reason is required |
@@ -295,12 +400,6 @@ default.
 | `GET /twin/proposals` · `POST /twin/proposals` | Proposed next moves. Reaches nobody — proposals are rows |
 | `POST /twin/proposals/resolve` | `{id, status}` → accepted / dismissed / expired |
 | `POST /twin/arcs/resolve` | `{id, status}` → open / stalled / resolved / abandoned |
-| `GET /debug/screenshot` | PNG of the live page — the fastest "what is it looking at" |
-| `GET /debug/selectors` | Live match count per selector candidate |
-| `GET /debug/selector-health` | Are the hooks ingestion needs alive? `503` when not |
-| `GET /debug/session` | Why the browser is down: launch error, attempt counts. Answers while wedged |
-| `GET /debug/rows` | DOM shape of the first chat rows |
-| `GET /debug/structure` | Ids, testids, header text, message-row markers |
 
 All except `/health` need `Authorization: Bearer $WA_BRIDGE_TOKEN`.
 
@@ -313,25 +412,21 @@ All except `/health` need `Authorization: Bearer $WA_BRIDGE_TOKEN`.
   the hooks it depends on before it walks a chat and refuses with a `503` naming
   the dead one, because the alternative failure is silent: a broken `messageRow`
   reads every conversation as empty and reports the archive as complete.
-- **Reading is a window, not history.** The chat list virtualises and only the
-  visible tail of a conversation is in the DOM. The agent cannot say what
-  someone never sent, only what is not in what it can see.
-- **The browser starts lazily, and two knobs around that are unset by choice.**
-  Chromium launches on the first request, not at boot, so between `compose up`
-  and that request there is no session — `/health` reports `starting` and stays
-  healthy, because failing there would trip `depends_on: service_healthy` and
-  keep the agent from ever starting. Two consequences are deliberately left
-  as they are, because both change deployment behaviour:
-  an eager warm-up at boot would make the healthcheck meaningful sooner, and
-  `depends_on: service_healthy` currently takes the *agent* down whenever the
-  bridge's browser is down — even though `/twin`, `/archive/*` and `/people/*`
-  read SQLite and need no browser at all. `service_started` would decouple them.
+- **History is as deep as your phone.** Backfill is a request to the phone
+  (`POST /history`), so the reachable depth is whatever it still holds — not
+  whatever WhatsApp's servers hold. A short answer is a fact about the phone,
+  not a failure.
+- **The agent waits on the bridge's health.** `depends_on: service_healthy`
+  takes the agent down whenever the bridge is unhealthy, even though `/twin`,
+  `/archive/*` and `/people/*` read SQLite and need nothing else.
+  `service_started` would decouple them.
 - **Media is listed, not read.** Photos, voice notes and documents arrive as
   placeholders with a `kind`; opening one costs a fetch (`whatsapp_view_media`,
   `whatsapp_transcribe_voice`). A row whose kind cannot be identified is
   reported as `unknown` rather than dropped.
-- **One session per profile.** WhatsApp allows one web session per browser
-  profile; this is a singleton by nature.
+- **One linked device, and four slots.** WhatsApp allows four linked devices per
+  account and this transport is one of them. Pair it once; a second pairing
+  consumes another slot rather than replacing the first.
 - **The twin is a reading, not a record.** Arcs, goals and contexts are what a
   model made of messages it was shown; each cites one, and anything it could not
   cite was dropped before storage, but a citation proves provenance, not
@@ -555,81 +650,20 @@ Schedules do not fire under `eve dev`; a built app under `eve start` runs them.
 
 ## Reacting to messages
 
-Off by default. `WA_WATCH_EVENTS=true` turns it on.
+Reception is push, and always on. The transport holds the protocol socket, so a
+message arrives as an event rather than as the result of a poll — into a durable
+outbox, which the bridge drains into the archive every five seconds
+(`WA_TRANSPORT_DRAIN_INTERVAL_MS`).
 
-Everything above is pull: the agent sees WhatsApp only when you ask it something,
-or when the 11:00 digest reads the archive. This is the part that reacts on its
-own.
+This is what replaced the browser's `MutationObserver` on `#pane-side`, and the
+difference is not just mechanical. Detection used to be free but reacting was
+not: topping up a chat meant opening it in a real browser, which was an
+unattended interaction and part of the automation footprint that gets accounts
+banned. It had to be rationed four ways — a cooldown, a chat cap, a scroll cap
+and quiet hours — all of which existed to bound a cost that no longer exists.
+Draining a queue costs nothing WhatsApp can see.
 
-### Detection is free; reacting is not
+What still runs on arrival is the self-chat console: every drained message is
+offered to the router, which answers only in your own chat and only when you
+have entered a state. See *The self chat is a console*.
 
-SPEC §0.1 says there is no push — every observation is a poll. That is true of the
-**transport**: WhatsApp Web offers no webhook to register. It is not true of the
-**browser session the bridge already holds open**. `#pane-side` mutates in the
-local DOM the instant a message lands in any chat, and a `MutationObserver`
-reading that costs no clicks, no keystrokes and no navigation. Passive observation
-is not an automation signal; actions are. So detection is unrationed and runs
-continuously.
-
-Reacting is the opposite. When an event fires the bridge opens the changed chat
-and tops up the archive, which **is** an unattended browser interaction — a real
-change to this project's risk posture, and one the daily digest still refuses. It
-is bounded four ways, all enforced in the bridge rather than asked of the agent,
-for the same reason the send allowlist is:
-
-| Bound | Setting | What it prevents |
-|---|---|---|
-| Coalescing | — | Ten messages in a group becoming ten reads |
-| Per-chat cooldown | `WA_EVENT_COOLDOWN_MINUTES` | An active conversation holding the session in a read loop |
-| Quiet hours | `WA_QUIET_HOURS` | Activity at 04:00, which no explanation fixes |
-| Fan-out cap | `WA_EVENT_MAX_CHATS` | An overnight backlog becoming a thirty-chat sweep |
-
-Event reads draw from the same `WA_MAX_INTERACTIONS_PER_HOUR` budget as a
-user-initiated archive. An event cannot buy extra interactions.
-
-Quiet hours suppress the **notification** too, not just the read. Writing a
-self-note opens a chat and types, so "just a quick note at 04:00" would produce
-the exact activity the window exists to prevent — and ring your phone as a bonus.
-
-### What actually happens
-
-```
-message arrives
-  → #pane-side mutates          (free, continuous)
-  → bridge diffs the chat list  (free — no clicks, no typing)
-  → event queued in SQLite      (deduplicated by content)
-  → inbox-watch fires, ≤15 min later
-  → bridge claims, gates, tops up the archive for what it may open
-  → agent writes ONE self-note, then acks the events
-```
-
-The queue is durable and content-addressed, so a restart loses nothing and a
-double-fired observer produces one event. The agent acknowledges events only
-*after* writing the note: crash in between and you are told late rather than
-never.
-
-Two things the watcher deliberately never infers. A row that vanished is not an
-event — the pane is virtualised, so absence means scrolled-away or archived. And
-the first snapshot after a restart emits nothing, or every already-unread chat
-would fire at boot.
-
-### Inspecting it
-
-```sh
-curl -s localhost:8099/events/status -H "authorization: Bearer $WA_BRIDGE_TOKEN"
-```
-
-Reports whether the in-page observer actually installed. Worth checking: an
-uninstalled observer produces an empty queue, which is indistinguishable from a
-quiet day unless something says so.
-
-### What it does not do
-
-- **It never sends to another person.** The only message a reactive run may write
-  is the self-note. Replies stay a thing you ask for, through the two-phase send.
-- **It does not read the message you got.** An event carries the chat-list
-  snippet — 160 characters, sender prefix included. Where the archive was topped
-  up the real text is searchable; where a cooldown held the read, the agent can
-  only tell you something arrived and from whom.
-- **It is not a command channel.** Self-chat text is ordinary untrusted input,
-  never elevated privilege (SPEC §8, open question 9).

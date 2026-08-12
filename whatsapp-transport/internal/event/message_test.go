@@ -221,8 +221,10 @@ func TestHistorySyncMessagesAreMarked(t *testing.T) {
 // deciding on its own that an undescribable message is not worth keeping.
 func TestUnrecognisedMessagesStillProduceAnEvent(t *testing.T) {
 	msg := groupTextMessage()
+	// Payments are a described kind now, so this fixture moved to an arm the
+	// archive genuinely has no vocabulary for.
 	msg.Message = &waE2E.Message{
-		CancelPaymentRequestMessage: &waE2E.CancelPaymentRequestMessage{},
+		BotPlatformRegistrationSuccessMessage: &waE2E.FutureProofMessage{},
 	}
 
 	got, err := FromMessage(context.Background(), resolver(), msg)

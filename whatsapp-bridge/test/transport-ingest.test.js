@@ -37,7 +37,7 @@ const store = () => openStore(":memory:", { now });
 /** A row in the shape `toArchiveRow` produces. */
 const row = (over = {}) => ({
   key: "3EB0FIXTURE01",
-  chat: { key: "fixture-a@lid", kind: "lid", provisional: false, displayName: "Marcela" },
+  chat: { key: "fixture-a@lid", kind: "lid", provisional: false, displayName: "Fixture Contact" },
   sender: { key: "fixture-a@lid", kind: "lid", provisional: false },
   sentAt: "2026-08-11T09:15:00Z",
   sentAtIso: "2026-08-11T09:15:00.000Z",
@@ -116,13 +116,13 @@ test("upsertTransportMessages: the push name is stored as a label, never as the 
   archive.upsertTransportMessages([row()]);
 
   const chat = archive.chatIdentity("fixture-a@lid");
-  assert.equal(chat.display_name, "Marcela");
+  assert.equal(chat.display_name, "Fixture Contact");
   assert.equal(chat.identity_kind, "lid");
   assert.equal(chat.identity_provisional, 0);
 
   // Nothing addresses the chat by the display name — that would fork the moment
   // the sender edited it on their phone.
-  assert.equal(archive.messagesFor("Marcela").length, 0);
+  assert.equal(archive.messagesFor("Fixture Contact").length, 0);
   archive.close();
 });
 
@@ -132,12 +132,12 @@ test("upsertTransportMessages: a renamed contact updates the label and keeps one
   const archive = store();
   archive.upsertTransportMessages([row()]);
   archive.upsertTransportMessages([
-    row({ key: "3EB0FIXTURE02", chat: { ...row().chat, displayName: "Marcela A." } }),
+    row({ key: "3EB0FIXTURE02", chat: { ...row().chat, displayName: "Fixture Contact A." } }),
   ]);
 
   assert.equal(archive.stats().chats, 1, "still one chat");
   assert.equal(archive.stats().messages, 2, "and both messages are in it");
-  assert.equal(archive.chatIdentity("fixture-a@lid").display_name, "Marcela A.");
+  assert.equal(archive.chatIdentity("fixture-a@lid").display_name, "Fixture Contact A.");
   archive.close();
 });
 
@@ -180,7 +180,7 @@ test("upsertTransportMessages: provisional chats are reportable, because they ar
   const archive = store();
   archive.upsertTransportMessages([
     row({ key: "a1", chat: { key: "pn:9f2ac41b7e", kind: "phone", provisional: true, displayName: "Fabio" } }),
-    row({ key: "a2", chat: { key: "fixture-b@lid", kind: "lid", provisional: false, displayName: "Marcela" } }),
+    row({ key: "a2", chat: { key: "fixture-b@lid", kind: "lid", provisional: false, displayName: "Fixture Contact" } }),
   ]);
 
   const unsettled = archive.provisionalChats();
@@ -221,13 +221,13 @@ test("upsertTransportMessages: provenance still holds — a fact can cite a tran
 
   assert.doesNotThrow(() =>
     archive.addFact({
-      subject: "Marcela",
+      subject: "Fixture Contact",
       statement: "the tiler confirmed Thursday",
       sourceMessageKey: "3EB0FIXTURE01",
       confidence: 0.9,
     }),
   );
-  const [fact] = archive.factsWithSource({ subject: "Marcela" });
+  const [fact] = archive.factsWithSource({ subject: "Fixture Contact" });
   assert.equal(fact.source_text, "o azulejista confirmou quinta");
   archive.close();
 });
@@ -237,9 +237,9 @@ test("upsertTransportMessages: a batch spanning several chats is written in one 
   // conversation that was active while the archive was down.
   const archive = store();
   const outcome = archive.upsertTransportMessages([
-    row({ key: "m1", chat: { key: "fixture-a@lid", kind: "lid", provisional: false, displayName: "Marcela" } }),
+    row({ key: "m1", chat: { key: "fixture-a@lid", kind: "lid", provisional: false, displayName: "Fixture Contact" } }),
     row({ key: "m2", chat: { key: "fixture-b@lid", kind: "lid", provisional: false, displayName: "Fabio" } }),
-    row({ key: "m3", chat: { key: "fixture-a@lid", kind: "lid", provisional: false, displayName: "Marcela" } }),
+    row({ key: "m3", chat: { key: "fixture-a@lid", kind: "lid", provisional: false, displayName: "Fixture Contact" } }),
   ]);
 
   assert.equal(outcome.inserted, 3);

@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
+	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 
 	// Pure-Go SQLite, registered as "sqlite". `dbutil.ParseDialect` accepts any
@@ -160,7 +162,10 @@ func Open(ctx context.Context, cfg Config) (*Session, error) {
 
 	client := whatsmeow.NewClient(device, log.Sub("client"))
 	resolver := identity.NewResolver(device.LIDs)
-	dispatcher := NewDispatcher(resolver, box, media, client)
+	// device.Contacts is the name of last resort: history-sync messages carry no
+	// push name, so without it a first pairing produces an archive of unnamed
+	// `@lid` chats. See Dispatcher.nameFor.
+	dispatcher := NewDispatcher(resolver, box, media, client, device.Contacts)
 
 	s := &Session{
 		container:  container,
@@ -185,13 +190,79 @@ func Open(ctx context.Context, cfg Config) (*Session, error) {
 // loop, because there is nothing it could usefully do with one. It is logged and
 // counted instead, and `Status.Events.Failed` is what makes it visible.
 func (s *Session) handle(raw any) {
+	// Pairing leaves the socket closed. Reconnecting is not the dispatcher's job
+	// — it describes messages — so it is handled here, before dispatch.
+	if _, ok := raw.(*events.PairSuccess); ok {
+		go s.reconnectAfterPairing()
+	}
+
 	if err := s.dispatcher.Handle(context.Background(), raw); err != nil {
 		s.log.Errorf("handling %T: %v", raw, err)
 	}
 }
 
+// reconnectAfterPairing brings the session back up once a device is linked.
+//
+// ── Why this is necessary ───────────────────────────────────────────────────
+// whatsmeow calls `expectDisconnect()` as the last step of pairing, which both
+// suppresses the Disconnected event AND clears `forceAutoReconnect`. In
+// `onDisconnect` the reconnect branch is then skipped, so auto-reconnect — on by
+// default, and working for every other kind of drop — deliberately does not fire
+// here.
+//
+// The consequence without this function is the worst kind of quiet failure: the
+// operator scans the code, sees "success", and the transport reports `paired:
+// true, connected: false` while receiving nothing at all. Everything looks
+// installed and no messages arrive.
+//
+// Run in its own goroutine because whatsmeow dispatches events synchronously on
+// its read loop: connecting from inside the handler would deadlock against the
+// teardown of the very socket that delivered the event.
+func (s *Session) reconnectAfterPairing() {
+	// Wait for the server-side disconnect to land. Connecting while the old
+	// socket is still closing is refused, and a fixed sleep would be a guess in
+	// both directions, so this polls briefly instead.
+	for i := 0; i < 50; i++ {
+		if !s.client.IsConnected() {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if err := s.client.ConnectContext(ctx); err != nil {
+		// Not fatal, and deliberately loud: a restart of the process also
+		// reconnects, and /status will show `connected: false` until then.
+		s.log.Errorf("pairing succeeded but reconnecting failed: %v. "+
+			"Call POST /connect or restart the service; the device is linked and the "+
+			"session is saved.", err)
+		return
+	}
+	s.log.Infof("reconnected after pairing")
+}
+
 // Paired reports whether a device is registered, without connecting.
 func (s *Session) Paired() bool { return s.client.Store.ID != nil }
+
+// Self is the operator's own address, for the one send that needs no allowlist.
+//
+// Returned as a JID rather than an Identity because it exists to be SENT to,
+// and `/send` speaks JIDs. That makes it the one place the operator's own
+// number leaves this package, which is why it is a named method with this
+// comment rather than a field: a self-note is addressed here and nowhere else,
+// and `POST /send/self` never echoes it back to the caller.
+//
+// The device suffix is stripped: a message is addressed to a person, not to the
+// particular linked device this transport happens to be.
+func (s *Session) Self() (types.JID, bool) {
+	id := s.client.Store.ID
+	if id == nil {
+		return types.JID{}, false
+	}
+	return id.ToNonAD(), true
+}
 
 func (s *Session) Status(ctx context.Context) (Status, error) {
 	status := Status{
@@ -237,16 +308,34 @@ func (s *Session) Connect(ctx context.Context) error {
 // Order is load-bearing: whatsmeow requires the QR channel to be taken BEFORE
 // connecting, because the channel is fed by pairing events that arrive during the
 // handshake. Taking it afterwards yields a channel that never produces a code.
+//
+// Cancellation is detached from the caller's context, and that is load-bearing
+// too. `ctx` here belongs to the `/pair/qr` HTTP request, and the handler
+// returns the instant it forwards `success` — so the request is cancelled
+// within milliseconds of a successful scan. whatsmeow's QR emitter reacts to
+// its context being done by calling `Disconnect()` on the *client* (qrchan.go),
+// not merely by stopping the code stream, so that cancellation races
+// `reconnectAfterPairing` and tears down the socket it has just established.
+// The observable failure is the one this cost an evening to find: the phone
+// spins on "Logging in", the half-provisioned registration is abandoned
+// server-side, and the next connect is refused with `401 logged out from
+// another device` — which whatsmeow treats as a logout and deletes the session,
+// so `paired` flips back to false and the whole scan is wasted.
+//
+// The channel still terminates on its own for the reasons that matter: success,
+// timeout, or a pairing error all close it from whatsmeow's side.
 func (s *Session) BeginQRPairing(ctx context.Context) (<-chan whatsmeow.QRChannelItem, error) {
 	if s.Paired() {
 		return nil, errors.New("session: already paired — use Connect")
 	}
 
-	codes, err := s.client.GetQRChannel(ctx)
+	pairCtx := context.WithoutCancel(ctx)
+
+	codes, err := s.client.GetQRChannel(pairCtx)
 	if err != nil {
 		return nil, fmt.Errorf("session: opening QR channel: %w", err)
 	}
-	if err := s.client.ConnectContext(ctx); err != nil {
+	if err := s.client.ConnectContext(pairCtx); err != nil {
 		return nil, fmt.Errorf("session: connecting to pair: %w", err)
 	}
 	return codes, nil
@@ -264,8 +353,11 @@ func (s *Session) PairPhone(ctx context.Context, phone string) (string, error) {
 		return "", errors.New("session: a phone number is required to pair")
 	}
 
+	// Detached for the same reason as BeginQRPairing: this connection has to
+	// outlive the HTTP request that asked for the code, because the operator
+	// still has to type it into their phone afterwards.
 	if !s.client.IsConnected() {
-		if err := s.client.ConnectContext(ctx); err != nil {
+		if err := s.client.ConnectContext(context.WithoutCancel(ctx)); err != nil {
 			return "", fmt.Errorf("session: connecting to pair: %w", err)
 		}
 	}
@@ -306,6 +398,44 @@ func (s *Session) Contacts(ctx context.Context) (map[types.JID]types.ContactInfo
 		return nil, fmt.Errorf("%w: the contact roster arrives with app-state sync after pairing", ErrNotPaired)
 	}
 	return s.client.Store.Contacts.GetAllContacts(ctx)
+}
+
+// Groups returns the groups this account has joined, with their subjects.
+//
+// ── Why this is not a store read like Contacts ──────────────────────────────
+// whatsmeow persists no group subject. The name of a group exists on the server
+// and nowhere on disk, so the only way to learn that a JID is called "We" is to
+// ask — which is why this needs a live connection where Contacts needs only a
+// registered device, and why it can fail while the contact roster succeeds.
+//
+// The connection guard is the same class of protection as the nil sub-store
+// check above: `GetJoinedGroups` on a disconnected client returns a "not
+// connected" error rather than crashing, but saying so in the session's own
+// vocabulary keeps the caller from reporting a network fault as an empty
+// account.
+func (s *Session) Groups(ctx context.Context) ([]types.GroupInfo, error) {
+	if !s.Paired() {
+		return nil, fmt.Errorf("%w: group subjects are read from the server, not the store", ErrNotPaired)
+	}
+	if !s.client.IsConnected() {
+		return nil, errors.New("session: not connected — group subjects require a live connection")
+	}
+
+	joined, err := s.client.GetJoinedGroups(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("session: listing joined groups: %w", err)
+	}
+
+	// Flattened to values because the pointers are whatsmeow's, and a caller
+	// that ranged over them would be reading a slice this package does not own.
+	groups := make([]types.GroupInfo, 0, len(joined))
+	for _, group := range joined {
+		if group == nil {
+			continue
+		}
+		groups = append(groups, *group)
+	}
+	return groups, nil
 }
 
 // Close disconnects and releases both databases.

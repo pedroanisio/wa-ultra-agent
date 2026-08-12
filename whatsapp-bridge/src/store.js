@@ -118,7 +118,26 @@ CREATE TABLE IF NOT EXISTS messages (
   duration_seconds INTEGER,
   filename         TEXT,
   caption          TEXT,
-  ingested_at      TEXT NOT NULL
+  ingested_at      TEXT NOT NULL,
+
+  -- Everything below arrived by ALTER TABLE, and SQLite appends such a column to
+  -- the END of the table. So a fresh database built from this block and an old
+  -- one walked through MIGRATIONS agree on column ORDER only if the additions
+  -- are listed here in migration order, last. migrations.test.js compares the
+  -- two databases column by column and fails when they drift apart.
+  --
+  -- Backticks are a syntax error in here: this whole block is a JS template
+  -- literal, so one would end it mid-SQL.
+
+  -- The message this one is ABOUT: what a reaction was aimed at, which poll was
+  -- voted in, what was pinned. Not a foreign key: the target regularly predates
+  -- this archive's coverage, and a constraint would reject the reaction rather
+  -- than record that it happened.
+  target_key       TEXT,
+  -- The protobuf arm behind an "unknown" row, and null for everything else.
+  -- Without it, "unknown" is a dead end and the only way to learn what the
+  -- archive is missing is to read the protocol by hand.
+  unknown_type     TEXT
 );
 
 CREATE INDEX IF NOT EXISTS messages_by_chat ON messages(chat_id, sent_at_iso);
@@ -538,7 +557,7 @@ export function parseSentAt(text, { order } = {}) {
  * The schema version this code expects. Bump it in the same commit as a new
  * entry in `MIGRATIONS`, never separately.
  */
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
 export const ALIAS_ORIGINS = ["session", "message", "unknown"];
 
@@ -626,6 +645,20 @@ const MIGRATIONS = [
     // Defaulted, because "not provisional" is the truth for every existing row:
     // a DOM-era chat is not a placeholder awaiting a LID.
     "ALTER TABLE chats ADD COLUMN identity_provisional INTEGER NOT NULL DEFAULT 0",
+  ],
+  // 2 → 3: record what a message is ABOUT, and what an `unknown` row actually
+  // was.
+  //
+  // Both arrive with the protocol layer's widened vocabulary. A reaction with no
+  // target stores as "somebody reacted to something", which no query can use;
+  // and an `unknown` row with no type is why 446 undescribed messages sat in
+  // this archive with no way to ask what they were.
+  //
+  // Nullable with no default, because both are genuinely unknown for every row
+  // that predates them. Back-filling either would fabricate a claim.
+  [
+    "ALTER TABLE messages ADD COLUMN target_key TEXT",
+    "ALTER TABLE messages ADD COLUMN unknown_type TEXT",
   ],
 ];
 
@@ -878,8 +911,8 @@ export function openStore(
       const insert = db.prepare(
         `INSERT OR IGNORE INTO messages
            (key, chat_id, sender, sent_at, sent_at_iso, kind, text, outgoing,
-            duration_seconds, filename, caption, ingested_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            duration_seconds, filename, caption, target_key, unknown_type, ingested_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       );
 
       let inserted = 0;
@@ -912,6 +945,8 @@ export function openStore(
             row.durationSeconds ?? null,
             row.filename ?? null,
             row.caption ?? null,
+            row.targetKey ?? null,
+            row.unknownType ?? null,
             now(),
           );
           if (result.changes > 0) inserted++;
@@ -969,11 +1004,33 @@ export function openStore(
       return db.prepare("SELECT name FROM pragma_table_info('chats')").all().map((r) => r.name);
     },
 
-    messagesFor(chat, { limit = 200 } = {}) {
+    /**
+     * One chat's stored messages, oldest first.
+     *
+     * `newest` picks which END the limit cuts from, and the default cuts the
+     * wrong one for anybody asking "what just happened": a limit of 20 over a
+     * chat of 8000 returns the twenty oldest messages in it. That is right for
+     * walking an archive forwards and wrong for reading a conversation, so the
+     * caller now says which it wants. The ORDER of the result never changes —
+     * `newest` reverses only the selection, then restores chronological order,
+     * because every reader downstream assumes oldest-first.
+     */
+    messagesFor(chat, { limit = 200, newest = false } = {}) {
+      if (!newest) {
+        return db
+          .prepare(
+            `SELECT m.* FROM messages m JOIN chats c ON c.id = m.chat_id
+             WHERE c.name = ? ORDER BY m.sent_at_iso, m.id LIMIT ?`,
+          )
+          .all(chat, limit);
+      }
+
       return db
         .prepare(
-          `SELECT m.* FROM messages m JOIN chats c ON c.id = m.chat_id
-           WHERE c.name = ? ORDER BY m.sent_at_iso, m.id LIMIT ?`,
+          `SELECT * FROM (
+             SELECT m.* FROM messages m JOIN chats c ON c.id = m.chat_id
+             WHERE c.name = ? ORDER BY m.sent_at_iso DESC, m.id DESC LIMIT ?
+           ) ORDER BY sent_at_iso, id`,
         )
         .all(chat, limit);
     },
@@ -2186,6 +2243,78 @@ export function openStore(
       }
 
       return { ...removed, skipped: false, dryRun };
+    },
+
+    /**
+     * Give a chat the name a person would call it.
+     *
+     * ── Why this exists at all ──────────────────────────────────────────────
+     * A drained message carries an identity, not a name. For a direct message
+     * the sender's `pushName` rides along and `chatDisplayName` uses it, but a
+     * GROUP has no such field: naming one after whoever spoke last would rename
+     * it every few minutes. So groups arrived nameless — 28 of 28 here — and
+     * the agent, which looks conversations up by name, could not find a single
+     * one. It reported them as non-existent while they sat in the roster.
+     *
+     * The subject comes from the roster instead, which reads it from the
+     * server. This is the write side of that refresh.
+     *
+     * Returns the number of rows actually changed, so a refresh that found
+     * nothing new is distinguishable from one that never ran.
+     */
+    renameChats(entries = []) {
+      const update = db.prepare(
+        `UPDATE chats SET display_name = ?
+          WHERE name = ? AND (display_name IS NULL OR display_name <> ?)`,
+      );
+      let renamed = 0;
+      // `db.exec("BEGIN")`, as everywhere else in this file: node:sqlite has no
+      // better-sqlite3-style `transaction()` wrapper.
+      db.exec("BEGIN");
+      try {
+        for (const { key, displayName } of entries) {
+          if (!key || !displayName) continue;
+          renamed += update.run(displayName, key, displayName).changes;
+        }
+        db.exec("COMMIT");
+      } catch (error) {
+        db.exec("ROLLBACK");
+        throw error;
+      }
+      return { renamed };
+    },
+
+    /**
+     * Recent conversations, from the archive rather than from a rendered list.
+     *
+     * This replaces the old `/chats`, which walked WhatsApp Web's chat pane and
+     * could therefore only report what was rendered — the visible tail of a
+     * virtualised list, ordered by whatever the page had loaded. Reading it here
+     * means the answer covers everything ever ingested, and `messages` is a real
+     * count rather than "what was on screen".
+     *
+     * `display_name` may be null: a correspondent who is not in the contact list
+     * has no name anywhere in the protocol, and inventing one from a phone
+     * number is exactly what `internal/identity` exists to prevent. Callers
+     * should fall back to `key`, which always identifies someone.
+     */
+    chats({ limit = 50 } = {}) {
+      return db
+        .prepare(
+          `SELECT c.name          AS key,
+                  c.display_name  AS displayName,
+                  c.identity_kind AS kind,
+                  c.identity_provisional AS provisional,
+                  COUNT(m.id)     AS messages,
+                  MAX(m.sent_at_iso) AS lastMessageAt
+             FROM chats c
+             LEFT JOIN messages m ON m.chat_id = c.id
+            GROUP BY c.id
+            ORDER BY lastMessageAt DESC NULLS LAST, c.id DESC
+            LIMIT ?`,
+        )
+        .all(limit)
+        .map((row) => ({ ...row, provisional: Boolean(row.provisional) }));
     },
 
     stats() {

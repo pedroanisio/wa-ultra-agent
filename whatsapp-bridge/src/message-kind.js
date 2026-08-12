@@ -72,6 +72,22 @@ const LABEL = {
   deleted: "deleted message",
   system: "system message",
   unknown: "unrecognised attachment",
+
+  // Added when the protocol layer stopped filing these as `unknown`. Each label
+  // is what a person would call the thing, because it is read by the model as
+  // the body of a message that has no text of its own.
+  reaction: "reaction",
+  video_note: "video note",
+  album: "album",
+  poll_vote: "poll vote",
+  event: "event",
+  pinned: "pinned message",
+  kept: "kept message",
+  group_invite: "group invite",
+  comment: "comment",
+  call_log: "call",
+  business: "business message",
+  payment: "payment message",
 };
 
 /** Seconds as WhatsApp writes them: 0:37, 3:42, 1:02:03. */

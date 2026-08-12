@@ -8,6 +8,7 @@ import (
 	"sort"
 	"testing"
 
+	"go.mau.fi/whatsmeow/proto/waCommon"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"google.golang.org/protobuf/proto"
 )
@@ -150,9 +151,9 @@ func TestClassifyRevocationIsDeleted(t *testing.T) {
 // no query could reveal.
 func TestClassifyUnmappedArmIsUnknownNotDropped(t *testing.T) {
 	got := Classify(&waE2E.Message{
-		// A real arm, deliberately not mapped: nothing in the archive
-		// vocabulary describes a payment cancellation.
-		CancelPaymentRequestMessage: &waE2E.CancelPaymentRequestMessage{},
+		// A real arm, deliberately not mapped: nothing in a personal archive's
+		// vocabulary describes a bot platform registration.
+		BotPlatformRegistrationSuccessMessage: &waE2E.FutureProofMessage{},
 	})
 
 	if got.Kind != KindUnknown {
@@ -162,6 +163,153 @@ func TestClassifyUnmappedArmIsUnknownNotDropped(t *testing.T) {
 	// stream it cannot describe, rather than silently averaging it away.
 	if got.Recognised {
 		t.Fatal("Recognised = true for an unmapped arm; want false")
+	}
+}
+
+// ── Naming what was not recognised ──────────────────────────────────────────
+//
+// An `unrecognised` COUNTER says a gap exists and never which one. This archive
+// accumulated 446 of them, and the only way to learn what they were was to read
+// the protobuf by hand and guess — so the metric could not be acted on.
+//
+// The name is taken by protobuf reflection rather than from a list, so a message
+// type invented after this code was written still reports its own name. A
+// hardcoded list would have exactly the blind spot the counter already had.
+func TestClassifyNamesTheArmItCouldNotRecognise(t *testing.T) {
+	got := Classify(&waE2E.Message{
+		BotPlatformRegistrationSuccessMessage: &waE2E.FutureProofMessage{},
+	})
+
+	if got.UnknownType != "botPlatformRegistrationSuccessMessage" {
+		t.Fatalf("UnknownType = %q, want the protobuf field name", got.UnknownType)
+	}
+}
+
+func TestClassifyLeavesUnknownTypeEmptyWhenItRecognisedTheMessage(t *testing.T) {
+	got := Classify(&waE2E.Message{Conversation: proto.String("oi")})
+	if got.UnknownType != "" {
+		t.Fatalf("UnknownType = %q for a recognised message; want empty", got.UnknownType)
+	}
+}
+
+// MessageContextInfo rides along on messages of every kind, so treating "some
+// field is set" as "this is the content" would name it for half the stream.
+func TestClassifyDoesNotNameContextInfoAsTheUnknownArm(t *testing.T) {
+	got := Classify(&waE2E.Message{
+		MessageContextInfo:                    &waE2E.MessageContextInfo{},
+		BotPlatformRegistrationSuccessMessage: &waE2E.FutureProofMessage{},
+	})
+
+	if got.UnknownType != "botPlatformRegistrationSuccessMessage" {
+		t.Fatalf("UnknownType = %q; context info must not be mistaken for content", got.UnknownType)
+	}
+}
+
+// ── The arms added after the coverage audit ─────────────────────────────────
+//
+// Every entry here was landing as `unknown` before, which is why the archive
+// held 446 undescribed messages. Reactions and video notes are ordinary traffic
+// on a personal account, not exotica.
+func TestClassifyTheArmsThatWereSilentlyUnknown(t *testing.T) {
+	cases := []struct {
+		name string
+		msg  *waE2E.Message
+		want Kind
+	}{
+		{"reaction", &waE2E.Message{ReactionMessage: &waE2E.ReactionMessage{}}, KindReaction},
+		{"encrypted reaction", &waE2E.Message{EncReactionMessage: &waE2E.EncReactionMessage{}}, KindReaction},
+		{"video note", &waE2E.Message{PtvMessage: &waE2E.VideoMessage{}}, KindVideoNote},
+		{"album", &waE2E.Message{AlbumMessage: &waE2E.AlbumMessage{}}, KindAlbum},
+		{"poll vote", &waE2E.Message{PollUpdateMessage: &waE2E.PollUpdateMessage{}}, KindPollVote},
+		{"event", &waE2E.Message{EventMessage: &waE2E.EventMessage{}}, KindEvent},
+		{"event invite", &waE2E.Message{EventInviteMessage: &waE2E.EventInviteMessage{}}, KindEvent},
+		{"pinned", &waE2E.Message{PinInChatMessage: &waE2E.PinInChatMessage{}}, KindPinned},
+		{"kept", &waE2E.Message{KeepInChatMessage: &waE2E.KeepInChatMessage{}}, KindKept},
+		{"group invite", &waE2E.Message{GroupInviteMessage: &waE2E.GroupInviteMessage{}}, KindGroupInvite},
+		{"comment", &waE2E.Message{CommentMessage: &waE2E.CommentMessage{}}, KindComment},
+		{"call log", &waE2E.Message{CallLogMesssage: &waE2E.CallLogMessage{}}, KindCallLog},
+		{"buttons", &waE2E.Message{ButtonsMessage: &waE2E.ButtonsMessage{}}, KindBusiness},
+		{"list", &waE2E.Message{ListMessage: &waE2E.ListMessage{}}, KindBusiness},
+		{"interactive", &waE2E.Message{InteractiveMessage: &waE2E.InteractiveMessage{}}, KindBusiness},
+		{"product", &waE2E.Message{ProductMessage: &waE2E.ProductMessage{}}, KindBusiness},
+		{"order", &waE2E.Message{OrderMessage: &waE2E.OrderMessage{}}, KindBusiness},
+		{"payment request", &waE2E.Message{RequestPaymentMessage: &waE2E.RequestPaymentMessage{}}, KindPayment},
+		{"payment cancel", &waE2E.Message{CancelPaymentRequestMessage: &waE2E.CancelPaymentRequestMessage{}}, KindPayment},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := Classify(tc.msg)
+			if got.Kind != tc.want {
+				t.Fatalf("kind = %q, want %q", got.Kind, tc.want)
+			}
+			if !got.Recognised {
+				t.Fatal("Recognised = false for an arm this package now maps")
+			}
+			if got.UnknownType != "" {
+				t.Fatalf("UnknownType = %q for a recognised arm", got.UnknownType)
+			}
+		})
+	}
+}
+
+// A reaction is only useful if you know what it was and what it was aimed at.
+// Storing it as a bare kind would put a row in the archive saying "somebody
+// reacted to something", which no query can use.
+func TestClassifyReactionCarriesItsEmojiAndTarget(t *testing.T) {
+	got := Classify(&waE2E.Message{
+		ReactionMessage: &waE2E.ReactionMessage{
+			Text: proto.String("❤️"),
+			Key:  &waCommon.MessageKey{ID: proto.String("3EB0TARGET")},
+		},
+	})
+
+	if got.Kind != KindReaction {
+		t.Fatalf("kind = %q", got.Kind)
+	}
+	if got.Text != "❤️" {
+		t.Fatalf("text = %q, want the emoji", got.Text)
+	}
+	if got.TargetKey != "3EB0TARGET" {
+		t.Fatalf("TargetKey = %q, want the message reacted to", got.TargetKey)
+	}
+}
+
+// An encrypted reaction's payload cannot be read without the message secret, so
+// the emoji is genuinely unavailable — but the fact of a reaction is not, and
+// that is worth a row.
+func TestClassifyEncryptedReactionIsRecognisedWithoutItsEmoji(t *testing.T) {
+	got := Classify(&waE2E.Message{EncReactionMessage: &waE2E.EncReactionMessage{
+		TargetMessageKey: &waCommon.MessageKey{ID: proto.String("3EB0TARGET")},
+	}})
+
+	if got.Kind != KindReaction || !got.Recognised {
+		t.Fatalf("got %+v", got)
+	}
+	if got.Text != "" {
+		t.Fatalf("text = %q; an encrypted reaction has no readable emoji here", got.Text)
+	}
+	if got.TargetKey != "3EB0TARGET" {
+		t.Fatalf("TargetKey = %q", got.TargetKey)
+	}
+}
+
+// A video note is a video with bytes to fetch. Getting HasMedia wrong for a new
+// kind is how a media type becomes permanently undownloadable.
+func TestClassifyVideoNoteCarriesMediaDetail(t *testing.T) {
+	got := Classify(&waE2E.Message{PtvMessage: &waE2E.VideoMessage{
+		Mimetype: proto.String("video/mp4"),
+		Seconds:  proto.Uint32(7),
+	}})
+
+	if !got.Kind.HasMedia() {
+		t.Fatal("a video note reports no media, so its bytes can never be fetched")
+	}
+	if got.Mimetype != "video/mp4" {
+		t.Fatalf("mimetype = %q", got.Mimetype)
+	}
+	if got.DurationSeconds == nil || *got.DurationSeconds != 7 {
+		t.Fatalf("duration = %v, want 7", got.DurationSeconds)
 	}
 }
 
@@ -298,6 +446,8 @@ func TestHasMediaCoversEveryKind(t *testing.T) {
 	withMedia := map[Kind]bool{
 		KindVoice: true, KindAudio: true, KindImage: true, KindVideo: true,
 		KindGIF: true, KindSticker: true, KindDocument: true,
+		// A round video note is a video with bytes on a media server.
+		KindVideoNote: true,
 	}
 
 	for _, k := range AllKinds() {
@@ -307,8 +457,13 @@ func TestHasMediaCoversEveryKind(t *testing.T) {
 	}
 
 	// Location, contact and poll carry structured data inline rather than an
-	// encrypted blob, so there is nothing on a media server to fetch.
-	for _, k := range []Kind{KindLocation, KindContact, KindPoll, KindText, KindDeleted, KindSystem} {
+	// encrypted blob, so there is nothing on a media server to fetch. An album is
+	// a header whose children hold the bytes, which is why it joins them.
+	for _, k := range []Kind{
+		KindLocation, KindContact, KindPoll, KindText, KindDeleted, KindSystem,
+		KindAlbum, KindReaction, KindPollVote, KindEvent, KindPinned, KindKept,
+		KindGroupInvite, KindComment, KindCallLog, KindBusiness, KindPayment,
+	} {
 		if k.HasMedia() {
 			t.Errorf("%s claims media it has no way to produce", k)
 		}

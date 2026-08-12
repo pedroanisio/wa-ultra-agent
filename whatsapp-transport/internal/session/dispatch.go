@@ -19,6 +19,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"sync/atomic"
 
 	"go.mau.fi/whatsmeow/proto/waE2E"
@@ -72,6 +73,34 @@ type Counters struct {
 	// this is a distinct and lesser failure than Failed and must not be folded
 	// into it.
 	MediaUnrecorded atomic.Int64
+
+	// unrecognisedTypes tallies WHICH protobuf arms went undescribed.
+	//
+	// The bare Unrecognised count reached 446 on a real archive while saying
+	// nothing about what those messages were, so the gap could not be
+	// prioritised and stayed open. Keyed by protocol field name only — no text,
+	// no sender, no id — which is what makes it safe on a status endpoint.
+	unrecognisedTypesMu sync.Mutex
+	unrecognisedTypes   map[string]int64
+}
+
+// NoteUnrecognised records one message nothing could describe.
+//
+// `field` is the protobuf arm that was set, or empty when even that could not be
+// determined; the empty case is tallied under a placeholder so that the tally
+// always sums to Unrecognised. Two numbers that disagree are worse than one.
+func (c *Counters) NoteUnrecognised(field string) {
+	c.Unrecognised.Add(1)
+
+	if field == "" {
+		field = "(unnameable)"
+	}
+	c.unrecognisedTypesMu.Lock()
+	defer c.unrecognisedTypesMu.Unlock()
+	if c.unrecognisedTypes == nil {
+		c.unrecognisedTypes = make(map[string]int64)
+	}
+	c.unrecognisedTypes[field]++
 }
 
 // Snapshot is a Counters reading, safe to serialise.
@@ -83,31 +112,108 @@ type Snapshot struct {
 	Ignored         int64 `json:"ignored"`
 	Failed          int64 `json:"failed"`
 	MediaUnrecorded int64 `json:"mediaUnrecorded"`
+
+	// UnrecognisedTypes is the breakdown behind Unrecognised, keyed by protobuf
+	// field name. Never nil, so a consumer needs no nil check and an empty tally
+	// reads as visibly empty rather than as absent.
+	UnrecognisedTypes map[string]int64 `json:"unrecognisedTypes"`
 }
 
 func (c *Counters) Snapshot() Snapshot {
+	c.unrecognisedTypesMu.Lock()
+	// Copied rather than shared: the snapshot is serialised on a request
+	// goroutine while the dispatcher keeps writing on whatsmeow's read loop, and
+	// handing out the live map would be a data race on every status poll.
+	types := make(map[string]int64, len(c.unrecognisedTypes))
+	for field, n := range c.unrecognisedTypes {
+		types[field] = n
+	}
+	c.unrecognisedTypesMu.Unlock()
+
 	return Snapshot{
-		Messages:        c.Messages.Load(),
-		FromHistory:     c.FromHistory.Load(),
-		Unrecognised:    c.Unrecognised.Load(),
-		Undecryptable:   c.Undecryptable.Load(),
-		Ignored:         c.Ignored.Load(),
-		Failed:          c.Failed.Load(),
-		MediaUnrecorded: c.MediaUnrecorded.Load(),
+		Messages:          c.Messages.Load(),
+		FromHistory:       c.FromHistory.Load(),
+		Unrecognised:      c.Unrecognised.Load(),
+		Undecryptable:     c.Undecryptable.Load(),
+		Ignored:           c.Ignored.Load(),
+		Failed:            c.Failed.Load(),
+		MediaUnrecorded:   c.MediaUnrecorded.Load(),
+		UnrecognisedTypes: types,
 	}
 }
 
 // Dispatcher routes whatsmeow events into the sink.
+// Contacts supplies a correspondent's advertised name when the message itself
+// carries none.
+//
+// Narrow on purpose: whatsmeow's ContactStore has seven methods, six of which
+// write. The dispatcher must never write to the contact store — it describes
+// messages — so it accepts only the read it actually needs.
+type Contacts interface {
+	GetContact(ctx context.Context, user types.JID) (types.ContactInfo, error)
+}
+
 type Dispatcher struct {
 	resolver *identity.Resolver
 	sink     Sink
 	media    MediaSink
 	parser   WebMessageParser
+	contacts Contacts
 	counters Counters
 }
 
-func NewDispatcher(r *identity.Resolver, sink Sink, media MediaSink, parser WebMessageParser) *Dispatcher {
-	return &Dispatcher{resolver: r, sink: sink, media: media, parser: parser}
+func NewDispatcher(r *identity.Resolver, sink Sink, media MediaSink, parser WebMessageParser, contacts Contacts) *Dispatcher {
+	return &Dispatcher{resolver: r, sink: sink, media: media, parser: parser, contacts: contacts}
+}
+
+// nameFor recovers a display name the message did not carry.
+//
+// ── Why this is necessary ───────────────────────────────────────────────────
+// `evt.Info.PushName` is set by the sending device on a live message and left
+// EMPTY on everything replayed by history sync. A first pairing is almost
+// entirely history: of the first thousand messages drained here, 991 came from
+// history and not one carried a push name. The bridge hangs a chat's label on
+// `pushName` (see `chatDisplayName` in transport.js), so without this the whole
+// archive lands keyed by `@lid` addresses with no human name anywhere in it —
+// 199 of 201 chats, in the run that prompted this.
+//
+// ── Why the phone number and not the LID ────────────────────────────────────
+// whatsmeow's contact store is keyed by phone JID (`whatsmeow_contacts.their_jid`
+// is `<number>@s.whatsapp.net`), while a resolved identity is a LID. The number
+// is reached through `Identity.PhoneNumber` rather than re-derived, because that
+// accessor is the single audited disclosure point for it — see the `identity`
+// package comment. Nothing here logs or stores it.
+func (d *Dispatcher) nameFor(ctx context.Context, sender identity.Identity, evt *events.Message) string {
+	if d.contacts == nil {
+		return ""
+	}
+
+	candidates := make([]types.JID, 0, 3)
+	if phone, ok := sender.PhoneNumber(); ok && phone != "" {
+		candidates = append(candidates, types.NewJID(phone, types.DefaultUserServer))
+	}
+	// History messages may carry the phone form directly, in either field.
+	for _, jid := range [2]types.JID{evt.Info.Sender, evt.Info.SenderAlt} {
+		if jid.Server == types.DefaultUserServer && jid.User != "" {
+			candidates = append(candidates, jid.ToNonAD())
+		}
+	}
+
+	for _, jid := range candidates {
+		info, err := d.contacts.GetContact(ctx, jid)
+		if err != nil || !info.Found {
+			continue
+		}
+		// FullName is the name the OPERATOR gave the contact, so it beats the
+		// name the contact chose for themselves. RedactedPhone is deliberately
+		// never used: a partially-masked number is still a number.
+		for _, name := range [3]string{info.FullName, info.PushName, info.BusinessName} {
+			if name != "" {
+				return name
+			}
+		}
+	}
+	return ""
 }
 
 func (d *Dispatcher) Counters() Snapshot { return d.counters.Snapshot() }
@@ -146,6 +252,12 @@ func (d *Dispatcher) handleMessage(ctx context.Context, evt *events.Message) err
 		return fmt.Errorf("session: describing message: %w", err)
 	}
 
+	// Only ever fills a gap: a name the sending device advertised is the more
+	// current of the two, so it is never overwritten.
+	if msg.PushName == "" {
+		msg.PushName = d.nameFor(ctx, msg.Sender, evt)
+	}
+
 	if err := d.sink.Append(ctx, msg); err != nil {
 		d.counters.Failed.Add(1)
 		return fmt.Errorf("session: queueing message %s: %w", msg.Key, err)
@@ -166,7 +278,7 @@ func (d *Dispatcher) handleMessage(ctx context.Context, evt *events.Message) err
 		d.counters.FromHistory.Add(1)
 	}
 	if !msg.Recognised {
-		d.counters.Unrecognised.Add(1)
+		d.counters.NoteUnrecognised(msg.UnknownType)
 	}
 	return nil
 }

@@ -8,8 +8,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"go.mau.fi/whatsmeow/types"
+	"go.mau.fi/whatsmeow/types/events"
 
 	"github.com/pedroanisio/whatsapp-agent/whatsapp-transport/internal/mediastore"
 )
@@ -328,5 +330,48 @@ func TestMediaStoreIsOpenedAlongsideTheOthers(t *testing.T) {
 	}
 	if count != 0 {
 		t.Fatalf("a fresh media store held %d rows", count)
+	}
+}
+
+// ── Pairing leaves the socket closed ────────────────────────────────────────
+//
+// whatsmeow's `expectDisconnect()` runs as the last step of pairing and clears
+// `forceAutoReconnect`, so the auto-reconnect that handles every other kind of
+// drop deliberately does not fire here. Without the PairSuccess handler the
+// transport reports `paired: true, connected: false` and receives nothing, which
+// looks exactly like a working installation.
+//
+// A real reconnect needs a server, so what is asserted here is that the event is
+// recognised and routed without disturbing whatsmeow's loop — the reconnect
+// itself is verified by pairing.
+func TestPairSuccessIsHandledWithoutDisturbingTheEventLoop(t *testing.T) {
+	s, _ := openSession(t)
+
+	// Must not panic and must not block: whatsmeow dispatches synchronously, so a
+	// handler that connected inline would deadlock against its own socket
+	// teardown.
+	done := make(chan struct{})
+	go func() {
+		s.handle(&events.PairSuccess{})
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handling PairSuccess blocked; it must hand off to a goroutine")
+	}
+
+	// PairSuccess is not a message, so it must not be counted as one.
+	status, err := s.Status(context.Background())
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if status.Events.Messages != 0 || status.Events.Failed != 0 {
+		t.Fatalf("PairSuccess was counted as message traffic: %+v", status.Events)
+	}
+	if status.Events.Ignored != 1 {
+		t.Fatalf("Ignored = %d, want 1 — the event should reach the dispatcher too",
+			status.Events.Ignored)
 	}
 }

@@ -1,6 +1,7 @@
-# The bridge holds a live, authenticated WhatsApp session. It is deliberately
-# NOT published to the host: only the agent, on the internal network, can reach
-# it. To link the account you publish the port temporarily (see README).
+# Three services. `whatsapp-transport` speaks WhatsApp's multi-device protocol
+# (Go, whatsmeow) and is the ONLY way this system reaches WhatsApp — the browser
+# driver it replaced is gone. `whatsapp-bridge` owns the archive and is its only
+# writer. `agent` is the eve agent; its tools call the bridge and nothing else.
 services:
   # Speaks WhatsApp's multi-device protocol directly (Go, whatsmeow) and queues
   # what arrives in a durable outbox. The bridge drains that queue into the
@@ -73,27 +74,9 @@ services:
       # The archive of ingested messages. Defaults to /data/store.db in the
       # image, so it lands on the volume rather than inside a container layer.
       WA_STORE_PATH: "${WA_STORE_PATH:-/data/store.db}"
-      # Hard ceiling on browser interactions per hour. A safety limit: a
-      # backfill at machine speed is what gets an account banned.
-      WA_MAX_INTERACTIONS_PER_HOUR: "${WA_MAX_INTERACTIONS_PER_HOUR:-240}"
-      # Which number is the month in "8/3/2026". Normally unnecessary: any
-      # message dated past the 12th settles it for the whole account, and the
-      # evidence in the messages always wins over this. Set it only if a chat
-      # is so short that no date in it ever exceeds 12. Unset means undatable
-      # rows stay undated, which is the honest outcome — a guess here reorders
-      # a history by months and looks exactly like a correct one.
-      WA_DATE_ORDER: "${WA_DATE_ORDER:-}"
-      # Watching the chat list for arrivals. Detection is passive and free;
-      # REACTING opens chats unattended, which the four settings below bound.
-      # Off by default: upgrading should not silently make the agent reactive.
-      WA_WATCH_EVENTS: "${WA_WATCH_EVENTS:-false}"
-      WA_EVENT_COOLDOWN_MINUTES: "${WA_EVENT_COOLDOWN_MINUTES:-15}"
-      WA_EVENT_MAX_CHATS: "${WA_EVENT_MAX_CHATS:-3}"
-      WA_EVENT_MAX_SCROLLS: "${WA_EVENT_MAX_SCROLLS:-2}"
       # UTC. Inside it the bridge reads nothing and reports nothing — a self-note
       # is itself an interaction. Unset means no quiet hours, which is a choice.
       WA_QUIET_HOURS: "${WA_QUIET_HOURS:-23:00-07:00}"
-      WA_HEADLESS: "${WA_HEADLESS:-false}"
       # Where to drain messages from. Unset means "there is no transport": the
       # bridge reads the DOM as before and every /transport/* route answers 503.
       # Setting it moves reception onto the protocol and sends through it too.
@@ -103,9 +86,18 @@ services:
       # silently unauthenticates the other.
       WA_TRANSPORT_TOKEN: "${WA_TRANSPORT_TOKEN:-}"
       WA_TRANSPORT_DRAIN_INTERVAL_MS: "${WA_TRANSPORT_DRAIN_INTERVAL_MS:-5000}"
+      # Reactive /eve: the bridge posts what the operator typed straight to the
+      # agent instead of leaving it for a poll. Unset means the queue still fills
+      # and /self/pending still serves it — the feature degrades to polling
+      # rather than breaking.
+      WA_AGENT_URL: "${WA_AGENT_URL:-}"
+      WA_CONSOLE_PUSH_TOKEN: "${WA_CONSOLE_PUSH_TOKEN:-}"
     volumes:
-      # The linked session. Losing this volume means scanning the QR again;
-      # copying it hands someone the account.
+      # The archive. Holds store.db — every message ingested, the interaction
+      # twin, people and obligations. Named `whatsapp-profile` for its history:
+      # it used to hold the browser profile, which WAS the linked session. That
+      # credential now lives in whatsapp-transport-data; this volume is your
+      # correspondence, which is worth no less.
       - whatsapp-profile:/data
     expose:
       - "8099"
@@ -117,8 +109,6 @@ services:
       - "127.0.0.1:8099:8099"
     networks:
       - internal
-    # WhatsApp Web is a heavy SPA; a starved container drops the session.
-    shm_size: "1gb"
 
   agent:
     build: .
@@ -134,6 +124,9 @@ services:
       # be reachable without a password, so the channel throws when this is unset.
       WA_UI_PASSWORD: "${WA_UI_PASSWORD:?set WA_UI_PASSWORD in .env}"
       WA_UI_USERNAME: "${WA_UI_USERNAME:-me}"
+      # The bridge's push route. Its own secret, deliberately not WA_UI_PASSWORD:
+      # this grants "the user said this", never a login to the agent's UI.
+      WA_CONSOLE_PUSH_TOKEN: "${WA_CONSOLE_PUSH_TOKEN:-}"
       # Voice-note transcription runs from the agent, not the bridge. Unset
       # leaves voice notes listed but unreadable, which is a working state.
       # Unset URL leaves voice notes listed but unread, which is a working

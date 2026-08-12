@@ -37,6 +37,36 @@ export function normalizeName(value) {
 }
 
 /**
+ * `normalizeName`, plus the differences that are not differences.
+ *
+ * ── Why this is separate ────────────────────────────────────────────────────
+ * Two jobs that look identical and are not. `normalizeName` produces the form
+ * an entry is RECORDED in, so it keeps what the operator wrote: an allowlist
+ * that silently rewrites `Zé` to `Ze` is an allowlist whose contents no longer
+ * match the file the operator is looking at.
+ *
+ * This produces the form two names are COMPARED in, where a circumflex nobody
+ * types from a phone and an emoji WhatsApp renders as decoration must not be
+ * the reason a message is refused. The bug that split them apart: the group
+ * `Kim, Lu, Rê` could not be reached as `Kim, Lu, Re` — the resolver found it
+ * and the allowlist check then rejected its own answer.
+ *
+ * Folding here can only ever make MORE names equal, never fewer, and every
+ * caller that consumes it refuses ambiguity rather than picking a winner.
+ */
+export function foldName(value) {
+  return normalizeName(
+    String(value ?? "")
+      .normalize("NFD")
+      // Combining marks, once NFD has split them from their letters.
+      .replace(/\p{M}+/gu, "")
+      // Decoration in a chat name: `👥 Casa & Crianças` is said as "casa e criancas".
+      .replace(/[\p{Extended_Pictographic}\p{Emoji_Presentation}\uFE0F]/gu, " "),
+  );
+}
+
+
+/**
  * Split the allowlist into entries, honouring names that contain commas.
  *
  * The delimiter collides with legal content: "Kiko, Tuca, Zé" is a real group
@@ -113,7 +143,7 @@ export function parseAliases(env = process.env) {
   try {
     const parsed = JSON.parse(raw);
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return new Map();
-    return new Map(Object.entries(parsed).map(([alias, real]) => [normalizeName(alias), String(real)]));
+    return new Map(Object.entries(parsed).map(([alias, real]) => [foldName(alias), String(real)]));
   } catch {
     // A malformed map must not stop the bridge from starting; it just means no
     // aliases resolve.
@@ -123,7 +153,7 @@ export function parseAliases(env = process.env) {
 
 /** The canonical chat name for `name`, or `name` unchanged when not an alias. */
 export function resolveAlias(name, env = process.env) {
-  return parseAliases(env).get(normalizeName(name)) ?? name;
+  return parseAliases(env).get(foldName(name)) ?? name;
 }
 
 function refuse(message, statusCode) {
@@ -162,7 +192,7 @@ export function assertSendConfigured(env = process.env) {
  */
 export function assertSendable(name, env = process.env) {
   assertSendConfigured(env);
-  if (!parseAllowlist(env).includes(normalizeName(name))) {
+  if (!parseAllowlist(env).map(foldName).includes(foldName(name))) {
     // A comma in the requested name is the likeliest cause of a surprising
     // refusal, because an unquoted entry was split into pieces. Say so rather
     // than leaving the operator to rediscover it.
@@ -187,7 +217,7 @@ export function assertSendable(name, env = process.env) {
  * evidence of being correct.
  */
 export function assertResolvedMatches(requested, resolved) {
-  if (normalizeName(requested) !== normalizeName(resolved)) {
+  if (foldName(requested) !== foldName(resolved)) {
     throw refuse(
       `Asked to message "${requested}" but the search opened "${resolved}". ` +
         "Refusing to send. Use the exact chat name from the chat list.",

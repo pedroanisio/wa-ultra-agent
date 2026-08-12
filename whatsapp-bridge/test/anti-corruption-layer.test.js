@@ -3,48 +3,36 @@ import { readFileSync, readdirSync } from "node:fs";
 import { test } from "node:test";
 
 /**
- * Where this project is allowed to know what WhatsApp's DOM looks like.
+ * The DOM seam is gone, and must stay gone.
  *
- * ── The pattern, and its name ───────────────────────────────────────────────
- * The DOM seam is this system's single largest fragility: WhatsApp Web is not an
- * API, ships no version number, and can be redesigned without notice. The
- * mitigation already in place is an isolation layer — `selectors.js` holds every
- * candidate hook and asserts the critical ones before anything walks the tree,
- * `message-kind.js` turns a rendered row into `{key, kind, outgoing, sent_at_iso}`,
- * and `history.js` turns a scrollback into content-addressed messages.
+ * ── What this file used to be ───────────────────────────────────────────────
+ * A ratchet. WhatsApp Web is not an API: it ships no version number and can be
+ * redesigned without notice, so every selector in this repository was a standing
+ * liability. The rule — WhatsApp's vocabulary on one side, this project's on the
+ * other, translated in exactly one place — could not be asserted cleanly,
+ * because `whatsapp.js` performed 73 inline DOM walks and `session.js` reached
+ * for `#pane-side` directly. So the invariant was written as a ceiling per file
+ * that could only decrease, and the file ended with its own exit condition:
  *
- * That pattern has a name and it is thirty years old:
+ *   "When only the three layer files remain, replace this file with the clean
+ *    assertion the audit asked for."
  *
- *   "Anti-Corruption Layer: Create an isolating layer to provide clients with
- *    functionality in terms of their own domain model." — Evans, Domain-Driven
- *    Design lineage
+ * ── Why it is this instead ──────────────────────────────────────────────────
+ * The ceilings reached zero the only way they ever realistically could: not by
+ * refactoring the DOM driver, but by deleting it. `whatsapp-transport` (Go,
+ * whatsmeow) speaks WhatsApp's multi-device protocol directly, which supplies
+ * every fact the browser was scraped for — and supplies them better. A protocol
+ * message carries its own id, an exact instant and a stable per-person key,
+ * where a rendered row offered a hash of its text, `"8/3/2026"` parsed against a
+ * guessed date order, and a fuzzy display name.
  *
- * Naming it matters because it converts a coincidence into a commitment, and it
- * gives review a rule: WhatsApp's vocabulary on one side, this project's on the
- * other, and the translation happens in one place.
+ * So the assertion is now the clean one, and it is stronger than a boundary:
+ * there is no boundary because there is nothing on the other side of it.
  *
- * ── Why this is a ratchet and not a clean assertion ─────────────────────────
- * The honest state of the tree is that the rule does NOT hold. `whatsapp.js`
- * imports `SELECTORS` and `first()` — so the entry points do go through the
- * layer — but it also performs 73 inline DOM walks inside `page.evaluate` and
- * `$$eval` callbacks, and `session.js` reaches for `#pane-side` directly.
- *
- * An audit suggested asserting that nothing outside the layer knows a selector.
- * Asserting that today would fail, and the two ways to make it pass are both
- * worse than this file: delete the test, or perform a large speculative refactor
- * of the most fragile code in the repository in the same change that introduces
- * its first test.
- *
- * So the invariant is expressed as a ratchet, which is weaker but true:
- *
- *   1. The set of files permitted to know the DOM is CLOSED. A new module cannot
- *      quietly start parsing WhatsApp's markup — that is the failure mode that
- *      turns one fragile seam into five.
- *   2. The debt in each file may only DECREASE. Every count below is a ceiling.
- *      Moving a DOM walk into the layer lowers it; adding one fails the test.
- *
- * When a ceiling reaches 0, delete that entry. When only the three layer files
- * remain, replace this file with the clean assertion the audit asked for.
+ * This is a REGRESSION test, not an archaeology note. Reintroducing a browser
+ * driver would reintroduce the entire class of fragility this project spent its
+ * history containing, and it would do so quietly — one `querySelector` at a
+ * time, in a file nobody was watching.
  */
 
 const SOURCE_DIR = new URL("../src/", import.meta.url);
@@ -52,111 +40,77 @@ const SOURCE_DIR = new URL("../src/", import.meta.url);
 /**
  * What counts as knowing the DOM.
  *
- * Deliberately syntactic. A semantic check would need to parse the file, and the
- * point here is to be impossible to argue with: these are the constructs that
- * only exist because somebody is addressing WhatsApp's markup.
+ * Deliberately syntactic, unchanged from the ratchet this replaces. A semantic
+ * check would need to parse the file, and the point is to be impossible to
+ * argue with: these constructs exist only because somebody is addressing
+ * WhatsApp's markup.
  */
 const DOM_KNOWLEDGE =
   /querySelector(?:All)?\(|\$\$?eval\(|\[data-testid=|\[aria-label|\[role=|\[title\]|contenteditable/g;
 
-/**
- * The Anti-Corruption Layer proper. These files exist to know the DOM, and a
- * count here is not debt.
- */
-const LAYER = new Set(["selectors.js", "message-kind.js", "history.js"]);
+/** Driving a browser, as opposed to merely describing one. */
+const BROWSER_DRIVER = /\bplaywright\b|\bchromium\b|page\.evaluate\(|page\.goto\(|browser\.newPage\(/g;
 
-/**
- * Files outside the layer that still address the DOM, with the ceiling each is
- * held to. Ratchet only: lower these when work moves into the layer, never raise
- * them.
- */
-const CEILINGS = {
-  // The bulk of it: DOM walks inside page.evaluate callbacks. The target state is
-  // that each becomes a named reader in selectors.js returning this project's
-  // vocabulary, at which point this number falls.
-  "whatsapp.js": 73,
-  // One reference: `#pane-side`, to attach the pane-change observer. Small enough
-  // to move in a single change, and the obvious first entry to retire.
-  "session.js": 1,
-};
-
-function domKnowledgeCounts() {
-  const counts = {};
-  for (const file of readdirSync(SOURCE_DIR).filter((f) => f.endsWith(".js")).sort()) {
-    const text = readFileSync(new URL(file, SOURCE_DIR), "utf8");
-    const hits = text.match(DOM_KNOWLEDGE)?.length ?? 0;
-    if (hits > 0) counts[file] = hits;
-  }
-  return counts;
+function sourceFiles() {
+  return readdirSync(SOURCE_DIR)
+    .filter((name) => name.endsWith(".js"))
+    .map((name) => ({ name, body: readFileSync(new URL(name, SOURCE_DIR), "utf8") }));
 }
 
-test("ACL: no new module learns what WhatsApp's DOM looks like", () => {
-  const counts = domKnowledgeCounts();
-  const permitted = new Set([...LAYER, ...Object.keys(CEILINGS)]);
-  const trespassers = Object.keys(counts).filter((f) => !permitted.has(f));
-
-  assert.deepEqual(
-    trespassers,
-    [],
-    `${trespassers.join(", ")} started addressing WhatsApp's markup directly. That belongs in the ` +
-      "anti-corruption layer — selectors.js for hooks, message-kind.js for rows, history.js for " +
-      "scrollback — so a redesign breaks one place instead of several. If this is genuinely a " +
-      "fourth layer file, add it to LAYER and say why in its header.",
-  );
-});
-
-test("ACL: the DOM debt outside the layer only ever shrinks", () => {
-  const counts = domKnowledgeCounts();
-  const regressions = [];
-
-  for (const [file, ceiling] of Object.entries(CEILINGS)) {
-    const actual = counts[file] ?? 0;
-    if (actual > ceiling) regressions.push(`${file}: ${actual} DOM references, ceiling is ${ceiling}`);
+function offenders(pattern) {
+  const found = {};
+  for (const { name, body } of sourceFiles()) {
+    const hits = body.match(pattern);
+    if (hits) found[name] = hits.length;
   }
+  return found;
+}
 
+test("ACL: no source file addresses WhatsApp's markup", () => {
+  const found = offenders(DOM_KNOWLEDGE);
   assert.deepEqual(
-    regressions,
-    [],
-    `DOM knowledge outside the anti-corruption layer grew:\n  ${regressions.join("\n  ")}\n\n` +
-      "Put the new selector in selectors.js and read it through first()/SELECTORS instead. These " +
-      "ceilings are a ratchet: they exist to be lowered, never raised.",
+    found,
+    {},
+    "A selector reappeared in the bridge. Reception, sending, media and history all run " +
+      "through whatsapp-transport now; anything needing a new fact should ask the protocol " +
+      "for it rather than scrape a rendering of it.",
   );
 });
 
-test("ACL: a retired ceiling is deleted rather than left at zero", () => {
-  // Housekeeping with a point. A ceiling of 0 left in place reads as "this file
-  // is allowed to know the DOM", which is the opposite of what it means, and it
-  // keeps the file in the permitted set for the closed-set test above.
-  const counts = domKnowledgeCounts();
-  const retired = Object.keys(CEILINGS).filter((f) => (counts[f] ?? 0) === 0);
-
+test("ACL: no source file drives a browser", () => {
+  const found = offenders(BROWSER_DRIVER);
   assert.deepEqual(
-    retired,
-    [],
-    `${retired.join(", ")} no longer addresses the DOM. Remove it from CEILINGS — leaving it at 0 ` +
-      "keeps it permitted, which is backwards.",
+    found,
+    {},
+    "A browser driver reappeared in the bridge. The Playwright path was removed deliberately: " +
+      "it duplicated the transport with weaker identity, weaker timestamps and a far larger " +
+      "automation footprint.",
   );
 });
 
-test("ACL: the layer files are still present and still doing the job", () => {
-  // Guards the case where the layer is dismantled rather than extended: if
-  // selectors.js stopped holding selectors, both tests above would pass while the
-  // boundary had ceased to exist.
-  const counts = domKnowledgeCounts();
-  for (const file of ["selectors.js"]) {
+test("ACL: the browser driver's modules are gone and stay gone", () => {
+  // Named individually rather than inferred: a test that only counted selectors
+  // would pass against an empty session.js left behind as a stub.
+  const present = readdirSync(SOURCE_DIR);
+  for (const gone of ["session.js", "selectors.js", "lifecycle.js", "watch.js"]) {
     assert.ok(
-      (counts[file] ?? 0) > 0,
-      `${file} is the anti-corruption layer and no longer contains any selector. Either the ` +
-        "boundary moved without this test being updated, or it has been dismantled.",
+      !present.includes(gone),
+      `${gone} belonged to the browser driver and has come back. If a genuine need for it ` +
+        "returned, the transport is the place to answer it.",
     );
   }
-  // message-kind.js and history.js translate rows and scrollback into this
-  // project's vocabulary; they are deliberately NOT asserted to contain
-  // selectors, because doing their job through passed-in handles is correct.
-  for (const file of ["message-kind.js", "history.js"]) {
-    assert.ok(
-      readdirSync(SOURCE_DIR).includes(file),
-      `${file} is part of the anti-corruption layer and has gone missing.`,
-    );
-  }
+});
+
+test("ACL: the bridge does not depend on Playwright", () => {
+  const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+  const deps = { ...(pkg.dependencies ?? {}), ...(pkg.devDependencies ?? {}) };
+  assert.ok(
+    !Object.keys(deps).some((name) => /playwright/i.test(name)),
+    "Playwright is back in the bridge's dependencies. The image no longer ships a browser, " +
+      "so this would install one that nothing can use.",
+  );
+  assert.ok(
+    !/xvfb/i.test(JSON.stringify(pkg.scripts ?? {})),
+    "An Xvfb script is back. There is no browser to give a display to.",
+  );
 });

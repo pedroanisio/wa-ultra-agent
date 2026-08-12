@@ -331,22 +331,15 @@ export interface IngestResult {
 }
 
 export interface MediaPayload {
-  chat: string;
-  exactMatch: boolean;
-  fromEnd: number;
-  /**
-   * The archive's id for this row. `fromEnd` expires the moment a message
-   * arrives; this does not, so it is what a transcript is filed under.
-   */
+  /** The protocol's own message id — what the attachment is addressed by. */
   key: string;
-  kind: MessageKind;
-  from?: string;
-  time?: string;
-  filename?: string;
   mediaType: string;
+  /** The real byte length, measured before base64 inflated it by a third. */
   sizeBytes: number;
+  filename?: string;
   base64: string;
 }
+
 
 /**
  * One observed change to the chat list.
@@ -383,11 +376,18 @@ export interface ReactionResult {
 }
 
 export class BridgeError extends Error {
-  constructor(
-    message: string,
-    readonly status: number,
-  ) {
+  /**
+   * Assigned in the body rather than declared as a constructor parameter
+   * property. The parameter-property form is TypeScript that *emits* code, and
+   * Node runs these files by stripping types rather than compiling them — so
+   * it made this module, and everything importing it, impossible to load under
+   * `node --test`. Nothing that talks to the bridge could be tested at all.
+   */
+  readonly status: number;
+
+  constructor(message: string, status: number) {
     super(message);
+    this.status = status;
   }
 }
 
@@ -427,25 +427,143 @@ async function call<T>(path: string, init: RequestInit = {}, signal?: AbortSigna
 
 export const bridge = {
   status: (signal?: AbortSignal) =>
-    call<{ state: "logged_in" | "logged_out" | "loading"; reason?: string }>("/status", {}, signal),
+    call<{
+      archive: { chats: number; messages: number };
+      transport: "configured" | "unset";
+    }>("/status", {}, signal),
 
+  /**
+   * Recent conversations, from the archive.
+   *
+   * `displayName` is null for anyone not in the contact list: the protocol
+   * offers no name for them, and deriving one from a phone number is what
+   * `internal/identity` exists to prevent. Fall back to `key`.
+   */
   listChats: (limit: number, signal?: AbortSignal) =>
-    call<{ chats: Array<{ name: string; preview: string; unread: number }>; note?: string }>(
-      `/chats?limit=${limit}`,
+    call<{
+      chats: Array<{
+        key: string;
+        displayName: string | null;
+        kind: string | null;
+        provisional: boolean;
+        messages: number;
+        lastMessageAt: string | null;
+      }>;
+    }>(`/archive/chats?limit=${limit}`, {}, signal),
+
+  /**
+   * One conversation's recent messages, from the archive.
+   *
+   * There is no `exactMatch` any more, and its absence is the point: this used
+   * to type a name into WhatsApp's search box and report how well the first
+   * result matched. A chat is now addressed by its key.
+   */
+  readChat: (chat: string, limit: number, signal?: AbortSignal) =>
+    call<{
+      chat: string;
+      messages: WhatsAppMessage[];
+      note?: string;
+    }>(
+      // `newest` is not optional here. Without it the archive cuts the limit
+      // from the OLDEST end, so "the last 25 messages" answers with the first
+      // 25 ever exchanged and a busy chat reads as a quiet one.
+      `/archive/messages?chat=${encodeURIComponent(chat)}&limit=${limit}&newest=1`,
       {},
       signal,
     ),
 
-  readChat: (chat: string, limit: number, signal?: AbortSignal) =>
+  /* ---------------------------------------------------------------- *
+   * Acting on a message that already exists.
+   *
+   * All four take the protocol's own `messageId` — the key the archive stores —
+   * because a reaction or a revoke addresses one exact message and nothing else
+   * identifies it. `sender` is needed only in a group, where the target may be
+   * somebody else's message.
+   * ---------------------------------------------------------------- */
+
+  /** React, or pass an empty emoji to take a reaction back. */
+  react: (
+    params: { to: string; messageId: string; emoji: string; sender?: string },
+    signal?: AbortSignal,
+  ) => call<{ id: string; sentAt?: string }>(
+    "/send/reaction",
+    { method: "POST", body: JSON.stringify(params) },
+    signal,
+  ),
+
+  /** Replace the text of a message already sent. */
+  editMessage: (
+    params: { to: string; messageId: string; message: string },
+    signal?: AbortSignal,
+  ) => call<{ id: string; sentAt?: string }>(
+    "/send/edit",
+    { method: "POST", body: JSON.stringify(params) },
+    signal,
+  ),
+
+  /** Delete for everyone. The only undo this system has. */
+  revokeMessage: (
+    params: { to: string; messageId: string; sender?: string },
+    signal?: AbortSignal,
+  ) => call<{ id: string; sentAt?: string }>(
+    "/send/revoke",
+    { method: "POST", body: JSON.stringify(params) },
+    signal,
+  ),
+
+  sendPoll: (
+    params: { to: string; name: string; options: string[]; selectableCount?: number },
+    signal?: AbortSignal,
+  ) => call<{ id: string; sentAt?: string }>(
+    "/send/poll",
+    { method: "POST", body: JSON.stringify(params) },
+    signal,
+  ),
+
+  votePoll: (
+    params: { to: string; messageId: string; options: string[]; sender?: string },
+    signal?: AbortSignal,
+  ) => call<{ id: string; sentAt?: string }>(
+    "/send/poll/vote",
+    { method: "POST", body: JSON.stringify(params) },
+    signal,
+  ),
+
+  /**
+   * Typing and online indicators.
+   *
+   * The one call here that is about how the account LOOKS rather than what it
+   * says: a considered answer that takes a minute reads as absence without it.
+   */
+  presence: (
+    params: { to: string; state: "composing" | "recording" | "paused" | "available" | "unavailable"; media?: string },
+    signal?: AbortSignal,
+  ) => call<{ ok: boolean }>(
+    "/presence",
+    { method: "POST", body: JSON.stringify(params) },
+    signal,
+  ),
+
+  /**
+   * Re-resolve the chats the transport could only give a provisional key.
+   *
+   * Fixes the `pn:` digests the README documents: whatsmeow fills its LID cache
+   * on first use, and a cache filled seconds after pairing is filled empty.
+   */
+  refreshNames: (signal?: AbortSignal) =>
+    call<{ updated: number; remaining?: number }>(
+      "/archive/names/refresh",
+      { method: "POST" },
+      signal,
+    ),
+
+  /** Pairing and connection state, straight from the transport. */
+  transportStatus: (signal?: AbortSignal) =>
     call<{
-      chat: string;
-      resolvedFrom: string;
-      exactMatch: boolean;
-      /** How many messages of each kind are in this window. */
-      counts?: Record<MessageKind, number | undefined>;
-      messages: WhatsAppMessage[];
-      note?: string;
-    }>(`/messages?chat=${encodeURIComponent(chat)}&limit=${limit}`, {}, signal),
+      session?: { paired?: boolean; connected?: boolean; loggedIn?: boolean };
+      send?: { enabled?: boolean; allowlistedSize?: number };
+      archive?: { provisionalChats?: number };
+    }>("/transport/status", {}, signal),
 
   sendMessage: (to: string, message: string, signal?: AbortSignal) =>
     call<{
@@ -459,14 +577,16 @@ export const bridge = {
     }>("/send", { method: "POST", body: JSON.stringify({ to, message }) }, signal),
 
   /**
-   * Walk a chat backwards and write it to the archive. Bounded on purpose —
-   * call again while `hasMore` is true. Re-reading costs nothing, because
-   * messages are identified by content.
+   * Ask the phone for messages older than the archive already holds.
+   *
+   * This replaces `ingest`, which scrolled a rendered conversation. Reachable
+   * depth is whatever the PHONE still has, not whatever WhatsApp's servers have,
+   * so a short answer is a fact about the phone rather than a failure.
    */
-  ingest: (
-    params: { chat: string; mode?: "top-up" | "backfill"; maxScrolls?: number },
+  requestHistory: (
+    params: { chat: string; oldestId?: string; oldestTimestamp?: number; count?: number },
     signal?: AbortSignal,
-  ) => call<IngestResult>("/ingest", { method: "POST", body: JSON.stringify(params) }, signal),
+  ) => call<{ requested: boolean }>("/history", { method: "POST", body: JSON.stringify(params) }, signal),
 
   /** Keyword search over everything ingested. Reads SQLite, never WhatsApp. */
   searchArchive: (params: ArchiveSearchParams, signal?: AbortSignal) => {
@@ -494,10 +614,20 @@ export const bridge = {
     );
   },
 
-  /** Stored messages for one chat, each with the key an extraction must cite. */
-  archiveMessages: (params: { chat: string; limit?: number }, signal?: AbortSignal) => {
+  /**
+   * Stored messages for one chat, each with the key an extraction must cite.
+   *
+   * `newest` decides which end the limit cuts from. Leave it off and a small
+   * limit returns the OLDEST messages in the chat, which is right for walking an
+   * archive forwards and wrong for every question about what just happened.
+   */
+  archiveMessages: (
+    params: { chat: string; limit?: number; newest?: boolean },
+    signal?: AbortSignal,
+  ) => {
     const query = new URLSearchParams({ chat: params.chat });
     if (params.limit) query.set("limit", String(params.limit));
+    if (params.newest) query.set("newest", "1");
     return call<{ chat: string; messages: ArchiveHit[] }>(`/archive/messages?${query}`, {}, signal);
   },
 
@@ -624,82 +754,31 @@ export const bridge = {
     ),
 
   /* ---------------------------------------------------------------- *
-   * Events.
+   * The self-chat console.
    *
-   * The bridge watches the chat list passively and queues what changed. It
-   * owns every limit on reacting — per-chat cooldown, quiet hours, fan-out cap,
-   * interaction budget — for the same reason it owns the send allowlist: a cap
-   * the agent enforces is a cap a confused agent can talk itself out of.
+   * The inbox-event queue that used to live here is gone with the browser. It
+   * existed because detection was free but REACTING was not: topping up a chat
+   * meant opening it in a real browser, so the bridge owned a cooldown, a
+   * fan-out cap, a scroll cap and quiet hours to bound an interaction the
+   * account could be banned for. Reception is push now — the transport holds the
+   * socket and messages land in a durable outbox — so there is no queue to claim
+   * from and no interaction to ration.
    * ---------------------------------------------------------------- */
 
-  /** Look at the queue, claiming nothing and reading no chats. */
-  inboxEvents: (params: { limit?: number } = {}, signal?: AbortSignal) => {
-    const query = new URLSearchParams();
-    if (params.limit) query.set("limit", String(params.limit));
-    return call<{
-      events: Array<{
-        key: string;
-        chat: string;
-        kind: InboxEvent["kind"];
-        preview?: string;
-        unread?: number;
-        observed_at: string;
-        attempts: number;
-      }>;
-      queue: { pending: number; handled: number; leased: number };
-    }>(`/events?${query}`, {}, signal);
-  },
-
-  /** Whether the watcher is running, and what it has seen. */
-  inboxStatus: (signal?: AbortSignal) =>
-    call<{
-      watching: boolean;
-      observer: { installed: boolean; error?: string | null };
-      baselineAt: string | null;
-      counters: { snapshots: number; skipped: number; recorded: number; lastAt: string | null };
-      queue: { pending: number; handled: number; leased: number };
-      settings: {
-        cooldownMinutes: number;
-        maxChatsPerWake: number;
-        maxScrolls: number;
-        quietHours: string | null;
-        quietHoursValid: boolean;
-        inQuietHoursNow: boolean;
-      };
-      budgetRemaining: number;
-      note?: string;
-    }>("/events/status", {}, signal),
-
   /**
-   * Claim pending events and let the bridge top up the archive for whichever
-   * chats its own limits allow it to open.
+   * What the operator typed in `/eve` mode, for this agent to answer.
    *
-   * Claiming does not close the events out — `completeInboxEvents` does, after
-   * the user has actually been told. A crash in between means the notification
-   * is late, not lost.
+   * Drains on read: answer through `sendSelfNote`, because a message handed over
+   * twice would be answered twice. Empty is the normal state — the console only
+   * forwards while the operator has entered that state.
    */
-  reactToInbox: (params: { limit?: number } = {}, signal?: AbortSignal) =>
-    call<ReactionResult>(
-      "/events/react",
-      { method: "POST", body: JSON.stringify(params) },
-      signal,
-    ),
-
-  /** Acknowledge events, after the user has been told about them. */
-  completeInboxEvents: (keys: string[], signal?: AbortSignal) =>
-    call<{ handled: number }>(
-      "/events/complete",
-      { method: "POST", body: JSON.stringify({ keys }) },
-      signal,
-    ),
-
-  /** Hand events back unhandled, for the next tick to reconsider. */
-  releaseInboxEvents: (keys: string[], signal?: AbortSignal) =>
-    call<{ released: number }>(
-      "/events/release",
-      { method: "POST", body: JSON.stringify({ keys }) },
-      signal,
-    ),
+  pendingForAgent: (params: { waitMs?: number } = {}, signal?: AbortSignal) =>
+    call<{
+      items: Array<{ text: string; at: string }>;
+      count: number;
+      /** `eve` while the user is in that state; null when they have left it. */
+      state: string | null;
+    }>(`/self/pending?waitMs=${params.waitMs ?? 0}`, {}, signal),
 
   /** The four buckets behind "what needs my attention". */
   attention: (params: { horizonDays?: number } = {}, signal?: AbortSignal) => {
@@ -832,29 +911,51 @@ export const bridge = {
    * row at that position is not the one that was read, because a message
    * arriving in between would otherwise redirect this to a different attachment.
    */
-  fetchMedia: (
-    params: {
-      chat: string;
-      fromEnd: number;
-      kind?: MessageKind;
-      from?: string;
-      time?: string;
-      maxBytes?: number;
-    },
-    signal?: AbortSignal,
-  ) => {
-    const query = new URLSearchParams({ chat: params.chat, fromEnd: String(params.fromEnd) });
-    if (params.kind) query.set("kind", params.kind);
-    if (params.from) query.set("from", params.from);
-    if (params.time) query.set("time", params.time);
-    if (params.maxBytes) query.set("maxBytes", String(params.maxBytes));
-    return call<MediaPayload>(`/media?${query}`, {}, signal);
-  },
+  /**
+   * The payload behind one media message, by the protocol's own message id.
+   *
+   * The old signature took a position from the end of a rendered chat plus a
+   * `kind`/`from`/`time` fingerprint to check that the row there was still the
+   * one the caller had read. All of that existed because a position is not an
+   * address. An id is.
+   */
+  fetchMedia: (params: { key: string }, signal?: AbortSignal) =>
+    call<MediaPayload>(`/media?key=${encodeURIComponent(params.key)}`, {}, signal),
 
   /**
-   * Write to the user's own chat. The bridge owns the safety check: it refuses
-   * unless the conversation open is exactly WA_SELF_CHAT_NAME, so there is no
-   * recipient to get wrong and nothing for a human to confirm.
+   * The name of the user's own chat, so it can be *read* as well as written to.
+   *
+   * Returned as the account's own identity key. There is no name involved on
+   * either side any more: the transport addresses the account from its device
+   * store, so nothing here can be fuzzy-matched to a stranger.
+   */
+  selfChat: (signal?: AbortSignal) =>
+    call<{
+      chat: string;
+      /**
+       * Where that chat can be READ. `archive` means the stored messages —
+       * there is no conversation to open, because the protocol transport has no
+       * screen. Anything that assumes otherwise addresses a component that no
+       * longer exists.
+       */
+      source: "archive";
+      via: "transport";
+      /**
+       * The bridge's own console session, when one is open — `"game"`, `"eve"`,
+       * or `null` for none. While it is set the console is answering that chat
+       * as each message arrives, and its game reads bare digits as moves. A
+       * second responder has to stand down rather than answer the same keystroke
+       * a few minutes later.
+       */
+      console?: string | null;
+    }>("/self/chat", {}, signal),
+
+  /**
+   * Write to the user's own chat.
+   *
+   * No allowlist and no confirmation, because there is no recipient to get
+   * wrong: the transport resolves the account's own JID itself and this call
+   * carries no address at all.
    */
   writeSelf: (messages: string[], signal?: AbortSignal) =>
     call<{ sent: boolean; chat: string; messages: string[]; at: string }>(
@@ -863,21 +964,81 @@ export const bridge = {
       signal,
     ),
 
-  prepareSend: (to: string, message: string, signal?: AbortSignal) =>
-    call<{
-      token: string;
-      resolvedRecipient: string;
-      requestedRecipient: string;
-      exactMatch: boolean;
-      preview: string;
-      expiresInSeconds: number;
-      warning?: string;
-    }>("/send/prepare", { method: "POST", body: JSON.stringify({ to, message }) }, signal),
+  /**
+   * An image to the user's own chat.
+   *
+   * Base64 over this hop because it is loopback between two processes we own,
+   * and a JSON body keeps the bridge route, its tests and this client reading
+   * the same shape. The encoding cost is nothing beside the media upload that
+   * follows it.
+   */
+  writeSelfImage: (
+    image: {
+      bytes: Uint8Array;
+      mimetype?: string;
+      caption?: string;
+      width?: number;
+      height?: number;
+      /** `document` for a PDF: WhatsApp shows a file row rather than a preview. */
+      kind?: "image" | "document";
+      /** What the file is called on the phone. Only meaningful for a document. */
+      filename?: string;
+    },
+    signal?: AbortSignal,
+  ) =>
+    call<{ id: string; sentAt: string; chat: string; archived: boolean }>(
+      "/send/self/media",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          dataBase64: Buffer.from(image.bytes).toString("base64"),
+          mimetype: image.mimetype ?? "image/png",
+          caption: image.caption,
+          width: image.width,
+          height: image.height,
+          kind: image.kind,
+          filename: image.filename,
+        }),
+      },
+      signal,
+    ),
 
-  commitSend: (token: string, signal?: AbortSignal) =>
-    call<{ sent: boolean; to: string; message: string; at: string }>(
-      "/send/commit",
-      { method: "POST", body: JSON.stringify({ token }) },
+  /**
+   * An image, for an allowlisted recipient.
+   *
+   * Protocol-only, and always was: the browser path had no attachment mechanism
+   * at all.
+   */
+  sendMedia: (
+    params: {
+      to: string;
+      bytes: Uint8Array;
+      mimetype: string;
+      caption?: string;
+      kind?: "image" | "document";
+      filename?: string;
+      width?: number;
+      height?: number;
+    },
+    signal?: AbortSignal,
+  ) =>
+    call<{ sent: boolean; to: string; at: string; exactMatch?: boolean }>(
+      "/send/media",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          to: params.to,
+          // The route reads `dataBase64`; an `image` field would arrive as a
+          // 400 saying the payload is missing, which is what it used to send.
+          dataBase64: Buffer.from(params.bytes).toString("base64"),
+          mimetype: params.mimetype,
+          caption: params.caption,
+          kind: params.kind,
+          filename: params.filename,
+          width: params.width,
+          height: params.height,
+        }),
+      },
       signal,
     ),
 };

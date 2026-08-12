@@ -8,11 +8,11 @@ disclaimer:
   date: "2026-08-11"
 last_verified: "2026-08-11"
 verified_how: >-
-  Every command in Steps 1-4 and 6-8 was executed on this machine against a
-  scratch archive and a real transport process. Step 5 (pairing) was NOT
-  executed: it requires linking a real WhatsApp account, which this session did
-  not do. Step 5 is derived from internal/httpapi/api.go and internal/session,
-  and is marked as unverified in place.
+  Every step was executed on this machine against a real account, including
+  Step 5. Pairing was completed by QR; the phone-code flow returned
+  "400 bad-request" from WhatsApp's servers on repeated attempts and is marked
+  accordingly in place. Steps 6-8 were run end to end: 8,658 queued messages
+  drained into the archive with 0 dropped.
 tool_versions:
   - tool: "Go (host)"
     version: "1.24.6"
@@ -162,7 +162,7 @@ Expected, exactly:
 ```
 
 ```json
-{"send":{"allowlistedSize":0,"enabled":false},"session":{"paired":false,"connected":false,"loggedIn":false,"events":{"messages":0,"fromHistory":0,"unrecognised":0,"undecryptable":0,"ignored":0,"failed":0,"mediaUnrecorded":0},"queue":{"depth":0,"dropped":0}}}
+{"send":{"allowlistedSize":0,"enabled":false},"session":{"paired":false,"connected":false,"loggedIn":false,"events":{"messages":0,"fromHistory":0,"unrecognised":0,"undecryptable":0,"ignored":0,"failed":0,"mediaUnrecorded":0,"unrecognisedTypes":{}},"queue":{"depth":0,"dropped":0}}}
 ```
 
 **If the container exits immediately**, read the last log line. There are exactly
@@ -230,14 +230,28 @@ acking `0` looks like success and loops forever.
 
 ### Step 5: Pair the account
 
-> **Unverified.** This session had no account to link, so the two flows below are
-> read from `internal/httpapi/api.go` rather than executed. Everything else in
+> **Verified by QR; the code flow failed.** Both flows below were attempted
+> against a real account. The QR flow works. `POST /pair/phone` returned
+> `400 bad-request` from WhatsApp's own servers on every attempt, with and
+> without a leading `+` — whatsmeow strips non-digits itself, so the format was
+> never the difference. Prefer the QR flow until that is understood. Everything else in
 > this guide was run.
 
 This is a **new linked device**, separate from the browser session. It consumes
 one of WhatsApp's linked-device slots and does not disturb the existing one.
 
-Prefer the code flow — it needs no QR rendering:
+The QR flow is the one that works here. Note that the code rotates every ~20s
+and the channel closes after about two minutes, so render it somewhere live
+rather than sending yourself a snapshot — a stale code fails as
+"Couldn't link device", which looks like a rejection but is an expiry.
+
+**Do not restart the transport while the phone says "Logging in".** The
+registration completes only once the new session stays connected long enough to
+finish its first login. Tearing it down before that abandons it, and the next
+connect is refused with `401 logged out from another device` — which whatsmeow
+treats as a logout, deleting the session and wasting the scan.
+
+The code flow, for reference — it needs no QR rendering, but see the note above:
 
 ```bash
 curl -s -X POST -H "Authorization: Bearer $WA_TRANSPORT_TOKEN" \
@@ -318,7 +332,8 @@ Expected shape — the transport's own status, plus what only the archive knows:
   "send": { "allowlistedSize": 0, "enabled": false },
   "session": { "paired": true, "connected": true, "loggedIn": true,
     "events": { "messages": 0, "fromHistory": 0, "unrecognised": 0,
-                "undecryptable": 0, "ignored": 0, "failed": 0, "mediaUnrecorded": 0 },
+                "undecryptable": 0, "ignored": 0, "failed": 0, "mediaUnrecorded": 0,
+                "unrecognisedTypes": {} },
     "queue": { "depth": 0, "dropped": 0 } },
   "archive": { "provisionalChats": 0, "provisional": [] }
 }

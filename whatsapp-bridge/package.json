@@ -3,14 +3,10 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Long-running Playwright session over web.whatsapp.com, exposed as a local HTTP API.",
+  "description": "The archive and its HTTP API. Reception, sending, media and history run through whatsapp-transport (Go, whatsmeow); this service owns store.db and is its only writer.",
   "scripts": {
     "start": "node src/server.js",
-    "start:xvfb": "xvfb-run -a --server-args='-screen 0 1280x900x24' node src/server.js",
-    "test": "node --test"
-  },
-  "dependencies": {
-    "playwright": "1.62.1"
+    "test": "node --test \"test/*.test.js\""
   },
   "engines": {
     "node": ">=22"

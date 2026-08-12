@@ -22,6 +22,7 @@ package translate
 
 import (
 	"go.mau.fi/whatsmeow/proto/waE2E"
+	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
 // Kind is the archive's closed vocabulary for what a message turned out to be.
@@ -45,6 +46,29 @@ const (
 	KindDeleted  Kind = "deleted"
 	KindSystem   Kind = "system"
 	KindUnknown  Kind = "unknown"
+
+	// ── Added after the coverage audit ──────────────────────────────────────
+	// Every one of these was arriving as `unknown`, which is how the archive
+	// accumulated 446 messages it could not describe. They are ordinary traffic
+	// on a personal account, not protocol exotica.
+	KindReaction    Kind = "reaction"
+	KindVideoNote   Kind = "video_note"
+	KindAlbum       Kind = "album"
+	KindPollVote    Kind = "poll_vote"
+	KindEvent       Kind = "event"
+	KindPinned      Kind = "pinned"
+	KindKept        Kind = "kept"
+	KindGroupInvite Kind = "group_invite"
+	KindComment     Kind = "comment"
+	KindCallLog     Kind = "call_log"
+
+	// Two families rather than a kind per arm. WhatsApp ships a dozen shapes for
+	// "a business sent you a structured thing" and another eight for payments,
+	// and an archive that named each one would carry twenty kinds no query
+	// distinguishes. The family is what a reader needs; the arm is recoverable
+	// from the protocol if it ever matters.
+	KindBusiness Kind = "business"
+	KindPayment  Kind = "payment"
 )
 
 // AllKinds returns every kind this package can emit.
@@ -56,6 +80,8 @@ func AllKinds() []Kind {
 		KindText, KindVoice, KindAudio, KindImage, KindVideo, KindGIF, KindSticker,
 		KindDocument, KindLocation, KindContact, KindPoll, KindDeleted, KindSystem,
 		KindUnknown,
+		KindReaction, KindVideoNote, KindAlbum, KindPollVote, KindEvent, KindPinned,
+		KindKept, KindGroupInvite, KindComment, KindCallLog, KindBusiness, KindPayment,
 	}
 }
 
@@ -67,9 +93,12 @@ func AllKinds() []Kind {
 //
 // Location and contact are excluded deliberately — they carry structured data
 // inline, not an encrypted blob on a media server, so there is nothing to fetch.
+// An album carries no bytes of its own — it is a header whose children are the
+// images — so it is excluded despite being visually a media message.
 func (k Kind) HasMedia() bool {
 	switch k {
-	case KindVoice, KindAudio, KindImage, KindVideo, KindGIF, KindSticker, KindDocument:
+	case KindVoice, KindAudio, KindImage, KindVideo, KindGIF, KindSticker, KindDocument,
+		KindVideoNote:
 		return true
 	default:
 		return false
@@ -94,11 +123,21 @@ type Content struct {
 	Mimetype        string
 	DurationSeconds *int
 
+	// TargetKey is the message this one is ABOUT: what a reaction was aimed at,
+	// which poll was voted in, what was pinned. Without it a reaction stores as
+	// "somebody reacted to something", which no query can use.
+	TargetKey string
+
 	// Recognised is false when no arm matched, which is the difference between
 	// "this is a message with no describable content" and "this is a message
 	// shape we have never seen". Both store as `unknown`; only the second is a
 	// reason to look at the protocol again.
 	Recognised bool
+
+	// UnknownType names the protobuf arm that was set when nothing matched, and
+	// is empty otherwise. It turns "446 unrecognised" — a number nobody can act
+	// on — into a ranked list of what to implement next.
+	UnknownType string
 }
 
 // Classify maps one decrypted message onto the archive vocabulary.
@@ -199,11 +238,137 @@ func Classify(msg *waE2E.Message) Content {
 		msg.GetPollCreationMessageV6() != nil:
 		return Content{Kind: KindPoll, Recognised: true}
 
+	case msg.GetReactionMessage() != nil:
+		reaction := msg.GetReactionMessage()
+		return Content{
+			Kind:       KindReaction,
+			Text:       reaction.GetText(),
+			TargetKey:  reaction.GetKey().GetID(),
+			Recognised: true,
+		}
+
+	// The emoji is inside an encrypted payload this package has no key for, so
+	// the reaction is recorded without it. That is a smaller loss than dropping
+	// the row: "she reacted to this" is most of the meaning.
+	case msg.GetEncReactionMessage() != nil:
+		return Content{
+			Kind:       KindReaction,
+			TargetKey:  msg.GetEncReactionMessage().GetTargetMessageKey().GetID(),
+			Recognised: true,
+		}
+
+	// A round video note. Same VideoMessage shape as a normal video, on a
+	// different arm — so it needs its own case or it lands as unknown, which is
+	// exactly what was happening.
+	case msg.GetPtvMessage() != nil:
+		ptv := msg.GetPtvMessage()
+		return Content{
+			Kind:            KindVideoNote,
+			Mimetype:        ptv.GetMimetype(),
+			DurationSeconds: seconds(ptv.GetSeconds()),
+			Recognised:      true,
+		}
+
+	case msg.GetAlbumMessage() != nil:
+		return Content{Kind: KindAlbum, Recognised: true}
+
+	case msg.GetPollUpdateMessage() != nil:
+		return Content{
+			Kind:       KindPollVote,
+			TargetKey:  msg.GetPollUpdateMessage().GetPollCreationMessageKey().GetID(),
+			Recognised: true,
+		}
+
+	case msg.GetEventMessage() != nil,
+		msg.GetEventInviteMessage() != nil,
+		msg.GetEncEventResponseMessage() != nil:
+		return Content{Kind: KindEvent, Recognised: true}
+
+	case msg.GetPinInChatMessage() != nil:
+		return Content{
+			Kind:       KindPinned,
+			TargetKey:  msg.GetPinInChatMessage().GetKey().GetID(),
+			Recognised: true,
+		}
+
+	case msg.GetKeepInChatMessage() != nil:
+		return Content{
+			Kind:       KindKept,
+			TargetKey:  msg.GetKeepInChatMessage().GetKey().GetID(),
+			Recognised: true,
+		}
+
+	case msg.GetGroupInviteMessage() != nil:
+		return Content{
+			Kind:       KindGroupInvite,
+			Text:       msg.GetGroupInviteMessage().GetCaption(),
+			Recognised: true,
+		}
+
+	case msg.GetCommentMessage() != nil, msg.GetEncCommentMessage() != nil:
+		return Content{Kind: KindComment, Recognised: true}
+
+	// whatsmeow spells the field with three s's. Matching their typo is the only
+	// way to read the field; it is not one of ours.
+	case msg.GetCallLogMesssage() != nil:
+		return Content{Kind: KindCallLog, Recognised: true}
+
+	case msg.GetTemplateMessage() != nil,
+		msg.GetTemplateButtonReplyMessage() != nil,
+		msg.GetHighlyStructuredMessage() != nil,
+		msg.GetButtonsMessage() != nil,
+		msg.GetButtonsResponseMessage() != nil,
+		msg.GetListMessage() != nil,
+		msg.GetListResponseMessage() != nil,
+		msg.GetInteractiveMessage() != nil,
+		msg.GetInteractiveResponseMessage() != nil,
+		msg.GetProductMessage() != nil,
+		msg.GetOrderMessage() != nil,
+		msg.GetInvoiceMessage() != nil:
+		return Content{Kind: KindBusiness, Recognised: true}
+
+	case msg.GetSendPaymentMessage() != nil,
+		msg.GetRequestPaymentMessage() != nil,
+		msg.GetDeclinePaymentRequestMessage() != nil,
+		msg.GetCancelPaymentRequestMessage() != nil,
+		msg.GetPaymentInviteMessage() != nil:
+		return Content{Kind: KindPayment, Recognised: true}
+
 	case msg.GetProtocolMessage() != nil:
 		return protocolContent(msg.GetProtocolMessage())
 	}
 
-	return Content{Kind: KindUnknown}
+	return Content{Kind: KindUnknown, UnknownType: populatedField(msg)}
+}
+
+// populatedField names the arm that was set, by reflection over the protobuf.
+//
+// ── Why reflection rather than a list ───────────────────────────────────────
+// The point of naming an unrecognised arm is to learn about types this code does
+// NOT know. A hardcoded list can only name types somebody already thought of,
+// which is the blind spot the bare counter already had — 446 unrecognised
+// messages and no way to ask what they were.
+//
+// Reflection inverts that: a message type invented after this code was written
+// still reports its own field name, and the operator gets a ranked list instead
+// of a number.
+func populatedField(msg *waE2E.Message) string {
+	if msg == nil {
+		return ""
+	}
+
+	name := ""
+	msg.ProtoReflect().Range(func(field protoreflect.FieldDescriptor, _ protoreflect.Value) bool {
+		// Context and secret-distribution ride along on messages of every kind,
+		// so naming one of them would mislabel half the stream.
+		switch field.TextName() {
+		case "messageContextInfo", "senderKeyDistributionMessage":
+			return true // keep looking
+		}
+		name = field.TextName()
+		return false // first real arm wins
+	})
+	return name
 }
 
 // protocolContent handles the control arm.

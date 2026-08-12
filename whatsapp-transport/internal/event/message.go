@@ -71,10 +71,20 @@ type Message struct {
 	Mimetype        string         `json:"mimetype,omitempty"`
 	DurationSeconds *int           `json:"durationSeconds,omitempty"`
 
+	// TargetKey is the message this one is about — what a reaction was aimed at,
+	// which poll was voted in, what was pinned. A reaction without it stores as
+	// "somebody reacted to something", which no query can use.
+	TargetKey string `json:"targetKey,omitempty"`
+
 	// Recognised is false when no protobuf arm matched. The row still stores as
 	// `unknown`; this field is what lets the bridge report how much of the
 	// stream it cannot describe instead of silently averaging it away.
 	Recognised bool `json:"recognised"`
+
+	// UnknownType names the protobuf arm behind an unrecognised message, and is
+	// empty otherwise. It is the difference between knowing that N messages were
+	// undescribed and knowing WHICH type to implement next.
+	UnknownType string `json:"unknownType,omitempty"`
 
 	// FromHistory distinguishes a backfilled message from a live arrival. The
 	// archive needs it to account for coverage honestly — SPEC §5.8 requires the
@@ -146,7 +156,9 @@ func FromMessage(ctx context.Context, r *identity.Resolver, evt *events.Message)
 		Filename:        content.Filename,
 		Mimetype:        content.Mimetype,
 		DurationSeconds: content.DurationSeconds,
+		TargetKey:       content.TargetKey,
 		Recognised:      content.Recognised,
+		UnknownType:     content.UnknownType,
 
 		// whatsmeow sets SourceWebMsg only when the message was parsed from a
 		// WebMessageInfo, which is history sync and unavailable-message replies

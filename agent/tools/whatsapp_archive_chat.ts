@@ -25,24 +25,33 @@ export default defineTool({
     "bridge's hourly interaction limit was reached: tell the user to retry later and DO NOT loop.",
   inputSchema: z.object({
     chat: z.string().min(1).describe("Conversation name. Prefer one taken from whatsapp_list_chats."),
-    mode: z
-      .enum(["top-up", "backfill"])
-      .default("top-up")
-      .describe(
-        "`top-up` for recent messages since the last run; `backfill` to reach genuinely old history.",
-      ),
-    maxScrolls: z
+    oldestId: z
+      .string()
+      .optional()
+      .describe("The `key` of the oldest message you already hold, from whatsapp_read_chat."),
+    oldestTimestamp: z
       .number()
       .int()
-      .min(0)
-      .max(15)
-      .default(5)
-      .describe("How many screenfuls to walk back in this call. Each one costs an interaction."),
+      .optional()
+      .describe("That message's unix timestamp, if known. Anchors the request."),
+    count: z
+      .number()
+      .int()
+      .min(1)
+      .max(200)
+      .default(50)
+      .describe("How many messages to ask the phone for."),
   }),
-  async execute({ chat, mode, maxScrolls }, ctx) {
+  async execute({ chat, oldestId, oldestTimestamp, count }, ctx) {
     try {
-      const result = await bridge.ingest({ chat, mode, maxScrolls }, ctx.abortSignal);
-      return { ok: true as const, ...result };
+      // A request to the PHONE, not a scroll of a rendered pane. Whatever it
+      // returns arrives through the transport and lands in the archive on the
+      // next drain, so this call reports that the ask was made, not what came.
+      const result = await bridge.requestHistory(
+        { chat, oldestId, oldestTimestamp, count },
+        ctx.abortSignal,
+      );
+      return { ok: true as const, chat, ...result };
     } catch (error) {
       if (error instanceof BridgeError) {
         return { ok: false as const, error: error.message, rateLimited: error.status === 429 };
@@ -61,23 +70,17 @@ export default defineTool({
       };
     }
 
-    const reach = output.bounds.oldestAt
-      ? ` The archive for this chat now reaches back to ${output.bounds.oldestAt.slice(0, 10)} (${output.bounds.count} messages).`
-      : "";
-
-    const next = output.atTop
-      ? " The whole conversation has been read; there is nothing older."
-      : output.reachedKnown
-        ? " It stopped at messages already saved, so this chat is up to date."
-        : output.budgetExhausted
-          ? " It stopped early because the hourly interaction budget ran out — resume later, not now."
-          : " More history remains; run it again to continue.";
-
+    // Deliberately says only that the ask was made. The phone answers over the
+    // protocol and the messages land in the archive on the next drain, so a
+    // count here would be invented — and "how much came back" is a question for
+    // whatsapp_read_chat a moment later, not for this call.
     return {
       type: "text" as const,
       value:
-        `Saved ${output.inserted} new message${output.inserted === 1 ? "" : "s"} from "${output.chat}" ` +
-        `(${output.duplicates} already known, ${output.scrolls} scrolls).${reach}${next}`,
+        `Asked your phone for older messages in "${output.chat}". ` +
+        "They arrive over the protocol and land in the archive within a few seconds — " +
+        "read the chat again to see them. Reachable depth is whatever the phone still " +
+        "holds, so a short answer is a fact about the phone, not a failure.",
     };
   },
 });

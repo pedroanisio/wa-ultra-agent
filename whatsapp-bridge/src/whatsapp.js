@@ -1,11 +1,5 @@
-import { randomUUID } from "node:crypto";
-
-import { scrollbackWith } from "./history.js";
-import { ingestWith } from "./ingest.js";
-import { fetchMediaWith } from "./media.js";
+import { placeholderText } from "./message-kind.js";
 import { buildDossier, resolvePerson } from "./people.js";
-import { classifyRow, clean } from "./message-kind.js";
-import { SELECTORS, criticalKeys, first, summarizeSelectorHealth } from "./selectors.js";
 import {
   parseAliases,
   assertResolvedMatches,
@@ -14,7 +8,6 @@ import {
   normalizeName,
   resolveAlias,
 } from "./recipients.js";
-import { createBudget } from "./rate.js";
 import {
   ENV as TRANSPORT_ENV,
   createTransport,
@@ -22,967 +15,39 @@ import {
   resolveRecipient,
   startDrain,
 } from "./transport.js";
-import { assertSelfNoteConfigured, normalizeMessages, sendSelfNoteWith } from "./self-note.js";
 import { openStore, retentionFromEnv } from "./store.js";
-import { trySerial } from "./serial.js";
-import { onPaneChange, requireLogin, status, watcherState } from "./session.js";
-import { diffRoster, inQuietHours, parseQuietHours, reactWith } from "./watch.js";
+import { foldName } from "./recipients.js";
+import { readFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+
+import { CATEGORIES, IDLE, isOwnReply, mark, route } from "./plugins.js";
+import { solidPngBase64 } from "./swatch.js";
+import { assertSelfNoteConfigured, sendSelfNoteWith } from "./self-note.js";
 
 /**
- * Wait until the chat list stops changing.
+ * The bridge's core, on the protocol transport.
  *
- * Filtering animates rows in and out, and a click on a moving element is
- * rejected outright. Polling a cheap signature — row count plus the first row's
- * title — costs one evaluate per tick and settles as soon as the list does,
- * rather than sleeping a fixed guess.
- */
-async function settleList(page, rowSel, { ticks = 14, intervalMs = 250 } = {}) {
-  let previous = null;
-  let stable = 0;
-  for (let i = 0; i < ticks; i++) {
-    const signature = await page
-      .$$eval(
-        rowSel,
-        (els) => `${els.length}|${els[0]?.querySelector("[title]")?.getAttribute("title") ?? ""}`,
-      )
-      .catch(() => null);
-    if (signature !== null && signature === previous) {
-      // Two identical reads in a row: the animation has finished.
-      if (++stable >= 2) return signature;
-    } else {
-      stable = 0;
-    }
-    previous = signature;
-    await page.waitForTimeout(intervalMs);
-  }
-  return previous;
-}
-
-
-/**
- * Whatever is currently typed in the chat-list search box.
+ * Reception, sending, media and history all run through `whatsapp-transport`
+ * (Go, whatsmeow). The browser driver this module used to be — Playwright,
+ * Chromium under Xvfb, a rendered chat list and its selectors — is gone: it was
+ * a second, weaker way to do the same things, keyed by fuzzy display names and
+ * parsed dates rather than by the protocol's own ids and instants.
  *
- * A pure read — no focus, no keystrokes — because the watcher calls it on every
- * snapshot and must not itself be an interaction. Non-empty means the pane is
- * filtered and any reading of it describes a subset, which is the distinction
- * `diffRoster` refuses to guess at.
- */
-async function chatSearchText(page) {
-  const search = await first(page, "chatSearch", { timeout: 10_000 });
-  if (!search) return "";
-
-  const value = await search.handle
-    .evaluate((el) => el.value ?? el.textContent ?? "")
-    .catch(() => "");
-  return value.trim();
-}
-
-/**
- * Empty the chat-list search box, leaving the full list showing.
- *
- * Cheap no-op when it is already empty, so callers can just always call it.
- */
-async function clearChatSearch(page) {
-  const search = await first(page, "chatSearch", { timeout: 10_000 });
-  if (!search) return;
-
-  if (!(await chatSearchText(page))) return;
-
-  await search.handle.evaluate((el) => el.focus());
-  await page.keyboard.press("ControlOrMeta+A").catch(() => {});
-  await page.keyboard.press("Backspace").catch(() => {});
-  // Let the list re-expand before anything reads it.
-  await page.waitForTimeout(700);
-}
-
-/**
- * Name of the conversation currently open, or "" if none.
- *
- * Reads the header's first text line. The header's only [title] attribute is
- * the literal "Profile details", so an attribute-based read returned that (or a
- * business chat's "Business Account" subtitle) instead of the chat name — which
- * would defeat the recipient check that guards sending.
- */
-/**
- * Strip the icon labels WhatsApp briefly renders as text.
- *
- * While a conversation header is still painting, its action buttons expose
- * their icon names ("ic-videocam", "ic-call", "ic-search", "ic-more-vert") as
- * text nodes with no separator, so the title reads
- * "Mariana de Souza e Limaic-videocamic-call...". Cutting at the first icon
- * token recovers the name; `looksSettled` then decides whether to trust it.
- */
-function stripIconLabels(text) {
-  return text.replace(/ic-[a-z-]+/g, "").trim();
-}
-
-const looksSettled = (title) => Boolean(title) && !/ic-[a-z-]+/.test(title);
-
-/**
- * Name of the conversation currently open, once the header has settled.
- *
- * Reading it eagerly returns whatever the previous conversation left behind, or
- * a half-painted header — observed live: three consecutive reads each reported
- * the chat from the request before. That is not cosmetic. `assertResolvedMatches`
- * and the pre-send re-check in `deliver` both compare against this string, so a
- * stale title could authorise typing into a conversation that is no longer the
- * one that was verified.
- *
- * So poll until two consecutive reads agree and neither looks mid-render.
- */
-async function openChatTitle(page, { timeout = 15_000, previous = null, expected = null } = {}) {
-  const header = await first(page, "conversationHeader", { timeout });
-  if (!header) return "";
-
-  const read = async () => {
-    const text = await header.handle.evaluate((el) => el.innerText || "").catch(() => "");
-    const firstLine = text
-      .split("\n")
-      .map((l) => l.trim())
-      .filter(Boolean)[0];
-    return clean(stripIconLabels(firstLine || ""));
-  };
-
-  // A settled header is not proof the NEW chat opened: the previous
-  // conversation's header is perfectly stable too, which is how three reads in
-  // a row each returned the chat from the request before. When the caller knows
-  // what was showing before, or what it asked for, require one of those to
-  // resolve before trusting the reading.
-  let last = null;
-  const deadline = Date.now() + Math.min(timeout, 12_000);
-  while (Date.now() < deadline) {
-    const current = await read();
-    const stable = looksSettled(current) && current === last;
-    const changed = previous === null || current !== previous;
-    const isExpected = expected !== null && normalizeName(current) === normalizeName(expected);
-    if (isExpected && looksSettled(current)) return current;
-    if (stable && changed) return current;
-    last = current;
-    await page.waitForTimeout(200);
-  }
-  // Timed out. Returning the last reading would hand back the conversation that
-  // was already open — which is exactly how a read of "kika" reported Antonio,
-  // and a read of "vi" reported Bruno: each was the chat left over from the
-  // previous request. A stale name that the caller then treats as verified is
-  // worse than no name, so report nothing and let the caller fail loudly.
-  return "";
-}
-
-/**
- * The chat-list rows as they currently stand. Returns null if the pane has not
- * rendered; callers decide what that means.
- *
- * Touches nothing — no clicks, no keystrokes, no navigation — which is what lets
- * the watcher call it on every DOM mutation without any of it counting against
- * the interaction budget.
- *
- * The pane virtualises its rows, so only what is scrolled into view exists in
- * the DOM. `limit` above roughly 20 therefore needs scrolling; this reads one
- * screenful, which is what a "what's new" question actually wants.
- */
-async function readChatRows(page, limit, { timeout = 20_000 } = {}) {
-  const rowSel = (await first(page, "chatRow", { timeout }))?.selector;
-  if (!rowSel) return null;
-
-  // Extraction is driven by what the rows actually contain (see /debug/rows):
-  //   - "Locked chats" and "Archived" are rows in this pane but NOT chats. They
-  //     carry no [title] element, which is the only reliable discriminator.
-  //   - The name and the message snippet are both [title] attributes; reading
-  //     them beats slicing innerText, which interleaves the unread label, the
-  //     timestamp and the badge digit with the text.
-  //   - The unread count is in aria-label ("2 unread messages"). Scraping a
-  //     digits-only span instead picked up any number in the preview.
-  const chats = await page.$$eval(
-    rowSel,
-    (rows, max) => {
-      const out = [];
-      for (const row of rows) {
-        const titled = [...row.querySelectorAll("[title]")];
-        if (titled.length === 0) continue; // nav entry, not a conversation
-
-        const labels = [...row.querySelectorAll("[aria-label]")].map((e) => e.getAttribute("aria-label") || "");
-        const unreadLabel = labels.find((l) => /unread message/i.test(l));
-        const unread = unreadLabel ? Number(unreadLabel.match(/\d+/)?.[0] ?? 0) : 0;
-
-        const name = titled[0].getAttribute("title") || "";
-        const lines = (row.innerText || "").split("\n").map((l) => l.trim()).filter(Boolean);
-        const time = lines.find((l) => /^\d{1,2}:\d{2}$/.test(l) || /^(yesterday|ontem)$/i.test(l));
-
-        // Rebuild the snippet from the row's text minus the parts that are not
-        // the message: this keeps the sender prefix that makes a group preview
-        // readable ("Helena: ..."), which the [title] snippet alone drops.
-        const noise = new Set([name, time].filter(Boolean));
-        const snippet = lines
-          .filter(
-            (l) =>
-              !noise.has(l) &&
-              !/unread message/i.test(l) &&
-              !/^\d+$/.test(l), // trailing badge digit
-          )
-          // WhatsApp renders a group sender as three nodes — "Helena", ":",
-          // "text" — so the colon is kept and reattached here rather than
-          // dropped, which would read as "Helena Amanha".
-          .join(" ")
-          .replace(/\s+:\s*/g, ": ")
-          .replace(/\s{2,}/g, " ");
-
-        out.push({
-          name,
-          preview: snippet || titled[titled.length - 1].getAttribute("title") || "",
-          unread,
-          time,
-          pinned: labels.some((l) => /pinned/i.test(l)) || undefined,
-        });
-        if (out.length >= max) break;
-      }
-      return out;
-    },
-    limit,
-  );
-
-  return chats.map((c) => ({
-    ...c,
-    name: clean(c.name),
-    preview: clean(c.preview).slice(0, 160),
-  }));
-}
-
-/**
- * Recent conversations, newest first.
- *
- * Shares `readChatRows` with the watcher on purpose: an event has to be derived
- * from exactly the rows a human listing would show, or the two disagree about
- * what "unread" and "preview" mean and the diff produces events that correspond
- * to nothing the user can see.
- */
-export async function listChats({ limit = 15 } = {}) {
-  const page = await requireLogin();
-
-  // Clear any leftover search first. openChat types into the same box and does
-  // not reset it, so without this a listing after a read returns only the
-  // previous query's matches — a "what's new" answer showing one chat because
-  // someone read that chat a moment ago.
-  await clearChatSearch(page);
-
-  const chats = await readChatRows(page, limit);
-  if (!chats) return { chats: [], note: "Chat list did not render; the page may still be loading." };
-
-  return { chats };
-}
-
-/**
- * Report the DOM shape of the first few chat rows.
- *
- * WhatsApp Web's markup is unversioned, so when extraction starts returning
- * blanks the only way to repair it is to look at what the rows actually contain.
- * This returns structure — text lines, title attributes, aria-labels — so a
- * selector can be fixed without attaching a debugger to a live session.
- */
-export async function debugRows(limit = 4) {
-  const page = await requireLogin();
-  const rowSel = (await first(page, "chatRow", { timeout: 20_000 }))?.selector;
-  if (!rowSel) return { rowSelector: null, rows: [] };
-
-  const rows = await page.$$eval(
-    rowSel,
-    (els, max) =>
-      els.slice(0, max).map((row, index) => ({
-        index,
-        textLines: (row.innerText || "").split("\n"),
-        titles: [...row.querySelectorAll("[title]")].map((e) => e.getAttribute("title")),
-        ariaLabels: [...row.querySelectorAll("[aria-label]")]
-          .map((e) => e.getAttribute("aria-label"))
-          .slice(0, 6),
-        selfAriaLabel: row.getAttribute("aria-label"),
-        hasImg: Boolean(row.querySelector("img")),
-        spanCount: row.querySelectorAll("span").length,
-      })),
-    limit,
-  );
-
-  return { rowSelector: rowSel, rows };
-}
-
-/** PNG of the current page. The fastest way to see what state the session is in. */
-/**
- * Raw shape of the rows inside the OPEN conversation.
- *
- * `/debug/rows` dumps chat-list rows, which is the wrong thing to look at when
- * a message is misclassified — and `message-kind.js` has been telling operators
- * to use it for exactly that. This is the sibling it should have had: every
- * signal `classifyRow` consumes, unprocessed, so a wrong kind or a missing
- * sender can be diagnosed against what the DOM actually contains rather than
- * against what the extractor believed.
- *
- * Deliberately raw. It reports what is there, decides nothing, and is the
- * source the classification fixtures in `test/` are captured from.
- */
-export async function debugMessageRows(limit = 8) {
-  const page = await requireLogin();
-  const rowSel = (await first(page, "messageRow", { timeout: 20_000 }))?.selector;
-  if (!rowSel) return { rows: [], note: "No message rows rendered. Is a conversation open?" };
-
-  const rows = await page.$$eval(
-    rowSel,
-    (els, max) =>
-      els.slice(-max).map((row) => ({
-        // Present after all, on an inner element — see the note in history.js.
-        dataId: row.querySelector("[data-id]")?.getAttribute("data-id") || null,
-        prePlainText: row.querySelector("[data-pre-plain-text]")?.getAttribute("data-pre-plain-text") || null,
-        icons: [...row.querySelectorAll("[data-icon]")]
-          .map((e) => e.getAttribute("data-icon"))
-          .filter(Boolean),
-        ariaLabels: [row.getAttribute("aria-label"), ...[...row.querySelectorAll("[aria-label]")].map((e) => e.getAttribute("aria-label"))]
-          .filter(Boolean)
-          .slice(0, 10),
-        titles: [...row.querySelectorAll("[title]")].map((e) => e.getAttribute("title")).filter(Boolean).slice(0, 6),
-        bodyText: row.querySelector("span.selectable-text, .copyable-text span")?.innerText || "",
-        rowText: (row.innerText || "").slice(0, 400),
-      })),
-    limit,
-  );
-
-  return { rows, count: rows.length };
-}
-
-export async function debugScreenshot() {
-  const page = await requireLogin();
-  return await page.screenshot({ type: "png", fullPage: false });
-}
-
-/** Top-level structure: ids, testids and header labels, for locating panels. */
-export async function debugStructure() {
-  const page = await requireLogin();
-  return await page.evaluate(() => ({
-    ids: [...document.querySelectorAll("[id]")].map((e) => e.id).filter(Boolean).slice(0, 40),
-    testIds: [
-      ...new Set([...document.querySelectorAll("[data-testid]")].map((e) => e.getAttribute("data-testid"))),
-    ].slice(0, 40),
-    headers: [...document.querySelectorAll("header")].map((h) => ({
-      titles: [...h.querySelectorAll("[title]")].map((e) => e.getAttribute("title")).slice(0, 4),
-      text: (h.innerText || "").slice(0, 80),
-    })),
-    gridRoles: document.querySelectorAll('[role="grid"]').length,
-    rowRoles: document.querySelectorAll('[role="row"]').length,
-    appRegions: [...document.querySelectorAll('[role="application"],[role="region"],[role="main"]')].map(
-      (e) => ({ role: e.getAttribute("role"), label: e.getAttribute("aria-label"), id: e.id }),
-    ),
-    // Sample message rows: what marks a message as sent rather than received?
-    messageRows: [...document.querySelectorAll('#main [role="row"]')].slice(-4).map((r) => ({
-      classes: (r.className || "").toString().slice(0, 90),
-      dataId: r.getAttribute("data-id"),
-      innerDataId: r.querySelector("[data-id]")?.getAttribute("data-id"),
-      dataIcons: [...r.querySelectorAll("[data-icon]")].map((e) => e.getAttribute("data-icon")),
-      ariaLabels: [...r.querySelectorAll("[aria-label]")].map((e) => e.getAttribute("aria-label")).slice(0, 5),
-      hasMsgOut: Boolean(r.querySelector(".message-out")),
-      hasMsgIn: Boolean(r.querySelector(".message-in")),
-      childClasses: [...r.children].map((c) => (c.className || "").toString().slice(0, 60)),
-    })),
-  }));
-}
-
-/**
- * Which selector candidates currently match, per key.
- *
- * When extraction breaks, the question is always "which hook died", and
- * answering it by editing code and redeploying is slow. This reports the live
- * match count for every candidate, plus the contenteditable elements on the
- * page, which is where the search box and composer both live.
- */
-export async function debugSelectors() {
-  const page = await requireLogin();
-
-  const perKey = {};
-  for (const [key, candidates] of Object.entries(SELECTORS)) {
-    perKey[key] = [];
-    for (const sel of candidates) {
-      const n = await page.$$eval(sel, (els) => els.length).catch(() => -1);
-      perKey[key].push({ selector: sel, matches: n });
-    }
-  }
-
-  const describe = (e) => ({
-    tag: e.tagName.toLowerCase(),
-    type: e.getAttribute("type"),
-    role: e.getAttribute("role"),
-    dataTab: e.getAttribute("data-tab"),
-    ariaLabel: e.getAttribute("aria-label"),
-    ariaPlaceholder: e.getAttribute("aria-placeholder"),
-    placeholder: e.getAttribute("placeholder"),
-    testId: e.getAttribute("data-testid"),
-    contentEditable: e.getAttribute("contenteditable"),
-    inMain: Boolean(e.closest("#main")),
-    inSide: Boolean(e.closest("#side")),
-    inFooter: Boolean(e.closest("footer")),
-  });
-
-  // Any element a human could type into, however it is implemented. Recent
-  // builds moved chat search from a contenteditable div to a real <input>, so
-  // probing only for contenteditable reported "nothing to type into".
-  const typeable = await page.$$eval(
-    'input, textarea, [contenteditable="true"], [role="textbox"], [role="searchbox"]',
-    (els, d) => els.slice(0, 12).map(eval(d)),
-    `(${describe.toString()})`,
-  );
-
-  const landmarks = await page.evaluate(() => ({
-    side: Boolean(document.querySelector("#side")),
-    paneSide: Boolean(document.querySelector("#pane-side")),
-    main: Boolean(document.querySelector("#main")),
-    app: Boolean(document.querySelector("#app")),
-    headerCount: document.querySelectorAll("header").length,
-    footerCount: document.querySelectorAll("footer").length,
-  }));
-
-  return { perKey, typeable, landmarks };
-}
-
-/**
- * Are the selectors ingestion depends on still matching anything?
- *
- * `/debug/selectors` answers "which hook died" once someone already suspects
- * one has. This answers the question nobody thinks to ask, and it exists
- * because of a specific silent failure: if `messageRow` stops matching, reading
- * a conversation returns zero rows, ingestion writes nothing, reports
- * `atTop: true` — and the agent tells the user their chat is empty. A break
- * that reads as an answer is worse than a break that reads as an error.
- *
- * Deliberately spends nothing from the interaction budget. It queries a page
- * that is already rendered: no scroll, no navigation, no request to WhatsApp,
- * so none of the traffic pattern the budget exists to bound.
- *
- * Which hooks count as critical, and what the results mean, are in
- * selectors.js — tested without a browser. This is only the probing.
- */
-export async function selectorHealth({ scope = "all" } = {}) {
-  const page = await requireLogin();
-
-  // The conversation hooks live under #main and do not exist until a chat is
-  // opened, so probing them on an idle page reported `conversationHeader` and
-  // `conversationScroller` as broken every time. An alert that fires when
-  // nothing is wrong is one nobody reads, which would have cost this check the
-  // only thing it is for.
-  let keys = criticalKeys(scope);
-  let note;
-  if (scope !== "list" && !(await first(page, "conversationPanel"))) {
-    keys = criticalKeys("list");
-    note =
-      "No conversation is open, so the conversation selectors were not checked — they do not " +
-      "exist until a chat is opened. Open one, or ask for scope=conversation after doing so.";
-  }
-
-  const checked = [];
-  for (const key of keys) {
-    const hit = await first(page, key);
-    checked.push({ key, ok: Boolean(hit), matchedBy: hit?.selector ?? null });
-  }
-
-  return { ...summarizeSelectorHealth(checked, scope), ...(note ? { note } : {}) };
-}
-
-/**
- * Refuse to walk a conversation whose hooks are broken.
- *
- * A 503 with the dead selector named is the alert §3.5 asks for; the
- * alternative is an archive that silently stops growing.
- */
-async function assertSelectorsHealthy(scope) {
-  const health = await selectorHealth({ scope });
-  if (health.ok) return health;
-
-  const error = new Error(
-    `These selectors no longer match anything: ${health.broken.join(", ")}. Reading this chat ` +
-      "would report it as empty rather than fail, so nothing was read. WhatsApp Web has almost " +
-      "certainly changed — inspect /debug/selectors and /debug/structure, then update " +
-      "src/selectors.js.",
-  );
-  error.statusCode = 503;
-  throw error;
-}
-
-/**
- * Open one conversation by name and confirm which one actually opened.
- *
- * The confirmation is the point. Search is fuzzy — typing "Ana" can land on
- * "Ana Paula", and every later action (reading, and above all sending) targets
- * whatever is open. Returning the resolved title lets the caller compare intent
- * against reality before anything irreversible happens.
- */
-export async function openChat(query) {
-  const page = await requireLogin();
-
-  // What is showing before the click, so the read afterwards can tell a new
-  // conversation from the one already open.
-  const before = await openChatTitle(page, { timeout: 2_000 }).catch(() => null);
-
-  const search = await first(page, "chatSearch", { timeout: 20_000 });
-  if (!search) throw new Error("Could not find the chat search box.");
-
-  // Focus directly rather than clicking. Playwright's click waits for the
-  // element to be "stable", and WhatsApp's sidebar animates continuously enough
-  // that the search box never satisfies that check — a click here times out
-  // after 30s even though the element is present and interactive. focus() has no
-  // actionability requirement, and the keystrokes that follow are real events.
-  await search.handle.evaluate((el) => el.focus());
-
-  // Clear whatever a previous call left behind, or the query concatenates.
-  await page.keyboard.press("ControlOrMeta+A").catch(() => {});
-  await page.keyboard.press("Backspace").catch(() => {});
-  await page.keyboard.type(query, { delay: 40 });
-  await page.waitForTimeout(1200);
-
-  const rowSel = (await first(page, "chatRow", { timeout: 15_000 }))?.selector;
-  if (!rowSel) throw new Error(`No chat matched "${query}".`);
-
-  // The result list animates as it filters, and Playwright refuses to click a
-  // moving target ("element is not stable"). Wait for the list to stop changing
-  // instead of clicking into an animation.
-  await settleList(page, rowSel);
-
-  // Skip rows that are not conversations. "Locked chats" and "Archived" sit at
-  // the top of this pane and survive a search, so clicking the literal first row
-  // can open a folder instead of a chat — and for a send, "whatever opened" is
-  // exactly what must never be typed into.
-  const rows = await page.$$(rowSel);
-  const chatRows = [];
-  for (const row of rows) {
-    if (await row.$("[title]")) chatRows.push(row);
-  }
-  if (chatRows.length === 0) throw new Error(`No chat matched "${query}".`);
-
-  const target = chatRows[0];
-  await target.scrollIntoViewIfNeeded().catch(() => {});
-  try {
-    await target.click({ timeout: 10_000 });
-  } catch {
-    // A list that never fully settles would otherwise be unusable. force skips
-    // the stability check; the conversation-title check below is what actually
-    // guarantees the right chat opened, so this stays safe.
-    await target.click({ force: true, timeout: 10_000 });
-  }
-
-  const opened = await openChatTitle(page, { previous: before, expected: query });
-  if (!opened) throw new Error("A chat opened but its title could not be read; refusing to act on it.");
-
-  const q = query.toLowerCase();
-  const o = opened.toLowerCase();
-  return { opened, exactMatch: o === q, contains: o.includes(q) || q.includes(o) };
-}
-
-/**
- * Classify the message rows currently rendered, opening nothing.
- *
- * Split out from `readChat` so media retrieval can re-read the same window
- * without navigating again — `fetchMedia` has already opened the chat and must
- * not disturb it between resolving a row and downloading it.
- */
-async function readVisibleMessages(page, limit) {
-  const rowSel = (await first(page, "messageRow", { timeout: 20_000 }))?.selector;
-  if (!rowSel) return { messages: [], counts: {}, note: "No messages rendered." };
-
-  // The browser returns a plain description of each row and decides nothing.
-  // What the row *means* is settled in Node by `classifyRow`, where it can be
-  // tested without a WhatsApp session.
-  const rows = await page.$$eval(
-    rowSel,
-    (els, max) => {
-      // Direction comes from the bubble tail: data-icon="tail-out" on a sent
-      // message, "tail-in" on a received one. Neither data-id nor .message-out
-      // exists in this build, so the tail is the only marker — and WhatsApp
-      // draws it only on the FIRST message of a consecutive run, which is why a
-      // tail-less row inherits the run it belongs to rather than reporting
-      // "unknown" for every message after the first.
-      let runDirection;
-      return els.slice(-max).map((row) => {
-        const icons = [...row.querySelectorAll("[data-icon]")].map((e) => e.getAttribute("data-icon"));
-        if (icons.includes("tail-out")) runDirection = true;
-        else if (icons.includes("tail-in")) runDirection = false;
-
-        const labels = [...row.querySelectorAll("[aria-label]")].map((e) => e.getAttribute("aria-label"));
-        const own = row.getAttribute("aria-label");
-
-        return {
-          // data-pre-plain-text carries "[HH:MM, DD/MM/YYYY] Sender: " on the
-          // bubble — the only place author and timestamp appear as plain text.
-          meta: row.querySelector("[data-pre-plain-text]")?.getAttribute("data-pre-plain-text") || "",
-          bodyText: row.querySelector("span.selectable-text, .copyable-text span")?.innerText || "",
-          rowText: row.innerText || "",
-          icons: icons.filter(Boolean),
-          ariaLabels: [own, ...labels].filter(Boolean).slice(0, 8),
-          titles: [...row.querySelectorAll("[title]")]
-            .map((e) => e.getAttribute("title"))
-            .filter(Boolean)
-            .slice(0, 4),
-          outgoing: runDirection,
-        };
-      });
-    },
-    limit,
-  );
-
-  const messages = rows.map((raw, i) => {
-    const message = classifyRow(raw);
-    return {
-      // Position counted from the newest message, which is how media is
-      // addressed for retrieval: 0 is the last message in the chat.
-      fromEnd: rows.length - 1 - i,
-      ...message,
-      text: message.text.slice(0, 2000),
-      // The row's own author label ("You:") is direct evidence and beats the
-      // inherited bubble-tail run, which only marks the first message of a
-      // consecutive group and is therefore a guess for every message after it.
-      outgoing: message.outgoing ?? raw.outgoing,
-    };
-  });
-
-  // A one-line census, so "what did I miss" can lead with the shape of the
-  // backlog rather than reading every placeholder.
-  const counts = {};
-  for (const m of messages) counts[m.kind] = (counts[m.kind] || 0) + 1;
-
-  return { messages, counts };
-}
-
-/** Read the visible tail of a conversation. */
-export async function readChat({ chat, limit = 25 }) {
-  const page = await requireLogin();
-  // Nicknames resolve here as well: reading "tonhão" should work like sending to him.
-  const resolved = await openChat(resolveAlias(chat));
-  await page.waitForTimeout(800);
-
-  const { messages, counts, note } = await readVisibleMessages(page, limit);
-  return {
-    chat: resolved.opened,
-    resolvedFrom: chat,
-    exactMatch: resolved.exactMatch,
-    counts,
-    messages,
-    note,
-  };
-}
-
-/* ------------------------------------------------------------------ *
- * Sending: two phases, on purpose.
- *
- * A message to a real person cannot be recalled after a few minutes, and the
- * recipient is chosen by a fuzzy search. One tool call must therefore not be
- * able to send: `prepare` resolves the recipient and returns a preview plus a
- * short-lived token, and only `commit` types. That forces the resolved name in
- * front of a human before anything leaves the machine, and makes a hallucinated
- * or repeated call inert.
- * ------------------------------------------------------------------ */
-
-const pending = new Map();
-const TOKEN_TTL_MS = 5 * 60_000;
-
-/**
- * Compare names the way a person would, without letting a short entry match
- * half the address book.
- *
- * Lowercases, collapses whitespace, strips surrounding quotes left by a
- * hand-edited .env, and drops a trailing parenthetical — which is what makes
- * "Joao Vitor Almeida Rocha" match the self-chat WhatsApp titles
- * "Joao Vitor Almeida Rocha (You)".
+ * The archive is unchanged. `store.js` remains the only writer of the
+ * correspondence, and the drain below writes through the SAME handle as every
+ * query here — a second `openStore` on one file would be a second writer to an
+ * archive whose design rests on having exactly one.
  */
 
 /**
- * Config-level checks, cheap and browser-free.
+ * The archive handle, opened once and shared.
  *
- * Run these BEFORE opening a chat. Otherwise a bridge with sending switched off
- * reports "not linked to WhatsApp" — the login error masks the real cause and
- * sends the operator to fetch their phone to fix a missing env var.
+ * One handle, deliberately: the drain and every query here write and read
+ * through the same connection, and a second `openStore` on the same file would
+ * make two writers of an archive whose design assumes exactly one.
  */
-
-
-export async function prepareSend({ to, message }) {
-  if (!message?.trim()) throw new Error("Refusing to prepare an empty message.");
-  assertSendConfigured();
-  const canonical = resolveAlias(to);
-  const resolved = await openChat(canonical);
-  // Same guard as the one-call path: being allowlisted is not evidence of
-  // being the chat that was asked for.
-  assertResolvedMatches(canonical, resolved.opened);
-  assertSendable(resolved.opened);
-
-  const token = randomUUID();
-  pending.set(token, { to: resolved.opened, message, expires: Date.now() + TOKEN_TTL_MS });
-
-  return {
-    token,
-    resolvedRecipient: resolved.opened,
-    requestedRecipient: to,
-    exactMatch: resolved.exactMatch,
-    preview: message,
-    expiresInSeconds: TOKEN_TTL_MS / 1000,
-    warning: resolved.exactMatch
-      ? undefined
-      : `"${to}" resolved to "${resolved.opened}" — confirm this is the right person before committing.`,
-  };
-}
-
-/**
- * Open the staged recipient, re-verify it, and type.
- *
- * Shared by the one-shot and two-phase paths so both get the same guard: the
- * conversation that is actually open is checked against the intended recipient
- * immediately before typing. That check — not the confirmation step — is what
- * prevents a message landing in the wrong chat, so it survives even when
- * sending is autonomous.
- */
-async function deliver(page, to, message) {
-  const openNow = await openChatTitle(page);
-  if (openNow !== to) {
-    const again = await openChat(to);
-    if (again.opened !== to) {
-      throw new Error(`Expected "${to}" to be open but found "${again.opened}". Not sending.`);
-    }
-  }
-  assertSendable(to);
-  await typeAndSend(page, message);
-
-  return { sent: true, to, message, at: new Date().toISOString() };
-}
-
-/**
- * Type one message into whatever conversation is open, and send it.
- *
- * Deliberately knows nothing about *which* chat is open: the caller owns that
- * check. `deliver` re-verifies an allowlisted recipient; `sendSelfNote` verifies
- * the self chat. Keeping the keystrokes in one place means both paths share the
- * quirk this function exists for.
- */
-async function typeAndSend(page, message) {
-  const composer = await first(page, "composer", { timeout: 15_000 });
-  if (!composer) throw new Error("Could not find the message composer.");
-
-  await composer.handle.click();
-  // Type rather than paste: WhatsApp binds its send handler to key events, and
-  // a newline in the text would submit early, so send line by line.
-  const lines = message.split("\n");
-  for (const [i, line] of lines.entries()) {
-    if (i > 0) await page.keyboard.press("Shift+Enter");
-    await page.keyboard.type(line, { delay: 15 });
-  }
-  await page.keyboard.press("Enter");
-  await page.waitForTimeout(1200);
-}
-
-/**
- * Send in one call, for a recipient already on the allowlist.
- *
- * No confirmation step: the allowlist is the boundary. Anyone not on it is
- * refused outright, so the blast radius of a wrong tool call is bounded by
- * configuration rather than by a human reading each message. The recipient is
- * still resolved and re-verified before typing.
- */
-export async function sendMessage({ to, message }) {
-  if (!message?.trim()) throw new Error("Refusing to send an empty message.");
-  assertSendConfigured();
-
-  const page = await requireLogin();
-  // Resolve the nickname first: the guard below compares requested against
-  // resolved, so an unresolved alias would always look like a mismatch.
-  //
-  // The roster comes first, because it can answer things the env alias map
-  // cannot: a partial name ("Fabio") becomes the full chat title, which is what
-  // makes `assertResolvedMatches` pass instead of refusing a request that was
-  // perfectly clear. An ambiguous name refuses HERE, with the candidates, rather
-  // than letting WhatsApp's recency-ranked search pick one.
-  const canonical = resolveRecipientName(to);
-  const resolved = await openChat(canonical);
-
-  // The recipient must be the chat that was ASKED for, not merely a chat that
-  // happens to be allowlisted.
-  //
-  // Searching "Helena Braga" opens the group "We" — she is its most recent
-  // sender, so the group outranks her own chat in the results. "We" is on the
-  // allowlist, so checking only the resolved name authorised delivering a
-  // message meant for one person into a group. The allowlist bounds WHO may be
-  // written to; this bounds whether the right one was found.
-  assertResolvedMatches(canonical, resolved.opened);
-
-  assertSendable(resolved.opened);
-
-  const result = await deliver(page, resolved.opened, message);
-  return {
-    ...result,
-    requestedRecipient: to,
-    exactMatch: resolved.exactMatch,
-    warning: resolved.exactMatch
-      ? undefined
-      : `"${to}" resolved to "${resolved.opened}" — it is allowlisted, but confirm this was the intended person.`,
-  };
-}
-
-export async function commitSend({ token }) {
-  const entry = pending.get(token);
-  if (!entry) {
-    // A replayed or invented token is a caller mistake, not a bridge fault:
-    // 400 keeps it out of the error log and tells the caller what to do.
-    const e = new Error("Unknown or already-used token. Call prepare again.");
-    e.statusCode = 400;
-    throw e;
-  }
-  pending.delete(token); // single use, even if the send throws below
-  if (Date.now() > entry.expires) {
-    const e = new Error("Confirmation expired. Call prepare again.");
-    e.statusCode = 400;
-    throw e;
-  }
-
-  const page = await requireLogin();
-  return await deliver(page, entry.to, entry.message);
-}
-
-
-/**
- * Write a note to the user's own chat.
- *
- * The safe half of sending: the recipient is a constant, so there is no
- * allowlist, no fuzzy recipient, and no confirmation step. What replaces all of
- * that is one exact comparison against the configured self chat, in
- * `self-note.js` — which is where the rules live, browser-free and tested.
- *
- * Config and input are checked here too, before `requireLogin()`. Otherwise a
- * bridge with WA_SELF_CHAT_NAME unset reports "not linked to WhatsApp" and sends
- * the operator to fetch their phone to fix an env var.
- */
-export async function sendSelfNote({ messages }) {
-  assertSelfNoteConfigured();
-  normalizeMessages(messages);
-
-  const page = await requireLogin();
-  return await sendSelfNoteWith(
-    {
-      env: process.env,
-      openChatTitle: () => openChatTitle(page),
-      openChat,
-      typeAndSend: (text) => typeAndSend(page, text),
-    },
-    { messages },
-  );
-}
-
-/* ------------------------------------------------------------------ *
- * Media retrieval.
- *
- * The rules — which rows have a payload, how one is addressed, and what proves
- * it is still the row the caller meant — live in `media.js` and are tested
- * without a browser. What follows is only the part that has to drive Chromium.
- *
- * The download step is the least verified code in this bridge. WhatsApp Web
- * exposes downloading differently per media kind and per build, so it tries the
- * bubble's own control first and the context menu second, and says what it
- * looked for when both fail. Repair it from /debug/rows rather than guessing.
- * ------------------------------------------------------------------ */
-
-/** Click through to the bytes behind one media row. */
-async function downloadRowMedia(page, target) {
-  const rowSel = (await first(page, "messageRow", { timeout: 20_000 }))?.selector;
-  if (!rowSel) throw new Error("No message rows are rendered.");
-
-  const rows = await page.$$(rowSel);
-  const element = rows[rows.length - 1 - target.fromEnd];
-  if (!element) {
-    const e = new Error(`Row ${target.fromEnd} from the end is no longer rendered.`);
-    e.statusCode = 409;
-    throw e;
-  }
-
-  await element.scrollIntoViewIfNeeded().catch(() => {});
-  // Most builds reveal the control only on hover.
-  await element.hover().catch(() => {});
-  await page.waitForTimeout(400);
-
-  const clickAndCapture = async (handle) => {
-    const [download] = await Promise.all([
-      page.waitForEvent("download", { timeout: 30_000 }),
-      handle.click({ timeout: 10_000 }),
-    ]);
-    const path = await download.path();
-    if (!path) throw new Error("The download produced no file on disk.");
-    const { readFile } = await import("node:fs/promises");
-    try {
-      return { buffer: await readFile(path), suggestedFilename: download.suggestedFilename() };
-    } finally {
-      // Playwright reaps downloads when the context closes. This context is a
-      // persistent one that stays open for weeks, so without this every photo,
-      // PDF and voice note ever fetched accumulates in the browser's temp
-      // directory — on the same volume as the session profile and the archive,
-      // and holding the same private correspondence twice over. In `finally`
-      // because a read that failed still left the file behind.
-      await download.delete().catch(() => {});
-    }
-  };
-
-  for (const selector of SELECTORS.messageDownload) {
-    const control = await element.$(selector);
-    if (control) return await clickAndCapture(control);
-  }
-
-  // Fall back to the row's context menu.
-  for (const selector of SELECTORS.messageMenu) {
-    const chevron = await element.$(selector);
-    if (!chevron) continue;
-
-    await chevron.click({ timeout: 10_000 }).catch(() => {});
-    await page.waitForTimeout(500);
-
-    for (const itemSel of SELECTORS.menuItem) {
-      for (const item of await page.$$(itemSel)) {
-        const label = clean(await item.innerText().catch(() => ""));
-        if (/^(download|baixar)/i.test(label)) return await clickAndCapture(item);
-      }
-    }
-    // Leave no menu open behind us.
-    await page.keyboard.press("Escape").catch(() => {});
-  }
-
-  const e = new Error(
-    "Could not find a download control on that message. WhatsApp Web's markup has probably " +
-      "changed: inspect the row with /debug/rows and update SELECTORS.messageDownload.",
-  );
-  e.statusCode = 502;
-  throw e;
-}
-
-/**
- * Fetch the payload behind one media message, addressed by position.
- *
- * `expect` is how the caller proves it still means the message it read. Omit it
- * and a message arriving in between silently redirects the fetch to a different
- * attachment — see media.js.
- */
-export async function fetchMedia({ chat, fromEnd, expect, maxBytes }) {
-  const page = await requireLogin();
-
-  return await fetchMediaWith(
-    {
-      openChat,
-      // A wider window than the caller read, so a couple of new arrivals do not
-      // push the target out of range before the fingerprint can reject them.
-      readRows: async () => (await readVisibleMessages(page, 60)).messages,
-      downloadRow: (target) => downloadRowMedia(page, target),
-    },
-    { chat, fromEnd, expect, maxBytes },
-  );
-}
-
-/* ------------------------------------------------------------------ *
- * History and ingestion.
- *
- * The rules live in rate.js, history.js, ingest.js and store.js, all tested
- * without a browser. What follows is the browser part — scrolling the pane —
- * plus the singletons that hold the interaction budget and the archive.
- *
- * The budget deliberately gates ingestion only. Interactive reads are low
- * volume and refusing one means refusing the user; a backfill is the traffic
- * that actually looks automated, so that is what is capped.
- * ------------------------------------------------------------------ */
-
-const budget = createBudget({ maxPerHour: Number(process.env.WA_MAX_INTERACTIONS_PER_HOUR) || 240 });
-
 let storeHandle = null;
+
 function store() {
   storeHandle ??= openStore(process.env.WA_STORE_PATH || "./data/store.db", {
     // Only consulted for a window whose own rows cannot say whether "8/3" is
@@ -1058,6 +123,30 @@ export function transportContacts() {
   return transport().contacts();
 }
 
+/**
+ * One message's media, by the protocol's own id.
+ *
+ * Base64 here rather than at the transport: the wire between these two services
+ * carries the bytes as bytes, and only the agent — which reads JSON — needs them
+ * encoded. `sizeBytes` is the real length, measured before encoding, so a caller
+ * bounding a download is not bounding base64's 33% inflation by mistake.
+ */
+export async function transportMedia(key) {
+  const { bytes, mediaType, sizeBytes, filename } = await transport().media(key);
+  return {
+    key,
+    mediaType,
+    sizeBytes,
+    ...(filename ? { filename } : {}),
+    base64: bytes.toString("base64"),
+  };
+}
+
+/** Ask the phone for messages older than one already held. */
+export function transportHistory({ chat, oldestId, oldestFromMe, oldestTimestamp, count }) {
+  return transport().history({ chat, oldestId, oldestFromMe, oldestTimestamp, count });
+}
+
 export function transportPairPhone(phone) {
   if (!phone) throw badRequest("phone is required");
   return transport().pairPhone(phone);
@@ -1068,44 +157,163 @@ export function transportConnect() {
 }
 
 /**
- * Send over the protocol instead of by typing into a browser.
+ * The one gate every outbound path goes through.
  *
- * The authorisation chain is deliberately unchanged: `assertSendConfigured` and
- * `assertSendable` are the same functions the DOM path calls, applied to the name
- * the roster resolved. What disappears is `assertResolvedMatches`, and only
- * because the failure it guarded against cannot happen here — it existed because
- * WhatsApp's search is recency-ranked and could open a group instead of a person.
- * An identity key is exact. The ambiguity that remains is handled by
- * `resolveRecipient`, which refuses rather than choosing.
+ * ── Why this is shared, having deliberately not been ────────────────────────
+ * With two send paths the chain was written out twice on purpose, so each could
+ * be read top to bottom and seen to be guarded — a wrapper would have hidden the
+ * very omission that let a two-letter group name resolve to a person.
  *
- * The transport enforces its own JID allowlist underneath this. That is defence
- * in depth, not a substitute: this layer is where a human name is checked.
+ * That argument inverts at six. Repeating three checks across text, media,
+ * reaction, revoke, edit and poll is not vigilance, it is six chances to leave
+ * one out, and the omission would look exactly like the code around it. So the
+ * chain lives here once, and `test/transport-send.test.js` drives EVERY exported
+ * send function through the same near-miss to prove none of them skipped it.
+ *
+ * Returns the protocol address to send to.
  */
-export async function sendViaTransport({ to, message }) {
-  if (!message?.trim()) throw new Error("Refusing to send an empty message.");
+async function resolveAllowedRecipient(to) {
   assertSendConfigured();
 
-  // The env alias map first, so "mãe" reaches the same person it would on the
-  // DOM path, then the roster resolves whatever name that produced.
+  // The env alias map first, so "mãe" reaches the same person it would have
+  // before, then the roster resolves whatever name that produced.
   const requested = resolveAlias(to);
-  const { contacts } = await transport().contacts();
-  const resolved = resolveRecipient(requested, contacts);
+  const { contacts, groupsUnavailable } = await transport().contacts();
+  const resolved = resolveRecipient(requested, contacts, { groupsUnavailable });
 
   // The allowlist bounds WHO may be written to, and it is written in human names,
   // so it is checked against the name the roster matched — not against the key.
   assertSendable(resolved.matchedName ?? requested);
 
-  const result = await transport().send({ to: resolved.to, message });
+  // ...and this bounds whether the roster found the one that was asked for.
+  assertResolvedMatches(requested, resolved.matchedName ?? "");
+
+  return { to: resolved.to, resolvedName: resolved.matchedName };
+}
+
+/** React to a message, or remove a reaction with an empty emoji. */
+export async function reactViaTransport({ to, messageId, emoji = "", sender }) {
+  if (!messageId) throw badRequest("messageId is required");
+  const resolved = await resolveAllowedRecipient(to);
+  const result = await transport().sendReaction({ to: resolved.to, messageId, emoji, sender });
+  return { ...result, requestedRecipient: to, resolvedName: resolved.resolvedName, via: "transport" };
+}
+
+/** Delete a message for everyone. */
+export async function revokeViaTransport({ to, messageId, sender }) {
+  if (!messageId) throw badRequest("messageId is required");
+  const resolved = await resolveAllowedRecipient(to);
+  const result = await transport().sendRevoke({ to: resolved.to, messageId, sender });
+  return { ...result, requestedRecipient: to, resolvedName: resolved.resolvedName, via: "transport" };
+}
+
+/** Replace the text of a message already sent. */
+export async function editViaTransport({ to, messageId, message }) {
+  if (!messageId) throw badRequest("messageId is required");
+  if (!message?.trim()) throw new Error("Refusing to edit a message to nothing — use revoke.");
+  const resolved = await resolveAllowedRecipient(to);
+  const result = await transport().sendEdit({ to: resolved.to, messageId, message });
+  return { ...result, requestedRecipient: to, resolvedName: resolved.resolvedName, via: "transport" };
+}
+
+/**
+ * Vote in a poll somebody else asked.
+ *
+ * `messageId` names the poll, not the vote: the payload is encrypted against
+ * that poll's own secret, so a poll this account never received cannot be voted
+ * in and the transport says so rather than sending a vote nobody can read.
+ */
+export async function pollVoteViaTransport({ to, messageId, sender, options }) {
+  if (!messageId) throw badRequest("messageId is required — a vote names the poll");
+  if (!Array.isArray(options) || options.length === 0) {
+    throw badRequest("options is required — choose at least one");
+  }
+  const resolved = await resolveAllowedRecipient(to);
+  const result = await transport().sendPollVote({ to: resolved.to, messageId, sender, options });
+  return { ...result, requestedRecipient: to, resolvedName: resolved.resolvedName, via: "transport" };
+}
+
+/**
+ * Show or clear the typing indicator.
+ *
+ * Behind the same gate as a message, because it is a signal this account emits
+ * into somebody's chat — an ungated version could show a stranger "typing…".
+ */
+export async function presenceViaTransport({ to, state, media }) {
+  if (state !== "composing" && state !== "paused") {
+    throw badRequest('state must be "composing" or "paused"');
+  }
+  const resolved = await resolveAllowedRecipient(to);
+  const result = await transport().presence({ to: resolved.to, state, media });
+  return { ...result, requestedRecipient: to, resolvedName: resolved.resolvedName, via: "transport" };
+}
+
+/** Ask a question with fixed answers. */
+export async function pollViaTransport({ to, name, options, selectableCount }) {
+  if (!name?.trim()) throw badRequest("a poll needs a question");
+  if (!Array.isArray(options) || options.length < 2) {
+    throw badRequest("a poll needs at least two options");
+  }
+  const resolved = await resolveAllowedRecipient(to);
+  const result = await transport().sendPoll({ to: resolved.to, name, options, selectableCount });
+  return { ...result, requestedRecipient: to, resolvedName: resolved.resolvedName, via: "transport" };
+}
+
+export async function sendViaTransport({ to, message, quoted }) {
+  if (!message?.trim()) throw new Error("Refusing to send an empty message.");
+  const resolved = await resolveAllowedRecipient(to);
+
+  const result = await transport().send({ to: resolved.to, message, quoted });
+
+  // Same reason as a self-note: nothing echoes our own sends back, so a reply
+  // that is not filed here leaves the archive holding one half of the exchange.
+  archiveOutgoing({ id: result?.id, sentAt: result?.sentAt, chatKey: resolved.to, text: message });
+
   return {
     ...result,
     requestedRecipient: to,
     resolvedName: resolved.matchedName,
-    exactMatch: resolved.exactMatch,
     via: "transport",
-    warning: resolved.exactMatch
-      ? undefined
-      : `"${to}" resolved to "${resolved.matchedName}" — it is allowlisted, but confirm this was ` +
-        "the intended person.",
+  };
+}
+
+/**
+ * Send an image over the protocol.
+ *
+ * ── Why this repeats the guard chain instead of sharing a helper with text ──
+ * It does share it — the same three functions, in the same order — and the
+ * repetition is four lines. A `sendAnything({kind})` wrapper would save those
+ * four lines and cost the property that matters: that every send path in this
+ * file can be read top to bottom and seen to check permission, allowlist and
+ * resolution. The bug that made `assertResolvedMatches` necessary here was born
+ * of a path that looked like it inherited a guard and did not.
+ *
+ * @param image  Raw bytes (`Buffer` or `Uint8Array`) of a PNG or JPEG. SVG is
+ *               rejected by the transport: WhatsApp renders no such image.
+ */
+export async function sendMediaViaTransport({
+  to, image, mimetype, caption, width, height, kind, filename, durationSeconds, quoted,
+}) {
+  if (!image?.length) throw new Error("Refusing to send an empty attachment.");
+  const resolved = await resolveAllowedRecipient(to);
+
+  const result = await transport().sendMedia({
+    to: resolved.to,
+    kind,
+    mimetype,
+    caption,
+    filename,
+    width,
+    height,
+    durationSeconds,
+    quoted,
+    dataBase64: Buffer.from(image).toString("base64"),
+  });
+  return {
+    ...result,
+    requestedRecipient: to,
+    resolvedName: resolved.matchedName,
+    via: "transport",
   };
 }
 
@@ -1116,8 +324,331 @@ export async function sendViaTransport({ to, message }) {
  * archive commits: a transport that is briefly unreachable costs latency, not
  * correspondence.
  */
+/* ------------------------------------------------------------------
+ * The self chat as a console
+ *
+ * Messages the operator writes to themselves pass through the drain like any
+ * other. When one is a command, it is answered here rather than by the agent:
+ * `/menu` and a game must be decidable, and a model in that loop can invent a
+ * menu entry or argue its way out of a lost position. See plugins.js.
+ * ------------------------------------------------------------------ */
+
+/**
+ * The console's state, on disk beside the archive.
+ *
+ * A match is a session spanning many events, and the events arrive minutes
+ * apart — so "in memory" means a container restart silently abandons a game
+ * mid-move, with the board still sitting in the chat inviting the next one.
+ *
+ * A file rather than a table in `store.db`: that database is the correspondence,
+ * and a half-finished game is not correspondence. It also keeps `store.js`'s
+ * migrations out of the way of a feature that changes shape more often than the
+ * archive does. Written whole on every transition, because it is a few hundred
+ * bytes and a partial write here would strand the session in a state no command
+ * can leave.
+ */
+const CONSOLE_STATE_PATH =
+  process.env.WA_CONSOLE_STATE_PATH ||
+  join(dirname(process.env.WA_STORE_PATH || "./data/store.db"), "console-session.json");
+
+let consoleSession = null;
+
+function loadConsoleSession() {
+  if (consoleSession) return consoleSession;
+  try {
+    consoleSession = JSON.parse(readFileSync(CONSOLE_STATE_PATH, "utf8"));
+  } catch {
+    // Absent or unreadable both mean the same thing: nothing is entered. A
+    // corrupt file must not wedge the console, so it is replaced on next write.
+    consoleSession = IDLE;
+  }
+  return consoleSession;
+}
+
+function saveConsoleSession(session) {
+  consoleSession = session;
+  try {
+    writeFileSync(CONSOLE_STATE_PATH, JSON.stringify(session), "utf8");
+  } catch (error) {
+    // Not fatal: the session survives in memory for this process. Losing it on
+    // restart is a worse outcome than refusing the move, but only slightly, so
+    // it is reported rather than thrown.
+    console.error("console: could not persist the session:", error?.message || error);
+  }
+}
+
+/** Cached so a routine self-note does not cost a /status round trip. */
+let selfKey = null;
+
+async function selfChatKey() {
+  if (selfKey) return selfKey;
+  const state = await transport().status();
+  selfKey = state?.session?.account?.key ?? null;
+  return selfKey;
+}
+
+/**
+ * Messages waiting for the agent, in `/eve` mode.
+ *
+ * ── Why this is on disk ─────────────────────────────────────────────────────
+ * It is the fallback for a push that failed, and the commonest reason a push
+ * fails is that the agent is restarting — which is also, invariably, when the
+ * bridge is restarting. Held in memory, the queue was emptied by the very event
+ * it existed to survive: two real questions were asked during a deploy, queued
+ * correctly, and then lost when the bridge came back a minute later. The user
+ * got silence and no error, which is the worst outcome available.
+ *
+ * Beside the console session and for the same reason: this is state about a
+ * sitting, not correspondence, so it does not belong in store.db.
+ */
+const FORWARD_QUEUE_PATH =
+  process.env.WA_CONSOLE_QUEUE_PATH ||
+  join(dirname(process.env.WA_STORE_PATH || "./data/store.db"), "console-queue.json");
+
+let forwardedCache = null;
+
+function forwardedQueue() {
+  if (forwardedCache) return forwardedCache;
+  try {
+    const parsed = JSON.parse(readFileSync(FORWARD_QUEUE_PATH, "utf8"));
+    forwardedCache = Array.isArray(parsed) ? parsed : [];
+  } catch {
+    forwardedCache = [];
+  }
+  return forwardedCache;
+}
+
+function saveForwardedQueue() {
+  try {
+    writeFileSync(FORWARD_QUEUE_PATH, JSON.stringify(forwardedQueue()), "utf8");
+  } catch (error) {
+    console.error("console: could not persist the forward queue:", error?.message || error);
+  }
+}
+
+/**
+ * Push one `/eve` message to the agent, now.
+ *
+ * This is what makes the mode reactive rather than polled: the drain routes the
+ * message and hands it straight to the agent, so the reply arrives while the
+ * user is still looking at their phone. A schedule still sweeps the queue every
+ * ten minutes, but only for what this failed to deliver.
+ *
+ * Fire-and-forget by design. This runs inside the drain, whose job is getting
+ * messages into the archive; an agent that is down, slow or restarting must not
+ * stall that or cost a message. A failure leaves the item queued, which is
+ * exactly where the fallback expects to find it.
+ */
+async function pushToAgent(text) {
+  const url = process.env.WA_AGENT_URL;
+  const token = process.env.WA_CONSOLE_PUSH_TOKEN;
+  if (!url || !token) return false;
+
+  // `/message`, not `/console/message`: eve mounts a custom channel's routes at
+  // the root, and the file stem is the channel's identity rather than a URL
+  // prefix. See agent/channels/console.ts.
+  const response = await fetch(`${url.replace(/\/$/, "")}/message`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+    body: JSON.stringify({ text }),
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!response.ok) {
+    throw new Error(`agent returned ${response.status}: ${(await response.text()).slice(0, 160)}`);
+  }
+  return true;
+}
+
+/**
+ * Hand the agent whatever the operator typed in `/eve` mode, and clear it.
+ *
+ * ── Why it can wait ─────────────────────────────────────────────────────────
+ * A cron cannot run more than once a minute, so a plain poll makes every answer
+ * up to a minute late — which is fine for a digest and useless for a
+ * conversation. Holding the request open until something arrives lets one
+ * scheduled run cover the whole gap to the next one: the operator types, this
+ * resolves within milliseconds, and the reply comes back while they are still
+ * looking at the screen.
+ *
+ * It waits only while the console is actually in `eve`. Any other time there is
+ * nothing that could arrive, so the caller is told so immediately rather than
+ * being held for no reason.
+ */
+export async function pendingForAgent({ waitMs = 0 } = {}) {
+  const drain = () => {
+    const queue = forwardedQueue();
+    const items = queue.splice(0, queue.length);
+    if (items.length) saveForwardedQueue();
+    return { items, count: items.length, state: loadConsoleSession().state };
+  };
+
+  const immediate = drain();
+  if (immediate.count > 0 || waitMs <= 0 || immediate.state !== "eve") return immediate;
+
+  const deadline = Date.now() + Math.min(waitMs, 55_000);
+  while (Date.now() < deadline) {
+    // Polled rather than evented: the producer is a drain callback on a five
+    // second timer, so a 250ms check costs nothing and needs no plumbing
+    // between them. Anything finer would just spin.
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    const next = drain();
+    if (next.count > 0 || next.state !== "eve") return next;
+  }
+  return drain();
+}
+
+/**
+ * Say something in the operator's own chat, and record that we said it.
+ *
+ * The console used to call `transport().sendSelf` directly, which meant every
+ * word it spoke — menus, board positions, "game abandoned" — was invisible to
+ * the archive. That is the same one-sided-record defect `archiveOutgoing` exists
+ * to close, and it mattered more here than anywhere: the console's replies are
+ * half of a conversation the operator is having with this machine, and half a
+ * conversation is not a record of it.
+ */
+async function answerSelf(text) {
+  const key = await selfChatKey();
+  const sent = await transport().sendSelf(text);
+  archiveOutgoing({ id: sent?.id, sentAt: sent?.sentAt, chatKey: key, text });
+  return sent;
+}
+
+/**
+ * Route one drained message if it belongs to the operator's own chat.
+ *
+ * Everything else returns immediately: this runs for every message the archive
+ * receives, so it must be cheap and must never answer a correspondent.
+ */
+export async function handleSelfMessage(payload) {
+  if (!payload?.text) return null;
+  if (payload.fromHistory) return null; // Replaying history must not replay commands.
+
+  const key = await selfChatKey();
+  if (!key || payload.chat?.key !== key || payload.sender?.key !== key) return null;
+
+  // Our own replies arrive here too. See isOwnReply.
+  if (isOwnReply(payload.text)) return null;
+
+  const { session, reply, ask, forward, banner } = route(loadConsoleSession(), payload.text);
+  saveConsoleSession(session);
+
+  if (forward !== undefined) {
+    const item = { text: forward, at: new Date().toISOString() };
+    // Queued BEFORE the push is attempted, and removed only once it lands. A
+    // crash between the two leaves the message waiting, which is recoverable;
+    // the reverse order loses it.
+    forwardedQueue().push(item);
+    saveForwardedQueue();
+
+    // Reactive: the agent is told immediately rather than discovering this on a
+    // schedule. If the push lands, the item is taken back out of the queue so a
+    // later poll cannot answer it a second time.
+    try {
+      if (await pushToAgent(forward)) {
+        const queue = forwardedQueue();
+        const at = queue.indexOf(item);
+        if (at >= 0) {
+          queue.splice(at, 1);
+          saveForwardedQueue();
+        }
+        return { forwarded: true, pushed: true };
+      }
+    } catch (error) {
+      console.error("console: could not push to the agent, leaving it queued:", error?.message || error);
+    }
+    return { forwarded: true, pushed: false };
+  }
+
+  if (ask === "status") {
+    const stats = store().stats();
+    const answer =
+      `${stats.messages} messages across ${stats.chats} chats.\n` +
+      `Transport: ${transportConfigured() ? "configured" : "unset"}.`;
+    await answerSelf(mark("archive", answer));
+    return { answered: true };
+  }
+
+  if (reply) {
+    // The banner first, so the colour block sits above the text that explains
+    // it — and so a notification preview carries the image, not just a line of
+    // characters. A failure to send it must not cost the reply: the words are
+    // the substance and the block is the signal.
+    if (banner) {
+      try {
+        await transport().sendSelfMedia({
+          mimetype: "image/png",
+          caption: `${CATEGORIES[banner.category].emoji} ${banner.label}`,
+          dataBase64: solidPngBase64(banner.color),
+        });
+      } catch (error) {
+        console.error("console: could not send the state banner:", error?.message || error);
+      }
+    }
+    await answerSelf(reply);
+    return { answered: true };
+  }
+  return null;
+}
+
+/**
+ * Teach the archive the names the roster knows.
+ *
+ * ── The bug this fixes ──────────────────────────────────────────────────────
+ * The agent finds a conversation by name, and every group in the archive was
+ * nameless, so it answered "no group called that" for groups that plainly exist
+ * — while the same name resolved fine when SENDING, because sending asks the
+ * roster and reading asks the archive. Two lookups over two different sources
+ * that disagreed.
+ *
+ * A group's subject only exists on the server, so it can only arrive this way:
+ * the roster is fetched and the names are written onto the chats already stored.
+ * Cheap enough to repeat — one request and a handful of updates — and repeating
+ * matters, because groups get renamed and a stale name is its own wrong answer.
+ *
+ * People are refreshed by the same pass. Their `pushName` does ride along on
+ * messages, but only on live ones: everything replayed by history sync arrives
+ * without it, which is why an archive built from a first pairing is mostly
+ * unnamed until this runs.
+ */
+export async function refreshChatNames() {
+  if (!transportConfigured()) return { renamed: 0, skipped: "no transport configured" };
+
+  const roster = await transport().contacts();
+  const entries = (roster?.contacts ?? [])
+    .map((contact) => ({
+      key: contact.key,
+      // Subject first: for a group it is the only real name. For a person the
+      // operator's own name for them beats the one they chose for themselves.
+      displayName: contact.subject || contact.fullName || contact.pushName || contact.businessName || null,
+    }))
+    .filter((entry) => entry.key && entry.displayName);
+
+  const { renamed } = store().renameChats(entries);
+  return { renamed, considered: entries.length, groupsUnavailable: roster?.groupsUnavailable ?? null };
+}
+
 export function startTransportDrain() {
   const intervalMs = Number(process.env.WA_TRANSPORT_DRAIN_INTERVAL_MS) || 5_000;
+
+  // Once at boot and then hourly. Not on every drain: the names change on the
+  // scale of somebody renaming a group, and a roster fetch per five seconds
+  // would be a request-per-second against the transport for nothing.
+  const nameRefresh = () =>
+    refreshChatNames()
+      .then(({ renamed, groupsUnavailable }) => {
+        if (renamed) console.log(`transport: named ${renamed} chat(s) from the roster`);
+        if (groupsUnavailable) {
+          console.error(
+            `transport: the roster could not list groups (${groupsUnavailable}), so group names ` +
+              "are missing rather than absent. Conversations will not be findable by name until this clears.",
+          );
+        }
+      })
+      .catch((error) => console.error("transport: could not refresh chat names:", error?.message || error));
+
+  setTimeout(nameRefresh, 2_000).unref?.();
+  setInterval(nameRefresh, 60 * 60_000).unref?.();
   return startDrain({
     transport: transport(),
     store: store(),
@@ -1136,6 +667,10 @@ export function startTransportDrain() {
           "bridge could store them. That is a permanent gap in the archive, not a quiet period.",
       ),
     onError: (error) => console.error("transport: drain failed:", error?.message || error),
+    // The self chat doubles as a console. Runs per message, after the store has
+    // it and the batch is acked, so a command that fails costs a reply and never
+    // a message. See handleSelfMessage.
+    onMessage: (payload) => handleSelfMessage(payload),
   });
 }
 
@@ -1144,79 +679,6 @@ function badRequest(message) {
   const error = new Error(message);
   error.statusCode = 400;
   return error;
-}
-
-/** Move the conversation back one screenful and let WhatsApp render it. */
-async function scrollUp(page) {
-  const scroller = await first(page, "conversationScroller", { timeout: 10_000 });
-  if (!scroller) {
-    throw new Error(
-      "Could not find the conversation's scrolling container, so history cannot be reached. " +
-        "Inspect it with /debug/structure and update SELECTORS.conversationScroller.",
-    );
-  }
-
-  await scroller.handle.evaluate((el) => {
-    el.scrollTop = Math.max(0, el.scrollTop - Math.round(el.clientHeight * 0.9));
-  });
-  // Older rows are fetched and rendered asynchronously; reading too early
-  // returns the same window and looks like the top of the history.
-  await page.waitForTimeout(1400);
-}
-
-/**
- * Read further back than one screenful, without writing anything.
- *
- * Useful on its own for "scroll up a bit"; `ingestChat` is the version that
- * persists what it finds.
- */
-export async function readHistory({ chat, maxScrolls = 3, stopAtKey }) {
-  const page = await requireLogin();
-  const resolved = await openChat(chat);
-  await page.waitForTimeout(800);
-
-  const walk = await scrollbackWith(
-    {
-      budget,
-      readMessages: async () => (await readVisibleMessages(page, 60)).messages,
-      scrollUp: () => scrollUp(page),
-    },
-    { chat: resolved.opened, maxScrolls, stopAtKey },
-  );
-
-  return { ...walk, resolvedFrom: chat, exactMatch: resolved.exactMatch };
-}
-
-/**
- * Walk a chat backwards and write what it finds to the archive.
- *
- * Bounded on purpose. Call it again to continue: messages are content-addressed
- * so a re-read costs nothing, and `hasMore` says whether there is anything left.
- */
-export async function ingestChat({ chat, mode = "top-up", maxScrolls = 5 }) {
-  const page = await requireLogin();
-  const resolved = await openChat(chat);
-  await page.waitForTimeout(800);
-
-  // Before anything is written: a broken message-row selector would make this
-  // store nothing and report the chat as fully read. Costs no budget.
-  await assertSelectorsHealthy("conversation");
-
-  return await ingestWith(
-    {
-      store: store(),
-      scrollback: (options) =>
-        scrollbackWith(
-          {
-            budget,
-            readMessages: async () => (await readVisibleMessages(page, 60)).messages,
-            scrollUp: () => scrollUp(page),
-          },
-          options,
-        ),
-    },
-    { chat: resolved.opened, mode, maxScrolls },
-  );
 }
 
 /**
@@ -1231,8 +693,13 @@ export function searchArchive({ query, ...filters }) {
   return { query, chat: filters.chat, hits: store().search(query, filters) };
 }
 
+/** Recent conversations, from the archive. Replaces the DOM's rendered list. */
+export function archiveChats({ limit = 50 } = {}) {
+  return { chats: store().chats({ limit }) };
+}
+
 export function archiveStats() {
-  return { ...store().stats(), budgetRemaining: budget.remaining(), budgetPerHour: budget.maxPerHour };
+  return store().stats();
 }
 
 /** The conversation around one search hit. Reads SQLite, never WhatsApp. */
@@ -1241,8 +708,67 @@ export function archiveContext({ key, before, after }) {
 }
 
 /** Stored messages for one chat, each carrying the key an extraction must cite. */
-export function archiveMessages({ chat, limit }) {
-  return { chat, messages: store().messagesFor(chat, { limit }) };
+/**
+ * Resolve whatever the caller called a chat into the key the archive stores it
+ * under.
+ *
+ * ── The bug this fixes ──────────────────────────────────────────────────────
+ * The archive files every conversation under its protocol address —
+ * `120363216555895408@g.us` — and the agent asks for "We". Nothing matched, so
+ * reading a group by name returned zero messages and the agent reported the
+ * group as unarchived while 809 of its messages sat in the table.
+ *
+ * Names are compared with `foldName`, the same fold the send path uses, so a
+ * circumflex nobody types and an emoji WhatsApp renders as decoration cannot be
+ * the reason a conversation is unreachable. Ambiguity is refused rather than
+ * guessed: reading the wrong person's chat is a smaller harm than writing to
+ * them, but it is still the wrong answer given confidently.
+ */
+export function resolveArchiveChat(query) {
+  const asked = String(query ?? "").trim();
+  if (!asked) return null;
+
+  const chats = store().chats({ limit: 10_000 });
+  const byKey = chats.find((c) => c.key === asked);
+  if (byKey) return byKey.key;
+
+  const wanted = foldName(asked);
+  const exact = chats.filter((c) => c.displayName && foldName(c.displayName) === wanted);
+  if (exact.length === 1) return exact[0].key;
+  if (exact.length > 1) {
+    const error = new Error(
+      `"${asked}" matches ${exact.length} conversations (${exact.map((c) => c.displayName).join(", ")}). ` +
+        "Refusing to choose. Use the chat's key, which is unique.",
+    );
+    error.statusCode = 409;
+    throw error;
+  }
+
+  // Every word you typed, in any order — `familia ulian` finds `Familia (Ulian)`.
+  const words = foldName(asked)
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .split(" ")
+    .filter(Boolean);
+  if (words.length === 0) return null;
+  const loose = chats.filter((c) => {
+    if (!c.displayName) return false;
+    const have = new Set(
+      foldName(c.displayName)
+        .replace(/[^\p{L}\p{N}]+/gu, " ")
+        .split(" ")
+        .filter(Boolean),
+    );
+    return words.every((word) => have.has(word));
+  });
+  return loose.length === 1 ? loose[0].key : null;
+}
+
+export function archiveMessages({ chat, limit, newest = false }) {
+  // Resolved, then reported back as asked: the caller gets both, so a wrong
+  // resolution is visible rather than silent.
+  const key = resolveArchiveChat(chat) ?? chat;
+  const messages = store().messagesFor(key, { limit, newest });
+  return { chat, resolved: key, messages };
 }
 
 /** Persist what an extraction pass found. All-or-nothing on provenance. */
@@ -1502,209 +1028,174 @@ export function pruneArchive({ dryRun = true, ...overrides } = {}) {
   return { policy, ...store().prune({ ...policy, dryRun }) };
 }
 
-/**
- * The chat name to actually open for a requested recipient.
- *
- * Falls back to the env alias map, then to the raw name, so a chat that has
- * never been archived still works exactly as it did before the roster existed.
- * An ambiguous name is refused rather than guessed: a wrong recipient cannot be
- * recalled, so asking costs far less than being confidently wrong.
- */
-function resolveRecipientName(requested) {
-  let resolution;
-  try {
-    resolution = resolveContact({ name: requested });
-  } catch {
-    // A store that cannot be read must not take sending down with it.
-    return resolveAlias(requested);
-  }
-
-  if (resolution.ambiguous) {
-    const names = resolution.candidates.map((c) => `"${c.name}"`).join(", ");
-    const error = new Error(
-      `"${requested}" matches more than one chat: ${names}. Refusing to guess — ask which one is ` +
-        "meant and send to that exact name.",
-    );
-    error.statusCode = 409;
-    throw error;
-  }
-
-  return resolution.name || resolveAlias(requested);
-}
-
 /* ------------------------------------------------------------------ *
- * The watcher.
+ * The user's own chat.
  *
- * Detection is free and therefore ungated: a DOM mutation the browser was going
- * to paint anyway, read without touching anything. Reaction costs browser
- * interactions and is therefore gated four ways — coalescing, per-chat cooldown,
- * quiet hours and a fan-out cap — with the rules in watch.js and the ceiling in
- * rate.js.
+ * On the protocol this is a stronger construct than it was on the DOM. There,
+ * "your own chat" was a display title typed into an env var and compared to
+ * whatever Chromium had open — a string, checked exactly, because a fuzzy search
+ * could open a similarly-named contact and deliver a private draft to them.
  *
- * The gating lives HERE, in the bridge, for the same reason the interaction
- * budget does: a cap the agent enforces is a cap a confused agent can talk
- * itself out of. The agent is handed a plan that has already been bounded.
+ * Here it is the account's own key, read from the live session. It is what the
+ * archive already files self-messages under, it is what the protocol addresses,
+ * and it cannot fuzzy-match anybody: there is no roster lookup in this path and
+ * no name to mistype. That is why neither the allowlist nor a confirmation step
+ * appears below — not because self-notes are trusted, but because the recipient
+ * is not a choice.
  * ------------------------------------------------------------------ */
 
-const WATCH_SNAPSHOT_ROWS = 30;
-
-let baseline = null;
-let watching = false;
-let unsubscribe = null;
-const watchCounters = { snapshots: 0, skipped: 0, recorded: 0, lastAt: null, lastSkip: null };
-
-function watchSettings() {
-  return {
-    cooldownMs: Number(process.env.WA_EVENT_COOLDOWN_MINUTES || 15) * 60_000,
-    maxChatsPerWake: Number(process.env.WA_EVENT_MAX_CHATS || 3),
-    maxScrolls: Number(process.env.WA_EVENT_MAX_SCROLLS || 2),
-    quietHoursRaw: process.env.WA_QUIET_HOURS || "",
-    quietHours: parseQuietHours(process.env.WA_QUIET_HOURS || ""),
-  };
-}
-
 /**
- * Read the pane and queue whatever changed.
+ * Which chat is the user's own, and where to read it.
  *
- * `trySerial` rather than `serial`: if an operation holds the browser then the
- * pane is mid-change and this reading would be thrown away by the `filtered`
- * guard regardless, while the mutation that triggered it stays visible to the
- * next snapshot. Queueing would only pile stale reads up behind a slow send.
+ * `source` is reported rather than left implicit because a caller that wants to
+ * read the chat it writes to has to know that reading means the ARCHIVE, not a
+ * conversation opened somewhere. A caller that assumes otherwise ends up
+ * addressing a component this bridge no longer has.
  */
-async function snapshotNow() {
-  const outcome = await trySerial(async () => {
-    const state = await status();
-    if (state.state !== "logged_in") return { skipped: "not-logged-in" };
-
-    const page = await requireLogin();
-    const rows = await readChatRows(page, WATCH_SNAPSHOT_ROWS, { timeout: 5_000 });
-    if (!rows) return { skipped: "pane-not-rendered" };
-
-    // Filtered means a read or send has the search box populated. `diffRoster`
-    // refuses such a snapshot outright — it describes a subset, and diffing a
-    // subset against a full list reports every hidden chat as a change.
-    const filtered = Boolean(await chatSearchText(page));
-    return { snapshot: { rows, filtered, at: new Date().toISOString() } };
-  });
-
-  if (outcome.skipped) {
-    watchCounters.skipped++;
-    watchCounters.lastSkip = "browser-busy";
-    return { skipped: "browser-busy" };
-  }
-  if (outcome.value.skipped) {
-    watchCounters.skipped++;
-    watchCounters.lastSkip = outcome.value.skipped;
-    return { skipped: outcome.value.skipped };
-  }
-
-  watchCounters.snapshots++;
-  watchCounters.lastAt = new Date().toISOString();
-
-  const { events, baseline: next, skipped } = diffRoster(baseline, outcome.value.snapshot);
-  // A null baseline means the snapshot must not be remembered — see diffRoster.
-  if (next) baseline = next;
-  if (skipped) watchCounters.lastSkip = skipped;
-
-  if (!events.length) return { events: 0, skipped };
-
-  const written = store().recordEvents(events);
-  watchCounters.recorded += written.inserted;
-  return { events: events.length, ...written };
-}
-
 /**
- * Start observing. Idempotent, and safe to call before login: the snapshot
- * checks session state itself and simply skips until the pane exists.
+ * File a message this bridge just sent into the archive.
+ *
+ * ── Why this has to exist ───────────────────────────────────────────────────
+ * The protocol does not echo our own sends back to us. `dispatch.go` is the only
+ * thing that appends to the outbox and it only ever sees INBOUND traffic, so
+ * without this the archive holds every message received and not one message
+ * sent — a one-sided transcript of every conversation in it. The DOM path hid
+ * this, because a sent message appeared on screen and was picked up by the next
+ * read; the move to the protocol removed the accident that was covering it.
+ *
+ * Verified rather than assumed: a note sent through `/send/self` was still
+ * absent from the archive twelve seconds and one drain later.
+ *
+ * The row is keyed by the protocol's own message id, which is what the transport
+ * returns and what a later history sync would carry, so a message that does
+ * arrive by both routes collides on `messages.key` and is stored once.
  */
-export async function startWatching() {
-  if (watching) return { watching: true, alreadyRunning: true };
+function archiveOutgoing({ id, sentAt, chatKey, text, kind = "text", caption = null }) {
+  if (!id || !chatKey) return { archived: false };
 
-  // Registering the listener also forces the browser to launch, which is what
-  // installs the in-page observer.
-  unsubscribe = onPaneChange(() => {
-    snapshotNow().catch((error) => {
-      console.error("snapshot failed:", error?.message || error);
-    });
-  });
-  watching = true;
-
-  await requireLogin().catch(() => null);
-  // Establish the baseline immediately rather than waiting for the first
-  // mutation, so the first real arrival is a diff against a known list instead
-  // of being swallowed as "no baseline".
-  await snapshotNow().catch(() => null);
-
-  return { watching: true, ...watcherState() };
-}
-
-export function stopWatching() {
-  unsubscribe?.();
-  unsubscribe = null;
-  watching = false;
-  return { watching: false };
-}
-
-/** What the watcher is doing, and whether it can do anything at all. */
-export function watchStatus() {
-  const settings = watchSettings();
-  const observer = watcherState();
-
-  return {
-    watching,
-    observer,
-    baselineAt: baseline?.at ?? null,
-    counters: { ...watchCounters },
-    queue: store().eventStats(),
-    settings: {
-      cooldownMinutes: settings.cooldownMs / 60_000,
-      maxChatsPerWake: settings.maxChatsPerWake,
-      maxScrolls: settings.maxScrolls,
-      quietHours: settings.quietHoursRaw || null,
-      quietHoursValid: Boolean(settings.quietHours) || !settings.quietHoursRaw,
-      inQuietHoursNow: inQuietHours(new Date().toISOString(), settings.quietHours),
+  const at = sentAt ?? new Date().toISOString();
+  const { inserted } = store().upsertTransportMessages([
+    {
+      key: id,
+      chat: { key: chatKey, kind: "person", provisional: false, displayName: null },
+      // Our own account. The archive reads direction off `outgoing`, and a
+      // sender that is not the chat partner is what keeps a self-note from
+      // renaming the chat after itself.
+      sender: { key: chatKey, kind: "person" },
+      sentAt: at,
+      sentAtIso: at,
+      kind,
+      // An image carries no body of its own, so the archive stores the same
+      // placeholder a received image would get. Storing "" instead is what makes
+      // a chat full of pictures read back as a silent one.
+      text: kind === "text" ? text : placeholderText({ kind, caption }),
+      caption,
+      filename: null,
+      durationSeconds: null,
+      outgoing: true,
+      recognised: true,
+      fromHistory: false,
     },
-    budgetRemaining: budget.remaining(),
-    // An observer that never installed produces an empty queue, which is
-    // indistinguishable from a quiet day unless it is said out loud.
-    note: observer.installed
-      ? undefined
-      : "The in-page observer is not installed, so no events can be detected. Restart the bridge.",
-  };
-}
+  ]);
 
-/** Look at the queue without claiming anything. */
-export function pendingEvents({ limit } = {}) {
-  return { events: store().pendingEvents({ limit }), queue: store().eventStats() };
-}
-
-export function completeEvents({ keys }) {
-  return store().completeEvents(keys || []);
-}
-
-export function releaseEvents({ keys }) {
-  return store().releaseEvents(keys || []);
+  return { archived: inserted > 0 };
 }
 
 /**
- * Claim pending events, top up the archive for the chats worth reading, and hand
- * back what the agent should tell the user about.
+ * Write a note to the operator's own chat, and record that we did.
  *
- * Claim-and-act is one operation on purpose. If the agent claimed events and
- * then decided for itself what to read, the cooldown and the fan-out cap would
- * be advisory. Here the reads have already happened, bounded, before the agent
- * sees anything.
- *
- * Events are NOT completed here. The agent acks them after it has written its
- * note, so a crash between the two leaves them pending and the user is told
- * late rather than never. The cooldown is what stops the retry re-reading the
- * chat.
+ * The recording is not bookkeeping — it is what makes the note part of the
+ * conversation as far as anything reading the archive is concerned. A feature
+ * that writes to the chat and then cannot see what it wrote will do it again.
  */
-export async function reactToEvents({ limit = 25 } = {}) {
-  const result = await reactWith(
-    { store: store(), ingest: (options) => ingestChat(options) },
-    { limit, settings: watchSettings() },
+export async function sendSelfNote({ messages }) {
+  const { chat } = await selfChatIdentity();
+
+  const result = await sendSelfNoteWith(
+    {
+      env: process.env,
+      send: async (message) => {
+        const sent = await transport().sendSelf(message);
+        archiveOutgoing({ id: sent?.id, sentAt: sent?.sentAt, chatKey: chat, text: message });
+        return sent;
+      },
+    },
+    { messages },
   );
 
-  return { ...result, budgetRemaining: budget.remaining() };
+  return { ...result, chat };
 }
+
+/**
+ * Write an image to the operator's own chat, and record that we did.
+ *
+ * ── Why this has no allowlist ───────────────────────────────────────────────
+ * The same reason `sendSelfNote` has none: there is exactly one possible
+ * recipient and it is the operator. `assertSelfNoteConfigured` is still the gate
+ * — the feature switch and the "which chat is yours" answer — because a bridge
+ * that has not been told whose chat this is must write nothing at all.
+ *
+ * The archive row matters as much as the send. A feature that posts to the chat
+ * and then cannot see what it posted will post it again on the next tick, which
+ * for a game means a second copy of the same final board.
+ */
+export async function sendSelfImage({
+  image, mimetype = "image/png", caption, width, height, kind = "image", filename, durationSeconds,
+}) {
+  if (!image?.length) throw new Error("Refusing to send an empty attachment.");
+  assertSelfNoteConfigured();
+
+  const { chat } = await selfChatIdentity();
+  const sent = await transport().sendSelfMedia({
+    kind,
+    mimetype,
+    caption,
+    filename,
+    width,
+    height,
+    durationSeconds,
+    dataBase64: Buffer.from(image).toString("base64"),
+  });
+
+  const { archived } = archiveOutgoing({
+    id: sent?.id,
+    sentAt: sent?.sentAt,
+    chatKey: chat,
+    kind,
+    caption: caption ?? null,
+  });
+
+  return { ...sent, chat, archived };
+}
+
+/**
+ * Which console state the self chat is in, if any.
+ *
+ * Reported so that a second responder can stand down. The self chat has one
+ * keyboard and now has two things listening to it: this bridge's console, which
+ * answers `/game` deterministically as each message arrives, and the agent's
+ * tic-tac-toe tool, which answers `ttt` on a schedule. Both read bare digits as
+ * moves, so while the console holds a session the digits are ITS input and
+ * anything else answering them is talking over it.
+ */
+export function consoleState() {
+  return loadConsoleSession()?.state ?? null;
+}
+
+export async function selfChatIdentity() {
+  const state = await transport().status();
+  const key = state?.session?.account?.key;
+  if (!key) {
+    const error = new Error(
+      "The transport has no account key yet, so it cannot say which chat is yours. Pair the " +
+        "session first — /transport/status reports whether it is paired.",
+    );
+    error.statusCode = 503;
+    throw error;
+  }
+  return { chat: key, source: "archive", via: "transport" };
+}
+
+// Writing a self-note lives with the other transport calls, above: it goes to
+// `/send/self`, which addresses the account from the transport's own device
+// store. Only the READ side needed anything new, and that is `selfChatIdentity`.

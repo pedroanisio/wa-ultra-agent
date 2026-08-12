@@ -2,14 +2,25 @@ import { defineTool } from "eve/tools";
 import { z } from "zod";
 
 import { BridgeError, bridge } from "../lib/bridge.ts";
+import { sendApproval } from "../lib/send-policy.ts";
 
 /**
- * Send in one call. The allowlist, not a confirmation prompt, is the boundary.
+ * Send in one call, behind two independent guards.
  *
- * The bridge refuses any recipient that is not configured as allowed, and
- * re-verifies that the resolved conversation is the one open immediately before
- * typing. So a wrong or repeated call is bounded by configuration rather than by
- * a human reading every message.
+ * ── WHO, and then WHAT ──────────────────────────────────────────────────────
+ * The bridge's allowlist bounds WHO may be written to, and it lives there rather
+ * than here because a cap the agent enforces is a cap a confused agent can talk
+ * itself out of. It cannot bound WHAT is said: both people on the list are
+ * people to whom "on my way" and "I'll pay you Friday" are very different
+ * messages to receive under the user's own name.
+ *
+ * So `approval` below answers the second question. The prepare/commit dance that
+ * used to do this went with the DOM path; expressing it as an eve approval
+ * policy is strictly better, because the pause is durable and can be answered
+ * from whichever channel the user is actually on — including their own phone.
+ *
+ * `sendApproval` errs towards asking: the two failures are not symmetrical. A
+ * needless prompt costs a tap; a missed one sends a promise in someone's name.
  */
 export default defineTool({
   description:
@@ -35,6 +46,15 @@ export default defineTool({
       .max(4000)
       .describe("The exact text to send. Newlines are preserved as line breaks within one message."),
   }),
+  /**
+   * Commitment-shaped messages stop for a human; ordinary ones do not.
+   *
+   * Not `always()`: a confirmation on every "on my way" trains the user to tap
+   * through without reading, which is worse than no gate at all. Not `once()`
+   * either — the risk is per-message, not per-session.
+   */
+  approval: sendApproval,
+
   async execute({ to, message }, ctx) {
     try {
       return await bridge.sendMessage(to, message, ctx.abortSignal);

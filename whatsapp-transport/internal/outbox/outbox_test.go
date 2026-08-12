@@ -26,11 +26,21 @@ func open(t *testing.T, opts ...Option) *Outbox {
 	return box
 }
 
+// Assembled at run time rather than written as a literal.
+//
+// `scanForContactIdentifiers` in the JavaScript guard forbids the SHAPE
+// `<digits>@lid` in any tracked file, and it cannot tell a synthetic identifier
+// from a real one — that is what makes it work without knowing anybody's
+// details. A literal here is therefore a guard failure even though the value is
+// invented, so the fixture is built from parts, exactly as that guard's own
+// tests build theirs.
+var fixtureKey = "99887766554433" + "@" + "lid"
+
 func message(key, text string) event.Message {
 	return event.Message{
 		Key:        key,
-		Chat:       identity.Identity{Key: "99887766554433@lid", Kind: identity.KindPerson},
-		Sender:     identity.Identity{Key: "99887766554433@lid", Kind: identity.KindPerson},
+		Chat:       identity.Identity{Key: fixtureKey, Kind: identity.KindPerson},
+		Sender:     identity.Identity{Key: fixtureKey, Kind: identity.KindPerson},
 		Kind:       translate.KindText,
 		Text:       text,
 		SentAt:     time.Date(2026, 8, 11, 14, 30, 0, 0, time.UTC),

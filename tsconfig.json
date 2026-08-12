@@ -9,6 +9,12 @@
     "moduleResolution": "bundler",
     "allowImportingTsExtensions": true,
     "strict": true,
+    // Node runs these files by stripping types, not by compiling them, so any
+    // TypeScript that emits code (enums, parameter properties, namespaces) is a
+    // module that cannot be loaded — and therefore cannot be tested. One such
+    // constructor in bridge.ts is why nothing that talks to the bridge had a
+    // test. This makes that failure a typecheck error instead of a discovery.
+    "erasableSyntaxOnly": true,
     "noEmit": true,
     "skipLibCheck": true,
     "types": [

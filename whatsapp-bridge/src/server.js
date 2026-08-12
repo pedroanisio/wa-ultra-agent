@@ -2,64 +2,59 @@ import { createServer } from "node:http";
 import { timingSafeEqual } from "node:crypto";
 
 import { parseSearchParams } from "./archive-query.js";
+import { assertSelfNoteConfigured } from "./self-note.js";
 import { serial } from "./serial.js";
-import { qrPng, sessionHealth, shutdown, status, waitForLogin } from "./session.js";
 import {
   addFact,
+  archiveChats,
+  refreshChatNames,
   archiveContext,
   archiveMessages,
   archiveStats,
-  commitSend,
-  completeEvents,
-  pendingEvents,
-  reactToEvents,
-  releaseEvents,
-  startWatching,
-  watchStatus,
-  debugRows,
-  debugMessageRows,
-  fetchMedia,
   attention,
+  consoleState,
   forgetAlias,
   getTranscript,
-  ingestChat,
   interactionTwin,
   listAliases,
   listExtractions,
   listFacts,
   listProposals,
-  pruneArchive,
-  restoreFact,
-  retractFact,
-  resolveArc,
-  resolveProposal,
-  saveInteractionModel,
-  saveProposals,
-  staleTwins,
+  pendingForAgent,
   peopleRoster,
   personDossier,
-  readHistory,
+  pruneArchive,
   recordTranscript,
   rememberAlias,
+  resolveArc,
   resolveContact,
   resolveExtraction,
+  resolveProposal,
+  restoreFact,
+  retractFact,
   saveExtractions,
+  saveInteractionModel,
+  saveProposals,
   searchArchive,
-  selectorHealth,
-  debugScreenshot,
-  debugSelectors,
-  debugStructure,
-  listChats,
-  prepareSend,
-  readChat,
-  sendMessage,
+  selfChatIdentity,
+  editViaTransport,
+  pollViaTransport,
+  pollVoteViaTransport,
+  presenceViaTransport,
+  reactViaTransport,
+  revokeViaTransport,
+  sendMediaViaTransport,
+  sendSelfImage,
   sendSelfNote,
   sendViaTransport,
+  staleTwins,
   startTransportDrain,
   transportConfigured,
   transportConnect,
   transportContacts,
   transportDrain,
+  transportHistory,
+  transportMedia,
   transportPairPhone,
   transportStatus,
 } from "./whatsapp.js";
@@ -95,12 +90,27 @@ function send(res, code, body, type = "application/json") {
   res.end(payload);
 }
 
-async function readJson(req) {
+/** A text request is a few hundred bytes; anything larger is a mistake. */
+const MAX_BODY_BYTES = 64 * 1024;
+
+/**
+ * An attachment is the one request that is legitimately large.
+ *
+ * Sized from the transport's own 16 MiB ceiling on decoded bytes, plus base64's
+ * 4/3 inflation and room for the surrounding JSON. Deriving it from that limit
+ * rather than picking a round number keeps the two ends from disagreeing about
+ * what is too big — a body accepted here and refused there would spend the
+ * upload before failing.
+ */
+const MAX_MEDIA_BODY_BYTES = Math.ceil((16 * 1024 * 1024 * 4) / 3) + 64 * 1024;
+
+async function readJson(req, maxBytes = MAX_BODY_BYTES) {
   const chunks = [];
+  let total = 0;
   for await (const c of req) {
     chunks.push(c);
-    // A bridge request is a few hundred bytes; anything larger is a mistake.
-    if (chunks.reduce((n, x) => n + x.length, 0) > 64 * 1024) throw new Error("body too large");
+    total += c.length;
+    if (total > maxBytes) throw new Error("body too large");
   }
   return chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : {};
 }
@@ -125,107 +135,121 @@ const server = createServer(async (req, res) => {
   // `serial()`, and an unauthenticated endpoint that drives the browser is both
   // a way to stall real work and a way to spend interactions from outside. This
   // reports state the session already knows and touches nothing.
-  //
-  // Coarse on purpose. `state` says whether Chromium is up; it never says
-  // whether an account is linked, and `lastError` stays behind the token
-  // because a launch failure can carry the profile path.
+  // Liveness only, and deliberately coarse: it answers before the token check,
+  // so it must never disclose whether an account is linked. Whether the
+  // transport is paired and connected is behind the token, on /transport/status.
   if (path === "/health") {
-    const { ok, state } = sessionHealth();
-    return send(res, ok ? 200 : 503, { ok, browser: state });
+    return send(res, 200, { ok: true, transport: transportConfigured() ? "configured" : "unset" });
   }
 
   if (!authorized(req)) return send(res, 401, { error: "unauthorized" });
 
   try {
-    if (path === "/status") return send(res, 200, await serial(() => status()));
-
-    if (path === "/qr") {
-      const png = await serial(() => qrPng());
-      if (!png) return send(res, 200, { state: "logged_in", note: "Already linked; no QR needed." });
-      if (url.searchParams.get("format") === "json") {
-        return send(res, 200, { state: "logged_out", pngBase64: png.toString("base64") });
-      }
-      res.writeHead(200, { "content-type": "image/png", "cache-control": "no-store" });
-      return res.end(png);
+    // What this service can say about itself. The session's own state lives on
+    // /transport/status, which asks the transport rather than paraphrasing it.
+    if (path === "/status") {
+      return send(res, 200, {
+        archive: archiveStats(),
+        transport: transportConfigured() ? "configured" : "unset",
+      });
     }
 
-    if (path === "/wait-for-login") {
-      const ok = await serial(() => waitForLogin(Number(url.searchParams.get("timeoutMs") || 180_000)));
-      return send(res, ok ? 200 : 408, { loggedIn: ok });
-    }
 
-    // Structure of the first few chat rows, for repairing selectors when a
-    // WhatsApp Web redesign breaks extraction. Returns DOM shape, not a feed.
-    if (path === "/debug/rows") {
-      const limit = Number(url.searchParams.get("limit") || 4);
-      return send(res, 200, await serial(() => debugRows(limit)));
-    }
 
-    // Rows inside the OPEN conversation, raw. This is the one to read when a
-    // message is misclassified; /debug/rows above is the chat list.
-    if (path === "/debug/message-rows") {
-      const limit = Number(url.searchParams.get("limit") || 8);
-      return send(res, 200, await serial(() => debugMessageRows(limit)));
-    }
 
-    if (path === "/debug/screenshot") {
-      const png = await serial(() => debugScreenshot());
-      res.writeHead(200, { "content-type": "image/png", "cache-control": "no-store" });
-      return res.end(png);
-    }
 
-    if (path === "/debug/structure") {
-      return send(res, 200, await serial(() => debugStructure()));
-    }
 
-    if (path === "/debug/selectors") {
-      return send(res, 200, await serial(() => debugSelectors()));
-    }
 
-    // Why the browser is down, for whoever is holding the token.
-    //
-    // The counterpart to `/health`, which is unauthenticated and therefore says
-    // only up/starting/down. This adds the launch error and the attempt counts —
-    // "it recovered after three failed launches" is a different fact from "it
-    // came up cleanly", and only the counts distinguish them. Queues behind
-    // nothing and starts no browser, so it still answers when the session is
-    // wedged, which is the moment it is worth having.
-    if (path === "/debug/session") return send(res, 200, sessionHealth());
-
-    // Are the hooks ingestion depends on still alive? This is the check
-    // `ingestChat` asserts before every run; exposed so it can also be polled.
-    if (path === "/debug/selector-health") {
-      const scope = url.searchParams.get("scope") || "all";
-      const health = await serial(() => selectorHealth({ scope }));
-      return send(res, health.ok ? 200 : 503, health);
-    }
-
-    if (path === "/chats") {
-      const limit = Number(url.searchParams.get("limit") || 15);
-      return send(res, 200, await serial(() => listChats({ limit })));
-    }
-
-    if (path === "/messages") {
-      const chat = url.searchParams.get("chat");
-      if (!chat) return send(res, 400, { error: "chat is required" });
-      const limit = Number(url.searchParams.get("limit") || 25);
-      return send(res, 200, await serial(() => readChat({ chat, limit })));
-    }
 
     // One-shot send for an allowlisted recipient. The allowlist is the
     // boundary; /send/prepare + /send/commit remain for a confirm-first flow.
     if (path === "/send" && req.method === "POST") {
-      const { to, message } = await readJson(req);
+      const { to, message, quoted } = await readJson(req);
       if (!to || !message) return send(res, 400, { error: "to and message are required" });
 
-      // The protocol path when there is one. Not serialised: `serial` exists to
-      // keep browser operations from interleaving in one tab, and a protocol send
-      // touches no tab. Routing on configuration rather than on a request field
-      // keeps the agent's tools unchanged — they call /send either way.
-      if (transportConfigured()) {
-        return send(res, 200, await sendViaTransport({ to, message }));
+      // Protocol only. There is no longer a second way to send, which is the
+      // point: the DOM path typed into a search box and trusted a fuzzy match.
+      return send(res, 200, await sendViaTransport({ to, message, quoted }));
+    }
+
+    // An image, for an allowlisted recipient. Protocol-only on purpose: the DOM
+    // path has no attachment mechanism at all, and a 503 that says so is better
+    // than a route that exists on paper and fails at a file picker.
+    if (path === "/send/media" && req.method === "POST") {
+      const {
+        to, dataBase64, mimetype, caption, width, height, kind, filename, durationSeconds, quoted,
+      } = await readJson(req, MAX_MEDIA_BODY_BYTES);
+      if (!to || !dataBase64 || !mimetype) {
+        return send(res, 400, { error: "to, dataBase64 and mimetype are required" });
       }
-      return send(res, 200, await serial(() => sendMessage({ to, message })));
+      if (!transportConfigured()) {
+        return send(res, 503, {
+          error:
+            "Sending an image requires the protocol transport. Set WA_TRANSPORT_URL; " +
+            "the browser path cannot attach files.",
+        });
+      }
+      return send(
+        res,
+        200,
+        await sendMediaViaTransport({
+          to,
+          image: Buffer.from(dataBase64, "base64"),
+          kind,
+          mimetype,
+          caption,
+          filename,
+          width,
+          height,
+          durationSeconds,
+          quoted,
+        }),
+      );
+    }
+
+    // Acting on a message that already exists: a reaction, a deletion, a
+    // correction, a poll. Each is something this account DOES in someone's
+    // conversation, so each goes through the same allowlist as a plain message —
+    // `resolveAllowedRecipient` is the one gate, and a test drives every one of
+    // these through it.
+    if (path === "/send/reaction" && req.method === "POST") {
+      const { to, messageId, emoji, sender } = await readJson(req);
+      if (!to || !messageId) return send(res, 400, { error: "to and messageId are required" });
+      return send(res, 200, await reactViaTransport({ to, messageId, emoji, sender }));
+    }
+
+    if (path === "/send/revoke" && req.method === "POST") {
+      const { to, messageId, sender } = await readJson(req);
+      if (!to || !messageId) return send(res, 400, { error: "to and messageId are required" });
+      return send(res, 200, await revokeViaTransport({ to, messageId, sender }));
+    }
+
+    if (path === "/send/edit" && req.method === "POST") {
+      const { to, messageId, message } = await readJson(req);
+      if (!to || !messageId || !message) {
+        return send(res, 400, { error: "to, messageId and message are required" });
+      }
+      return send(res, 200, await editViaTransport({ to, messageId, message }));
+    }
+
+    if (path === "/send/poll/vote" && req.method === "POST") {
+      const { to, messageId, sender, options } = await readJson(req);
+      if (!to || !messageId) return send(res, 400, { error: "to and messageId are required" });
+      return send(res, 200, await pollVoteViaTransport({ to, messageId, sender, options }));
+    }
+
+    // Typing indicators. Gated like a message because that is what it is: a
+    // signal this account emits into somebody else's conversation.
+    if (path === "/presence" && req.method === "POST") {
+      const { to, state, media } = await readJson(req);
+      if (!to || !state) return send(res, 400, { error: "to and state are required" });
+      return send(res, 200, await presenceViaTransport({ to, state, media }));
+    }
+
+    if (path === "/send/poll" && req.method === "POST") {
+      const { to, name, options, selectableCount } = await readJson(req);
+      if (!to || !name) return send(res, 400, { error: "to and name are required" });
+      return send(res, 200, await pollViaTransport({ to, name, options, selectableCount }));
     }
 
     /* -------------------------------------------------------------- *
@@ -260,6 +284,19 @@ const server = createServer(async (req, res) => {
 
     // Everything ingested so far. Cheap and browser-free: it reads SQLite, not
     // WhatsApp, so it costs nothing from the interaction budget.
+    // Every conversation the archive holds, most recently active first. The
+    // agent's chat list reads this; there is no rendered pane to walk.
+    // Pull names from the roster now rather than waiting for the hourly pass.
+    // A group renamed a minute ago is a group the agent cannot find by name.
+    if (path === "/archive/names/refresh" && req.method === "POST") {
+      return send(res, 200, await refreshChatNames());
+    }
+
+    if (path === "/archive/chats") {
+      const limit = Number(url.searchParams.get("limit")) || 50;
+      return send(res, 200, archiveChats({ limit }));
+    }
+
     if (path === "/archive/stats") return send(res, 200, archiveStats());
 
     /* -------------------------------------------------------------- *
@@ -270,26 +307,10 @@ const server = createServer(async (req, res) => {
      * through `serial` like every other browser operation.
      * -------------------------------------------------------------- */
 
-    if (path === "/events") {
-      return send(res, 200, pendingEvents({ limit: Number(url.searchParams.get("limit")) || undefined }));
-    }
 
-    if (path === "/events/status") return send(res, 200, watchStatus());
 
-    if (path === "/events/react" && req.method === "POST") {
-      const { limit } = await readJson(req);
-      return send(res, 200, await serial(() => reactToEvents({ limit })));
-    }
 
-    if (path === "/events/complete" && req.method === "POST") {
-      const { keys } = await readJson(req);
-      return send(res, 200, completeEvents({ keys }));
-    }
 
-    if (path === "/events/release" && req.method === "POST") {
-      const { keys } = await readJson(req);
-      return send(res, 200, releaseEvents({ keys }));
-    }
 
     // Parsed in archive-query.js and passed through whole. Listing the filters
     // again here is what let five of them get dropped once already.
@@ -322,7 +343,14 @@ const server = createServer(async (req, res) => {
       return send(
         res,
         200,
-        archiveMessages({ chat, limit: Number(url.searchParams.get("limit")) || undefined }),
+        // `newest` cuts the limit from the recent end. Without it a limit of 20
+        // over a long chat returns its twenty OLDEST messages, which reads as an
+        // empty conversation to anything asking what just happened.
+        archiveMessages({
+          chat,
+          limit: Number(url.searchParams.get("limit")) || undefined,
+          newest: url.searchParams.get("newest") === "1",
+        }),
       );
     }
 
@@ -527,72 +555,97 @@ const server = createServer(async (req, res) => {
       );
     }
 
-    // Scroll back through a chat without storing anything.
-    if (path === "/history") {
-      const chat = url.searchParams.get("chat");
+    // Ask the operator's phone for messages older than one already held. The
+    // reachable depth is whatever the phone still has — not whatever WhatsApp's
+    // servers have — so a short answer is a fact about the phone, not a failure.
+    if (path === "/history" && req.method === "POST") {
+      const { chat, oldestId, oldestFromMe, oldestTimestamp, count } = await readJson(req);
       if (!chat) return send(res, 400, { error: "chat is required" });
-      const maxScrolls = Number(url.searchParams.get("maxScrolls"));
-      return send(
-        res,
-        200,
-        await serial(() =>
-          readHistory({ chat, maxScrolls: Number.isInteger(maxScrolls) ? maxScrolls : 3 }),
-        ),
-      );
+      return send(res, 200, await transportHistory({ chat, oldestId, oldestFromMe, oldestTimestamp, count }));
     }
 
-    // Walk a chat backwards and write it to the archive. Bounded by maxScrolls
-    // and by the interaction budget; call again while hasMore is true.
-    if (path === "/ingest" && req.method === "POST") {
-      const { chat, mode, maxScrolls } = await readJson(req);
-      if (!chat) return send(res, 400, { error: "chat is required" });
-      if (mode && mode !== "top-up" && mode !== "backfill") {
-        return send(res, 400, { error: 'mode must be "top-up" or "backfill"' });
-      }
-      return send(res, 200, await serial(() => ingestChat({ chat, mode, maxScrolls })));
-    }
-
-    // The payload behind one media message, addressed by position from the end
-    // of the chat. `kind`/`from`/`time` are the caller's fingerprint: the bridge
-    // refuses if the row there is not the one they read.
+    // The payload behind one media message, addressed by the protocol's own
+    // message id. The old route took a position from the end of a rendered chat
+    // and a fingerprint to check it against, because a position is not an
+    // address; an id is.
     if (path === "/media") {
-      const chat = url.searchParams.get("chat");
-      const fromEnd = Number(url.searchParams.get("fromEnd"));
-      if (!chat) return send(res, 400, { error: "chat is required" });
-      if (!Number.isInteger(fromEnd) || fromEnd < 0) {
-        return send(res, 400, { error: "fromEnd must be a non-negative integer" });
-      }
+      const key = url.searchParams.get("key");
+      if (!key) return send(res, 400, { error: "key is required" });
+      return send(res, 200, await transportMedia(key));
+    }
 
-      const expect = {
-        kind: url.searchParams.get("kind") || undefined,
-        from: url.searchParams.get("from") || undefined,
-        time: url.searchParams.get("time") || undefined,
-      };
-      const maxBytes = Number(url.searchParams.get("maxBytes")) || undefined;
+    // Which chat is the user's own.
+    //
+    // The agent is not given WA_SELF_CHAT_NAME — it is a real contact name, so
+    // it lives in exactly one place and the bridge is that place. But an agent
+    // that has *written* a self-note may also need to *read* the chat it wrote
+    // to, and `/messages` takes a name. Reading it back is how a conversation
+    // held in the self chat survives the agent being restarted between turns.
+    //
+    // Browser-free: this reports configuration, opens nothing, and spends no
+    // interaction budget. It reuses the same check `/send/self` runs, so an
+    // unconfigured bridge answers 403 here with the same instructions rather
+    // than handing out an empty name that would fuzzy-match some other chat.
+    // Which chat is the user's own, and where a caller can READ it.
+    //
+    // The title in WA_SELF_CHAT_NAME is still what enables the feature, but it
+    // is not an address any more: on the protocol the account's own key is, and
+    // that key is also what the archive files self-messages under. A caller that
+    // wants to read back what it wrote needs the key, not the title — reporting
+    // the title here is what sent tic-tac-toe to a browser that no longer exists.
+    if (path === "/self/chat") {
+      assertSelfNoteConfigured();
+      // `console` says whether this bridge's own console currently owns the
+      // keyboard. Anything else that answers the self chat reads it and stands
+      // down, or two responders end up racing for the same digits.
+      return send(res, 200, { ...(await selfChatIdentity()), console: consoleState() });
+    }
 
-      return send(res, 200, await serial(() => fetchMedia({ chat, fromEnd, expect, maxBytes })));
+    // What the operator typed in `/eve` mode, and nothing else. Drains on read:
+    // the agent asks, answers through /send/self, and a message handed over twice
+    // would be answered twice. Empty is the normal state.
+    if (path === "/self/pending") {
+      const waitMs = Number(url.searchParams.get("waitMs")) || 0;
+      return send(res, 200, await pendingForAgent({ waitMs }));
     }
 
     // Write to the user's own chat. No allowlist and no confirmation step,
-    // because the recipient is a constant: the bridge refuses unless the
-    // conversation actually open is exactly WA_SELF_CHAT_NAME. Validation lives
-    // in self-note.js and carries its own status codes.
+    // because the recipient is a constant — the transport addresses the account's
+    // own JID from its device store, so there is no name to mis-resolve and
+    // nothing for a human to confirm. Validation lives in self-note.js and
+    // carries its own status codes.
     if (path === "/send/self" && req.method === "POST") {
       const { messages } = await readJson(req);
       return send(res, 200, await serial(() => sendSelfNote({ messages })));
     }
 
-    if (path === "/send/prepare" && req.method === "POST") {
-      const { to, message } = await readJson(req);
-      if (!to || !message) return send(res, 400, { error: "to and message are required" });
-      return send(res, 200, await serial(() => prepareSend({ to, message })));
+    // An image to the user's own chat, on the same terms as the note above: one
+    // possible recipient, so no allowlist and no confirmation. The larger body
+    // limit is the only difference, and it is the attachment's, not a relaxation
+    // of anything else.
+    if (path === "/send/self/media" && req.method === "POST") {
+      const { dataBase64, mimetype, caption, width, height, kind, filename, durationSeconds } =
+        await readJson(req, MAX_MEDIA_BODY_BYTES);
+      if (!dataBase64) return send(res, 400, { error: "dataBase64 is required" });
+      return send(
+        res,
+        200,
+        await serial(() =>
+          sendSelfImage({
+            image: Buffer.from(dataBase64, "base64"),
+            kind,
+            mimetype,
+            caption,
+            filename,
+            width,
+            height,
+            durationSeconds,
+          }),
+        ),
+      );
     }
 
-    if (path === "/send/commit" && req.method === "POST") {
-      const { token } = await readJson(req);
-      if (!token) return send(res, 400, { error: "token is required" });
-      return send(res, 200, await serial(() => commitSend({ token })));
-    }
+
 
     return send(res, 404, { error: "not found" });
   } catch (error) {
@@ -622,21 +675,6 @@ server.listen(PORT, HOST, () => {
   // but the queue it fills is what a dispatcher then acts on, and an operator
   // who has not configured quiet hours or a cooldown should not acquire a
   // reactive agent by upgrading.
-  if (process.env.WA_WATCH_EVENTS !== "true") {
-    console.log("events: disabled (set WA_WATCH_EVENTS=true to observe the chat list)");
-    return;
-  }
-
-  // Deliberately not awaited: this launches the browser, which takes tens of
-  // seconds and must not delay the port being answerable. Failure is reported
-  // and left alone — /events/status is where its state is visible.
-  startWatching().then(
-    (state) =>
-      console.log(
-        `events: watching (observer ${state.installed === false ? "NOT installed" : "installed"})`,
-      ),
-    (error) => console.error("events: failed to start watching:", error?.message || error),
-  );
 });
 
 for (const sig of ["SIGINT", "SIGTERM"]) {
@@ -645,7 +683,6 @@ for (const sig of ["SIGINT", "SIGTERM"]) {
     // throw on the write, and a drain that starts after it would ack entries it
     // never stored.
     drain?.stop();
-    await shutdown();
     server.close(() => process.exit(0));
   });
 }

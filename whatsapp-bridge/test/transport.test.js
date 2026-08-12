@@ -33,7 +33,7 @@ const payload = (over = {}) => ({
   key: "3EB0FIXTURE01",
   chat: CHAT,
   sender: CHAT,
-  pushName: "Marcela",
+  pushName: "Fixture Contact",
   outgoing: false,
   sentAt: "2026-08-11T09:15:00Z",
   kind: "text",
@@ -107,21 +107,21 @@ test("toArchiveRow: an unrecognised protobuf arm still stores, as unknown", () =
 });
 
 test("toArchiveRow: the chat is keyed on identity and the push name is only a label", () => {
-  const row = toArchiveRow(payload({ pushName: "Marcela" }));
+  const row = toArchiveRow(payload({ pushName: "Fixture Contact" }));
   assert.equal(row.chat.key, "fixture-a@lid", "the stable key addresses the chat");
-  assert.equal(row.chat.displayName, "Marcela", "the self-asserted name rides alongside");
+  assert.equal(row.chat.displayName, "Fixture Contact", "the self-asserted name rides alongside");
 });
 
 test("toArchiveRow: a group is not renamed after whoever spoke in it last", () => {
   // The trap: `pushName` labels the SENDER. In a direct message the sender is the
   // chat partner, so it labels the chat too — but in a group it is one
-  // participant, and hanging it on the chat would rename "Obra" to "Marcela" and
+  // participant, and hanging it on the chat would rename "Obra" to "Fixture Contact" and
   // then to whoever spoke next. Silent, and it corrupts every chat listing.
   const row = toArchiveRow(
     payload({
       chat: { key: "fixture-group@g.us", kind: "group", provisional: false },
       sender: { key: "fixture-a@lid", kind: "lid", provisional: false },
-      pushName: "Marcela",
+      pushName: "Fixture Contact",
     }),
   );
   assert.equal(row.chat.displayName, null, "a participant's name is not the group's name");
@@ -130,8 +130,8 @@ test("toArchiveRow: a group is not renamed after whoever spoke in it last", () =
 
 test("toArchiveRow: a direct message does take its label from the sender", () => {
   // The other half of the rule above — otherwise every DM would be unlabelled.
-  const row = toArchiveRow(payload({ pushName: "Marcela" }));
-  assert.equal(row.chat.displayName, "Marcela");
+  const row = toArchiveRow(payload({ pushName: "Fixture Contact" }));
+  assert.equal(row.chat.displayName, "Fixture Contact");
 });
 
 test("toArchiveRow: a message with no id is refused rather than stored", () => {
@@ -237,13 +237,13 @@ test("drainOnce: a non-zero dropped count is reported, not swallowed", async () 
 // ── resolveRecipient: name to address ──────────────────────────────────────
 
 const ROSTER = [
-  { key: "fixture-a@lid", kind: "lid", provisional: false, pushName: "Marcela", fullName: "Marcela A." },
+  { key: "fixture-a@lid", kind: "lid", provisional: false, pushName: "Fixture Contact", fullName: "Fixture Contact A." },
   { key: "fixture-b@lid", kind: "lid", provisional: false, pushName: "Fabio", fullName: "" },
   { key: "pn:9f2ac41b7e", kind: "phone", provisional: true, pushName: "Helena", fullName: "" },
 ];
 
 test("resolveRecipient: an exact name resolves to that contact's address", () => {
-  const resolved = resolveRecipient("Marcela", ROSTER);
+  const resolved = resolveRecipient("Fixture Contact", ROSTER);
   assert.equal(resolved.to, "fixture-a@lid");
   assert.equal(resolved.exactMatch, true);
 });
@@ -295,6 +295,42 @@ test("resolveRecipient: a provisional identity is refused, because it is not an 
 
 test("resolveRecipient: a name nobody in the roster has is refused, not guessed at", () => {
   assert.throws(() => resolveRecipient("Nobody At All", ROSTER), /no contact matches/i);
+});
+
+test("resolveRecipient: a group resolves by its subject", () => {
+  // Groups carry `subject` and none of the three person-name fields, so a roster
+  // reader that only knows about push names cannot address one at all.
+  const roster = [
+    ...ROSTER,
+    { key: "120363000000000001@g.us", kind: "group", provisional: false, subject: "Fixture Group" },
+  ];
+  const resolved = resolveRecipient("Fixture Group", roster);
+  assert.equal(resolved.to, "120363000000000001@g.us");
+  assert.equal(resolved.matchedName, "Fixture Group");
+  assert.equal(resolved.exactMatch, true);
+});
+
+test("resolveRecipient: an exact group subject beats a person it is a prefix of", () => {
+  // The shape of the original defect. "We" is two characters, and while the
+  // roster held no groups it prefix-matched a person and resolved to them.
+  const roster = [
+    { key: "fixture-b@lid", provisional: false, pushName: "Wesley Fixture" },
+    { key: "120363000000000002@g.us", kind: "group", provisional: false, subject: "We" },
+  ];
+  assert.equal(resolveRecipient("We", roster).to, "120363000000000002@g.us");
+});
+
+test("resolveRecipient: a missing name says so differently when groups could not be listed", () => {
+  // "no contact matches" is a true statement about a roster that is missing its
+  // groups, and a misleading one: it reads as "this name does not exist".
+  assert.throws(
+    () => resolveRecipient("Fixture Group", ROSTER, { groupsUnavailable: "iq timed out" }),
+    (error) => {
+      assert.match(error.message, /group/i);
+      assert.match(error.message, /iq timed out/);
+      return true;
+    },
+  );
 });
 
 // ── createTransport: the HTTP client ───────────────────────────────────────
@@ -395,4 +431,81 @@ test("createTransport: the outbox limit is capped at what the API accepts", asyn
 
   await transport.outbox({ limit: 5000 });
   assert.equal(requested, "1000");
+});
+
+/* ---------------------------------------------------------------- *
+ * Finding a chat by the name a person would actually type
+ *
+ * Every case below is a real miss against this account's roster. The bug that
+ * prompted them: the group `Kim, Lu, Rê` could not be found as `Kim, Lu, Re`,
+ * so the agent told the user no such group existed — while the group sat in the
+ * roster, on the send allowlist.
+ * ---------------------------------------------------------------- */
+
+const SEARCH_ROSTER = [
+  { key: "1@g.us", kind: "group", subject: "Kim, Lu, Rê" },
+  { key: "2@g.us", kind: "group", subject: "👥 Casa & Crianças" },
+  { key: "3@g.us", kind: "group", subject: "Rex + Pals" },
+  { key: "4@g.us", kind: "group", subject: "Familia (Ulian)" },
+  { key: "5@lid", kind: "person", pushName: "Ana" },
+  { key: "6@lid", kind: "person", pushName: "Ana Paula" },
+];
+
+test("search: a diacritic the user did not type still finds the chat", () => {
+  assert.equal(resolveRecipient("Kim, Lu, Re", SEARCH_ROSTER).to, "1@g.us");
+  assert.equal(resolveRecipient("Kim, Lu, Rê", SEARCH_ROSTER).to, "1@g.us");
+});
+
+test("search: separators are not part of anybody's name", () => {
+  for (const typed of ["kim lu re", "Kim Lu Rê", "kim, lu, re"]) {
+    assert.equal(resolveRecipient(typed, SEARCH_ROSTER).to, "1@g.us", typed);
+  }
+});
+
+test("search: a decorative emoji in the chat name is ignored", () => {
+  assert.equal(resolveRecipient("Casa & Crianças", SEARCH_ROSTER).to, "2@g.us");
+  assert.equal(resolveRecipient("casa e criancas", SEARCH_ROSTER).to, "2@g.us");
+});
+
+test("search: a conjunction written as a word matches one written as a symbol", () => {
+  assert.equal(resolveRecipient("Rex e Pals", SEARCH_ROSTER).to, "3@g.us");
+  assert.equal(resolveRecipient("rex pals", SEARCH_ROSTER).to, "3@g.us");
+});
+
+test("search: a parenthetical is reachable both with and without it", () => {
+  assert.equal(resolveRecipient("Familia", SEARCH_ROSTER).to, "4@g.us");
+  assert.equal(resolveRecipient("Familia Ulian", SEARCH_ROSTER).to, "4@g.us");
+});
+
+test("search: an exact name beats a longer one that contains it", () => {
+  // The safety property the tiers exist for: widening the fold must never make
+  // "Ana" ambiguous just because "Ana Paula" is also in the roster.
+  const hit = resolveRecipient("Ana", SEARCH_ROSTER);
+  assert.equal(hit.to, "5@lid");
+  assert.equal(hit.exactMatch, true);
+});
+
+test("search: a genuinely ambiguous name is refused, never guessed", () => {
+  const roster = [
+    { key: "a@lid", kind: "person", pushName: "Ana Fixture Souza" },
+    { key: "b@lid", kind: "person", pushName: "Ana Fixture Lima" },
+  ];
+  assert.throws(
+    () => resolveRecipient("Ana Fixture", roster),
+    (e) => e.statusCode === 409 && /ambiguous/.test(e.message),
+  );
+});
+
+test("search: a name that is not there is still not there", () => {
+  assert.throws(
+    () => resolveRecipient("Nao Existe Esse Grupo", SEARCH_ROSTER),
+    (e) => e.statusCode === 404,
+  );
+});
+
+test("search: a miss names the closest wordings, so a typo is correctable", () => {
+  assert.throws(
+    () => resolveRecipient("Casa dos Meninos", SEARCH_ROSTER),
+    (e) => /Closest by wording/.test(e.message) && /Casa & Crianças/.test(e.message),
+  );
 });

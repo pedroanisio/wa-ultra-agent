@@ -64,14 +64,62 @@ type rig struct {
 }
 
 type captureSender struct {
-	to   types.JID
-	body string
+	to       types.JID
+	body     string
+	uploaded []byte
 }
 
 func (c *captureSender) SendMessage(_ context.Context, to types.JID, msg *waE2E.Message,
 	_ ...whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error) {
 	c.to, c.body = to, msg.GetConversation()
 	return whatsmeow.SendResponse{ID: "3EB0SENT", Timestamp: time.Unix(1786000000, 0)}, nil
+}
+
+// The builders are exercised in the httpapi package's own tests; this rig cares
+// about the pipeline, so they construct the minimum that identifies the arm.
+func (c *captureSender) BuildRevoke(_, _ types.JID, id types.MessageID) *waE2E.Message {
+	return &waE2E.Message{ProtocolMessage: &waE2E.ProtocolMessage{
+		Type: waE2E.ProtocolMessage_REVOKE.Enum(),
+	}}
+}
+
+func (c *captureSender) BuildEdit(_ types.JID, _ types.MessageID,
+	newContent *waE2E.Message) *waE2E.Message {
+	return &waE2E.Message{EditedMessage: &waE2E.FutureProofMessage{Message: newContent}}
+}
+
+func (c *captureSender) BuildReaction(_, _ types.JID, _ types.MessageID,
+	reaction string) *waE2E.Message {
+	return &waE2E.Message{ReactionMessage: &waE2E.ReactionMessage{
+		Text: proto.String(reaction),
+	}}
+}
+
+func (c *captureSender) BuildPollCreation(name string, _ []string, _ int) *waE2E.Message {
+	return &waE2E.Message{PollCreationMessage: &waE2E.PollCreationMessage{
+		Name: proto.String(name),
+	}}
+}
+
+func (c *captureSender) BuildPollVote(_ context.Context, _ *types.MessageInfo,
+	_ []string) (*waE2E.Message, error) {
+	return &waE2E.Message{PollUpdateMessage: &waE2E.PollUpdateMessage{}}, nil
+}
+
+func (c *captureSender) SendChatPresence(_ context.Context, _ types.JID,
+	_ types.ChatPresence, _ types.ChatPresenceMedia) error {
+	return nil
+}
+
+func (c *captureSender) Upload(_ context.Context, plaintext []byte,
+	_ whatsmeow.MediaType) (whatsmeow.UploadResponse, error) {
+	c.uploaded = plaintext
+	return whatsmeow.UploadResponse{
+		URL:        "https://mmg.whatsapp.net/e2e",
+		DirectPath: "/e2e/path",
+		MediaKey:   []byte("e2e-media-key"),
+		FileLength: uint64(len(plaintext)),
+	}, nil
 }
 
 // pairingStub stands in for the parts that need a linked device. Everything the
@@ -102,6 +150,14 @@ func (p pairingStub) BeginQRPairing(context.Context) (<-chan whatsmeow.QRChannel
 func (p pairingStub) Contacts(context.Context) (map[types.JID]types.ContactInfo, error) {
 	return map[types.JID]types.ContactInfo{
 		types.NewJID(senderPhone, types.DefaultUserServer): {PushName: "Pim", FullName: "Pim Example"},
+	}, nil
+}
+func (p pairingStub) Self() (types.JID, bool) {
+	return types.NewJID(senderLID, types.HiddenUserServer), true
+}
+func (p pairingStub) Groups(context.Context) ([]types.GroupInfo, error) {
+	return []types.GroupInfo{
+		{JID: types.NewJID(groupID, types.GroupServer), GroupName: types.GroupName{Name: "Group Subject"}},
 	}, nil
 }
 func (p pairingStub) DownloadMedia(ctx context.Context, key string) (mediastore.Record, []byte, error) {
@@ -182,7 +238,7 @@ func newRig(t *testing.T, allowlist string) *rig {
 	t.Cleanup(server.Close)
 
 	return &rig{
-		dispatcher: session.NewDispatcher(resolver, queue, media, parserStub{}),
+		dispatcher: session.NewDispatcher(resolver, queue, media, parserStub{}, nil),
 		queue:      queue,
 		media:      media,
 		server:     server,

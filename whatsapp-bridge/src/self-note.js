@@ -7,15 +7,21 @@
  * why the two-phase prepare/commit dance does not apply here: the recipient is
  * a constant, so there is nothing for a human to confirm.
  *
- * The whole safety argument rests on one comparison — the conversation that is
- * open must be *exactly* the configured self chat. `openChat()` finds a chat by
- * typing into WhatsApp's search box and clicking the first result, so its answer
- * is a fuzzy match and must never be trusted on its own: "Joao" can open "Joao
- * Antunes". Everything below exists to make that mistake impossible rather than
- * unlikely.
+ * ── What changed with the protocol transport ────────────────────────────────
+ * The old safety argument rested entirely on one comparison: the conversation
+ * WhatsApp Web had open must be exactly the configured self chat, because
+ * `openChat()` typed into a search box and clicked the first result, and "Joao"
+ * can open "Joao Antunes". That whole class of mistake is gone. The transport
+ * addresses the note to the account's own JID, read from the device store and
+ * never accepted from a caller, so there is no name to match and nothing to
+ * mis-resolve — see `handleSendSelf` in the transport's httpapi.
  *
- * Kept free of Playwright so the rules can be tested without a browser; the
- * page-driving dependencies are injected.
+ * `WA_SELF_CHAT_NAME` is still required. It no longer routes anything, but it
+ * remains the switch that makes the feature live at all, and an operator who
+ * has not set it has not asked for an agent that writes to their WhatsApp.
+ *
+ * Kept free of transport specifics so the rules can be tested without a server;
+ * the sending dependency is injected.
  */
 
 /** A self-note is at most a context line plus the body. */
@@ -41,13 +47,27 @@ function refuse(message, statusCode) {
  * boolean on top of that would be ceremony, and this path displaces strictly
  * more dangerous ones.
  */
-export function assertSelfNoteConfigured(env = process.env) {
+export function assertSelfNoteEnabled(env = process.env) {
   if (env.WA_ALLOW_SELF_NOTE === "false") {
     throw refuse(
       'Self-notes are disabled. Remove WA_ALLOW_SELF_NOTE or set it to "true" to enable them.',
       403,
     );
   }
+}
+
+/**
+ * The switch, alone.
+ *
+ * Split out of the check below because the two questions stopped having the same
+ * answer. On the protocol transport the recipient is the account's OWN key, read
+ * from the live session — there is no title to compare, so `WA_SELF_CHAT_NAME`
+ * is not merely unnecessary, requiring it would send an operator to their phone
+ * to copy a string that nothing then uses. What both paths still share is the
+ * off switch.
+ */
+export function assertSelfNoteConfigured(env = process.env) {
+  assertSelfNoteEnabled(env);
 
   const name = (env.WA_SELF_CHAT_NAME || "").trim();
   if (!name) {
@@ -63,17 +83,17 @@ export function assertSelfNoteConfigured(env = process.env) {
 /**
  * Validate and trim the messages to write.
  *
- * The cap is not cosmetic. Every message is a separate click-type-Enter cycle
- * against a real browser, which is both slow and part of the automation
- * footprint that gets accounts banned. A digest belongs in one dense message.
+ * The cap is not cosmetic. Each message lands as its own notification on the
+ * operator's phone, so a burst is worse to receive than one dense note — and a
+ * digest is what a self-note is for.
  */
 export function normalizeMessages(messages) {
   if (!Array.isArray(messages)) throw refuse("messages must be an array of strings.", 400);
   if (messages.length === 0) throw refuse("Refusing to write an empty self-note.", 400);
   if (messages.length > MAX_MESSAGES) {
     throw refuse(
-      `A self-note is at most ${MAX_MESSAGES} messages and ${messages.length} were given. Each one ` +
-        "is a separate browser interaction, so write one dense message rather than a burst.",
+      `A self-note is at most ${MAX_MESSAGES} messages and ${messages.length} were given. ` +
+        "Write one dense message rather than a burst.",
       400,
     );
   }
@@ -93,58 +113,24 @@ export function normalizeMessages(messages) {
 }
 
 /**
- * The comparison the whole feature rests on.
+ * Write the note, through the transport.
  *
- * Exact, after trimming. Not `includes`, not case-folded: "Joao" is a prefix of
- * "Joao Peixoto", and a private draft delivered to a similarly-named contact is
- * precisely the accident this path exists to prevent. A case-only mismatch fails
- * closed and the message names both strings, which is a five-second fix; the
- * opposite default has no fix at all once the message is delivered.
+ * `send` is injected as `(message) => Promise` and is expected to be the
+ * transport's `POST /send/self`: it resolves the recipient itself, so this
+ * function never handles an address at all. Messages go one at a time and in
+ * order, because two notes are a context line followed by its body and reading
+ * them reversed is worse than useless.
  */
-export function assertSelfChatOpen(openTitle, expected) {
-  const actual = (openTitle || "").trim();
-  if (actual === expected) return;
-
-  throw refuse(
-    actual
-      ? `Expected the self chat "${expected}" to be open but found "${actual}". Refusing to write.`
-      : `No conversation is open; expected the self chat "${expected}". Refusing to write.`,
-    409,
-  );
-}
-
-/**
- * Open the self chat if it is not already open, verify it, then write.
- *
- * Dependencies are injected: `openChatTitle()` reads the header of whatever is
- * open, `openChat(query)` navigates by fuzzy search, and `typeAndSend(text)`
- * types one message and presses Enter.
- */
-export async function sendSelfNoteWith({ env, openChatTitle, openChat, typeAndSend }, { messages }) {
-  // Config and input first, so neither failure is reported as a browser problem.
-  const expected = assertSelfNoteConfigured(env);
+export async function sendSelfNoteWith({ env, send }, { messages }) {
+  // Config and input first, so neither failure is reported as a transport problem.
+  // The switch alone: the recipient is the account's own address, so there is
+  // no configured title left to honour. See assertSelfNoteEnabled.
+  assertSelfNoteEnabled(env);
   const outgoing = normalizeMessages(messages);
 
-  const current = (await openChatTitle()) || "";
-  if (current.trim() !== expected) {
-    const resolved = await openChat(expected);
-
-    // openChat reports what it believes it opened. Reject a fuzzy hit here…
-    if (!resolved?.exactMatch || resolved.opened !== expected) {
-      throw refuse(
-        `Searching for the self chat "${expected}" opened "${resolved?.opened || "nothing"}". ` +
-          "Refusing to write. Check WA_SELF_CHAT_NAME against the chat header.",
-        409,
-      );
-    }
-
-    // …and then do not trust it: re-read the header that is actually rendered.
-    assertSelfChatOpen(await openChatTitle(), expected);
+  const sent = [];
+  for (const message of outgoing) {
+    sent.push(await send(message));
   }
-
-  // Sequential on purpose. A failure part-way leaves a partial note, which is
-  // recoverable; interleaving two messages into a half-typed composer is not.
-  for (const text of outgoing) await typeAndSend(text);
-
-  return { sent: true, chat: expected, messages: outgoing, at: new Date().toISOString() };
+  return { sent: sent.length, messages: outgoing };
 }

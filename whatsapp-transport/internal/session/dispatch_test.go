@@ -82,11 +82,11 @@ func (m *recordingMedia) Put(_ context.Context, id, _, _ string, msg *waE2E.Mess
 }
 
 func dispatcher(sink Sink, parser WebMessageParser) *Dispatcher {
-	return NewDispatcher(identity.NewResolver(nil), sink, newRecordingMedia(), parser)
+	return NewDispatcher(identity.NewResolver(nil), sink, newRecordingMedia(), parser, nil)
 }
 
 func dispatcherWithMedia(sink Sink, media MediaSink, parser WebMessageParser) *Dispatcher {
-	return NewDispatcher(identity.NewResolver(nil), sink, media, parser)
+	return NewDispatcher(identity.NewResolver(nil), sink, media, parser, nil)
 }
 
 func voiceMessage(id string) *events.Message {
@@ -304,8 +304,11 @@ func TestUnrecognisedMessagesAreCountedButStored(t *testing.T) {
 	d := dispatcher(sink, stubParser{})
 
 	msg := liveMessage("3EB0AAA")
+	// Payments used to stand in for "unmapped" here; they are a described kind
+	// now, so the fixture moved to an arm a personal archive genuinely has no
+	// vocabulary for.
 	msg.Message = &waE2E.Message{
-		CancelPaymentRequestMessage: &waE2E.CancelPaymentRequestMessage{},
+		BotPlatformRegistrationSuccessMessage: &waE2E.FutureProofMessage{},
 	}
 
 	if err := d.Handle(context.Background(), msg); err != nil {
@@ -314,8 +317,13 @@ func TestUnrecognisedMessagesAreCountedButStored(t *testing.T) {
 	if len(sink.appended) != 1 {
 		t.Fatal("an unrecognised message was not stored")
 	}
-	if got := d.Counters(); got.Unrecognised != 1 || got.Messages != 1 {
+	got := d.Counters()
+	if got.Unrecognised != 1 || got.Messages != 1 {
 		t.Fatalf("counters = %+v", got)
+	}
+	// The count alone was never actionable — see NoteUnrecognised.
+	if got.UnrecognisedTypes["botPlatformRegistrationSuccessMessage"] != 1 {
+		t.Fatalf("the tally did not name the arm: %+v", got.UnrecognisedTypes)
 	}
 }
 
@@ -377,5 +385,109 @@ func TestAFailedMediaRecordStillQueuesTheMessage(t *testing.T) {
 	}
 	if got.Messages != 1 {
 		t.Fatalf("Messages = %d, want 1", got.Messages)
+	}
+}
+
+// ── Push-name recovery ──────────────────────────────────────────────────────
+//
+// History-sync messages carry no push name, and a first pairing is almost
+// entirely history. The bridge labels a chat from `pushName`, so without a
+// fallback the archive is a wall of `@lid` addresses with no name in it.
+
+type stubContacts struct {
+	byJID   map[string]types.ContactInfo
+	queried []string
+}
+
+func (s *stubContacts) GetContact(_ context.Context, user types.JID) (types.ContactInfo, error) {
+	s.queried = append(s.queried, user.String())
+	info, ok := s.byJID[user.String()]
+	if !ok {
+		return types.ContactInfo{}, nil
+	}
+	return info, nil
+}
+
+// historyMessage is a replayed message: phone-addressed, and with the empty
+// PushName that whatsmeow leaves on everything history sync produces.
+func historyMessage(id, phone string) *events.Message {
+	return &events.Message{
+		Info: types.MessageInfo{
+			MessageSource: types.MessageSource{
+				Chat:   types.NewJID(phone, types.DefaultUserServer),
+				Sender: types.NewJID(phone, types.DefaultUserServer),
+			},
+			ID:        id,
+			PushName:  "",
+			Timestamp: time.Date(2026, 8, 11, 14, 30, 0, 0, time.UTC),
+		},
+		Message: &waE2E.Message{Conversation: proto.String("olá")},
+	}
+}
+
+func TestPushNameFallsBackToTheContactStore(t *testing.T) {
+	const phone = "15550001111"
+	sink := &recordingSink{}
+	contacts := &stubContacts{byJID: map[string]types.ContactInfo{
+		types.NewJID(phone, types.DefaultUserServer).String(): {Found: true, PushName: "Ana Fixture"},
+	}}
+	d := NewDispatcher(identity.NewResolver(nil), sink, newRecordingMedia(), stubParser{}, contacts)
+
+	if err := d.Handle(context.Background(), historyMessage("3EB0FALLBACK", phone)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if len(sink.appended) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(sink.appended))
+	}
+	if got := sink.appended[0].PushName; got != "Ana Fixture" {
+		t.Fatalf("PushName = %q, want %q (queried: %v)", got, "Ana Fixture", contacts.queried)
+	}
+}
+
+func TestOperatorsOwnNameBeatsTheSelfAssertedOne(t *testing.T) {
+	const phone = "15550001111"
+	sink := &recordingSink{}
+	contacts := &stubContacts{byJID: map[string]types.ContactInfo{
+		types.NewJID(phone, types.DefaultUserServer).String(): {
+			Found: true, PushName: "@handle", FullName: "Ana Fixture",
+		},
+	}}
+	d := NewDispatcher(identity.NewResolver(nil), sink, newRecordingMedia(), stubParser{}, contacts)
+
+	if err := d.Handle(context.Background(), historyMessage("3EB0FULLNAME", phone)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if got := sink.appended[0].PushName; got != "Ana Fixture" {
+		t.Fatalf("PushName = %q, want the operator's own name for the contact", got)
+	}
+}
+
+func TestAdvertisedPushNameIsNeverOverwritten(t *testing.T) {
+	const phone = "15550001111"
+	sink := &recordingSink{}
+	contacts := &stubContacts{byJID: map[string]types.ContactInfo{
+		types.NewJID(phone, types.DefaultUserServer).String(): {Found: true, PushName: "stale"},
+	}}
+	d := NewDispatcher(identity.NewResolver(nil), sink, newRecordingMedia(), stubParser{}, contacts)
+
+	evt := historyMessage("3EB0LIVE", phone)
+	evt.Info.PushName = "fresh"
+	if err := d.Handle(context.Background(), evt); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if got := sink.appended[0].PushName; got != "fresh" {
+		t.Fatalf("PushName = %q, want the name the device advertised", got)
+	}
+}
+
+func TestMissingContactStoreIsNotAnError(t *testing.T) {
+	sink := &recordingSink{}
+	d := NewDispatcher(identity.NewResolver(nil), sink, newRecordingMedia(), stubParser{}, nil)
+
+	if err := d.Handle(context.Background(), historyMessage("3EB0NILSTORE", "5511900000003")); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if got := sink.appended[0].PushName; got != "" {
+		t.Fatalf("PushName = %q, want empty when no contact store is wired", got)
 	}
 }

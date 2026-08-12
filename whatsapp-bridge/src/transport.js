@@ -23,6 +23,7 @@
  */
 
 import { placeholderText } from "./message-kind.js";
+import { foldName } from "./recipients.js";
 
 /** Matches `DefaultDrainLimit` in internal/httpapi. */
 export const DEFAULT_DRAIN_LIMIT = 200;
@@ -100,6 +101,14 @@ export function toArchiveRow(payload) {
     caption: payload.caption || null,
     filename: payload.filename || null,
     durationSeconds: payload.durationSeconds ?? null,
+    // What this message is about, when it is about another one. A reaction, a
+    // poll vote and a pin are all meaningless without it.
+    targetKey: payload.targetKey || null,
+    // Only ever set on an `unknown` row: the protobuf arm nothing could
+    // describe, so the gap is answerable from the archive itself rather than by
+    // reading the protocol by hand.
+    unknownType: payload.unknownType || null,
+
     outgoing: Boolean(payload.outgoing),
     recognised: Boolean(payload.recognised),
     fromHistory: Boolean(payload.fromHistory),
@@ -159,31 +168,87 @@ function normaliseInstant(value) {
  * receives the message, so an ambiguous name is refused WITH its candidates and
  * the operator disambiguates. Silence is not an option and neither is a guess.
  *
+ * ── Groups are recipients too ───────────────────────────────────────────────
+ * A group carries `subject` and none of the three person-name fields, so it is
+ * matched on that. This is not a convenience: while the roster held only people,
+ * a short group name such as a two-letter one PREFIX-MATCHED a person and
+ * resolved to them, which is the same wrong-recipient failure this function
+ * exists to prevent, arriving through the one door it did not watch.
+ *
+ * Note that resolving correctly is still not the same as being sure. An exact
+ * subject beats a prefixed person here, but a caller that sends on a non-exact
+ * match reintroduces the bug — which is why `sendViaTransport` checks
+ * `assertResolvedMatches` rather than trusting `exactMatch` to be read.
+ *
  * @param name      What the caller asked for.
  * @param contacts  `GET /contacts` output — identity-keyed, never phone numbers.
+ * @param options   `groupsUnavailable`: the roster's own report that its group
+ *                  listing failed, so a miss can be described honestly.
  */
-export function resolveRecipient(name, contacts = []) {
+export function resolveRecipient(name, contacts = [], options = {}) {
   const wanted = normaliseName(name);
   if (!wanted) {
     throw new TransportError("transport: no recipient was named", { statusCode: 400 });
   }
 
-  const labelled = contacts.map((contact) => ({
-    contact,
-    labels: [contact.pushName, contact.fullName, contact.businessName]
-      .filter(Boolean)
-      .map(normaliseName),
-  }));
+  const wantedTokens = nameTokens(name);
+  const labelled = contacts.map((contact) => {
+    const names = [contact.pushName, contact.fullName, contact.businessName, contact.subject].filter(
+      Boolean,
+    );
+    return {
+      contact,
+      labels: names.map(normaliseName),
+      // Both the stripped and the raw form: `Familia (Ulian)` has to be
+      // reachable as "familia" AND as "familia ulian", because both are things
+      // the operator legitimately calls it.
+      tokenSets: names.map((label) => new Set([...nameTokens(label), ...nameTokens(String(label).replace(/[()]/g, " "))])),
+    };
+  });
 
+  // ── Tiers, tried in order, and the first non-empty one wins ────────────────
+  //
+  // Ordering is the whole safety argument. An exact fold beats a prefix, and a
+  // prefix beats "contains every word you typed", so a name that IS someone's
+  // name can never lose to a name that merely contains it: asking for "Ana"
+  // reaches Ana rather than being called ambiguous because "Ana Paula" exists.
+  // Within a tier, more than one match is refused rather than ranked — see
+  // below. A later tier is never consulted once an earlier one has matched.
   const exact = labelled.filter(({ labels }) => labels.includes(wanted));
-  const candidates = exact.length
-    ? exact
-    : labelled.filter(({ labels }) => labels.some((label) => label.startsWith(wanted)));
+  const prefixed = labelled.filter(({ labels }) => labels.some((label) => label.startsWith(wanted)));
+  const byWords =
+    wantedTokens.length === 0
+      ? []
+      : labelled.filter(({ tokenSets }) =>
+          tokenSets.some((set) => wantedTokens.every((token) => set.has(token))),
+        );
+
+  const candidates = exact.length ? exact : prefixed.length ? prefixed : byWords;
 
   if (candidates.length === 0) {
+    // A roster that failed to list its groups cannot support the claim that this
+    // name does not exist, and saying so anyway sends the operator to look for a
+    // typo instead of at a transport that is not fully connected.
+    if (options.groupsUnavailable) {
+      throw new TransportError(
+        `transport: no contact matches "${name}", and the roster's group listing failed ` +
+          `(${options.groupsUnavailable}) — so if "${name}" is a group, it is missing from the ` +
+          "roster rather than absent from the account. Retry once the transport is connected.",
+        { statusCode: 503 },
+      );
+    }
+    // Near misses are worth naming: the usual cause of a miss is not a name
+    // that is absent but a name that is spelled slightly differently, and the
+    // operator cannot correct what they cannot see.
+    const near = labelled
+      .filter(({ tokenSets }) => tokenSets.some((set) => wantedTokens.some((token) => set.has(token))))
+      .map(({ contact }) => contact.subject || contact.pushName || contact.fullName)
+      .filter(Boolean)
+      .slice(0, 5);
     throw new TransportError(
       `transport: no contact matches "${name}". The roster only contains people this account has ` +
-        "actually corresponded with, so a name that never appears there cannot be addressed.",
+        "actually corresponded with, so a name that never appears there cannot be addressed." +
+        (near.length ? ` Closest by wording: ${near.map((n) => `"${n}"`).join(", ")}.` : ""),
       { statusCode: 404 },
     );
   }
@@ -191,7 +256,9 @@ export function resolveRecipient(name, contacts = []) {
   if (candidates.length > 1) {
     // The labels, not the keys: a key is a stable per-person identifier and
     // printing one into an error that will be logged republishes it.
-    const names = candidates.map(({ contact }) => contact.pushName || contact.fullName).join(", ");
+    const names = candidates
+      .map(({ contact }) => contact.subject || contact.pushName || contact.fullName)
+      .join(", ");
     throw new TransportError(
       `transport: "${name}" is ambiguous — it matches ${candidates.length} contacts (${names}). ` +
         "Refusing to choose, because choosing wrong sends a private message to the wrong person.",
@@ -214,15 +281,45 @@ export function resolveRecipient(name, contacts = []) {
 
   return {
     to: contact.key,
-    matchedName: contact.pushName || contact.fullName || contact.businessName || null,
+    matchedName:
+      contact.pushName || contact.fullName || contact.businessName || contact.subject || null,
     exactMatch: exact.length === 1,
   };
 }
 
 /** Case- and whitespace-insensitive, so a line-wrapped or padded name still matches. */
-function normaliseName(value) {
-  return String(value ?? "").trim().replace(/\s+/g, " ").toLowerCase();
+// The fold lives in recipients.js and is imported, deliberately. It used to be
+// duplicated here, the two copies drifted, and the result was a group this
+// resolver could find and the bridge's own allowlist check then rejected.
+const normaliseName = foldName;
+
+/**
+ * The same fold, reduced to its words.
+ *
+ * Separators vary by whoever named the chat — commas, plus signs, ampersands,
+ * hyphens — and none of them survive being said out loud. Comparing word sets
+ * is what lets `Rex + Pals` be found as `rex pals`.
+ */
+function nameTokens(value) {
+  return (
+    normaliseName(value)
+      // Parentheses are separators here, not deletions: `Familia (Ulian)` is
+      // said as "familia ulian", and normaliseName drops a trailing parenthetical
+      // wholesale so that `Ana (You)` still equals `Ana`.
+      .replace(/[()]/g, " ")
+      .replace(/[^\p{L}\p{N}]+/gu, " ")
+      .split(" ")
+      .filter(Boolean)
+      // Conjunctions that people write as separators. `Casa & Crianças` is
+      // typed back as "casa e criancas" and `Rex + Pals` as "rex and pals"; the
+      // word is the punctuation, spelled out. Dropped from BOTH sides, so it
+      // cannot make a name match one it does not.
+      .filter((token) => !CONJUNCTIONS.has(token))
+  );
 }
+
+/** Written as separators in chat names, not as part of anybody's name. */
+const CONJUNCTIONS = new Set(["e", "and", "y", "und"]);
 
 /**
  * The HTTP client.
@@ -237,6 +334,38 @@ export function createTransport({
   fetch: fetchImpl = globalThis.fetch,
 } = {}) {
   const root = String(baseUrl).replace(/\/+$/, "");
+
+  /**
+   * Fetch bytes, not JSON.
+   *
+   * `/media` answers with the attachment itself — a Content-Type header and a
+   * body of image bytes — because the transport has no reason to base64 a
+   * payload for a consumer on the same host. Running that through `request()`
+   * hands the bytes to `JSON.parse`, which is how a photo reached the agent as
+   * "a raw, malformed JPEG": nothing was corrupt, it was simply never JSON.
+   */
+  const requestBytes = async (path) => {
+    const response = await fetchImpl(`${root}${path}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+
+    if (!response.ok) {
+      const detail = await errorDetail(response);
+      throw new TransportError(`transport: GET ${path} failed (${response.status}): ${detail}`, {
+        statusCode: response.status,
+      });
+    }
+
+    const buffer = Buffer.from(await response.arrayBuffer());
+    const disposition = response.headers.get("content-disposition") || "";
+    const filename = /filename="([^"]*)"/.exec(disposition)?.[1];
+    return {
+      bytes: buffer,
+      mediaType: response.headers.get("content-type") || "application/octet-stream",
+      sizeBytes: buffer.length,
+      ...(filename ? { filename } : {}),
+    };
+  };
 
   const request = async (path, { method = "GET", body } = {}) => {
     const response = await fetchImpl(`${root}${path}`, {
@@ -286,8 +415,88 @@ export function createTransport({
      */
     contacts: () => request("/contacts"),
 
+    /** One message's media bytes, addressed by the protocol's own message id. */
+    media: (key) => requestBytes(`/media?key=${encodeURIComponent(key)}`),
+
+    /**
+     * Ask the phone for messages older than one already held.
+     *
+     * Depth is whatever the phone still has, not whatever WhatsApp's servers
+     * have — see the transport's RequestHistory.
+     */
+    history: ({ chat, oldestId, oldestFromMe, oldestTimestamp, count }) =>
+      request("/history", {
+        method: "POST",
+        body: { chat, oldestId, oldestFromMe, oldestTimestamp, count },
+      }),
+
     /** `to` must be a JID. Names are resolved by recipients.js, before this. */
-    send: ({ to, message }) => request("/send", { method: "POST", body: { to, message } }),
+    send: ({ to, message, quoted }) =>
+      request("/send", { method: "POST", body: { to, message, quoted } }),
+
+    /**
+     * Write to the operator's own chat.
+     *
+     * Deliberately takes NO recipient. The transport resolves the account's own
+     * address from its device store, so there is no argument here that could
+     * redirect the note — which is the whole reason this route may skip the send
+     * allowlist while `send` above may not. Returns `{id, sentAt}`.
+     */
+    sendSelf: (message) => request("/send/self", { method: "POST", body: { message } }),
+
+
+    /**
+     * An image, as base64. `to` is a JID, for the same reason as `send`.
+     *
+     * The bytes go over as base64 rather than as a multipart upload because this
+     * hop is loopback between two processes we own — the encoding cost is
+     * irrelevant next to the media upload that follows, and a JSON body keeps
+     * the client, the fake in the tests, and the Go handler all reading the same
+     * shape.
+     */
+    sendMedia: ({
+      to, kind, mimetype, caption, filename, dataBase64, width, height, durationSeconds, quoted,
+    }) =>
+      request("/send/media", {
+        method: "POST",
+        body: {
+          to, kind, mimetype, caption, filename, dataBase64, width, height, durationSeconds, quoted,
+        },
+      }),
+
+    /** React to a message, or remove a reaction by passing an empty emoji. */
+    sendReaction: ({ to, messageId, emoji, sender }) =>
+      request("/send/reaction", { method: "POST", body: { to, messageId, emoji, sender } }),
+
+    /** Delete a message for everyone. */
+    sendRevoke: ({ to, messageId, sender }) =>
+      request("/send/revoke", { method: "POST", body: { to, messageId, sender } }),
+
+    /** Replace the text of a message already sent. */
+    sendEdit: ({ to, messageId, message }) =>
+      request("/send/edit", { method: "POST", body: { to, messageId, message } }),
+
+    /** Ask a question with fixed answers. */
+    sendPoll: ({ to, name, options, selectableCount }) =>
+      request("/send/poll", { method: "POST", body: { to, name, options, selectableCount } }),
+
+    /** Vote in a poll somebody else asked. `messageId` names that poll. */
+    sendPollVote: ({ to, messageId, sender, options }) =>
+      request("/send/poll/vote", { method: "POST", body: { to, messageId, sender, options } }),
+
+    /** Show or clear the typing indicator. */
+    presence: ({ to, state, media }) =>
+      request("/presence", { method: "POST", body: { to, state, media } }),
+
+    /**
+     * An image to the operator's own chat. No recipient, because there is only
+     * one it could be — the same reason `sendSelf` takes no address.
+     */
+    sendSelfMedia: ({ kind, mimetype, caption, filename, dataBase64, width, height, durationSeconds }) =>
+      request("/send/self/media", {
+        method: "POST",
+        body: { kind, mimetype, caption, filename, dataBase64, width, height, durationSeconds },
+      }),
 
     outbox: ({ limit = DEFAULT_DRAIN_LIMIT } = {}) => {
       const bounded = Math.max(1, Math.min(Number(limit) || DEFAULT_DRAIN_LIMIT, MAX_DRAIN_LIMIT));
@@ -328,7 +537,11 @@ async function errorDetail(response) {
  * reason the store skips unwritable rows: one bad entry must not wedge the queue
  * behind it forever.
  */
-export async function drainOnce({ transport, store, limit = DEFAULT_DRAIN_LIMIT }) {
+function onMessageError(error) {
+  console.error("transport: self-chat router failed:", error?.message || error);
+}
+
+export async function drainOnce({ transport, store, limit = DEFAULT_DRAIN_LIMIT, onMessage }) {
   const { entries = [], depth = 0, dropped = 0 } = await transport.outbox({ limit });
 
   if (entries.length === 0) {
@@ -350,6 +563,20 @@ export async function drainOnce({ transport, store, limit = DEFAULT_DRAIN_LIMIT 
 
   const through = entries.reduce((highest, entry) => Math.max(highest, Number(entry.seq) || 0), 0);
   await transport.ack(through);
+
+  // After the write AND the ack, deliberately. `onMessage` is where the self-chat
+  // command router runs, and a router that throws must not cost the archive a
+  // message or replay a batch: the drain's contract is at-least-once delivery to
+  // the STORE, and nothing else may weaken it. Failures are reported and dropped.
+  if (onMessage) {
+    for (const entry of entries) {
+      try {
+        await onMessage(entry.payload);
+      } catch (error) {
+        onMessageError(error);
+      }
+    }
+  }
 
   return {
     fetched: entries.length,
@@ -384,6 +611,7 @@ export function startDrain({
   onDrain,
   onError,
   onGap,
+  onMessage,
 } = {}) {
   let stopped = false;
   let running = false;
@@ -396,7 +624,7 @@ export function startDrain({
     if (stopped || running) return;
     running = true;
     try {
-      const outcome = await drainOnce({ transport, store, limit });
+      const outcome = await drainOnce({ transport, store, limit, onMessage });
 
       if (onGap && outcome.dropped > 0 && outcome.dropped !== lastDropped) {
         onGap(outcome.dropped);
@@ -425,6 +653,6 @@ export function startDrain({
     },
     // Exposed for tests and for a manual /transport/drain call: a drain the
     // operator asked for should not wait for the next tick.
-    drainNow: () => drainOnce({ transport, store, limit }),
+    drainNow: () => drainOnce({ transport, store, limit, onMessage }),
   };
 }

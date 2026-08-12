@@ -12,8 +12,10 @@ import (
 	"time"
 
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/proto/waCommon"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/types"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/pedroanisio/whatsapp-agent/whatsapp-transport/internal/identity"
 	"github.com/pedroanisio/whatsapp-agent/whatsapp-transport/internal/mediastore"
@@ -35,6 +37,8 @@ type fakeSession struct {
 	paired      bool
 	contacts    map[types.JID]types.ContactInfo
 	contactsErr error
+	groups      []types.GroupInfo
+	groupsErr   error
 	connectErr  error
 
 	mediaRecord mediastore.Record
@@ -67,6 +71,15 @@ func (f *fakeSession) BeginQRPairing(context.Context) (<-chan whatsmeow.QRChanne
 }
 func (f *fakeSession) Contacts(context.Context) (map[types.JID]types.ContactInfo, error) {
 	return f.contacts, f.contactsErr
+}
+func (f *fakeSession) Groups(context.Context) ([]types.GroupInfo, error) {
+	return f.groups, f.groupsErr
+}
+func (f *fakeSession) Self() (types.JID, bool) {
+	if !f.paired {
+		return types.JID{}, false
+	}
+	return lidJID(allowedLID), true
 }
 func (f *fakeSession) DownloadMedia(_ context.Context, key string) (mediastore.Record, []byte, error) {
 	if f.mediaErr != nil {
@@ -101,7 +114,30 @@ func (q *fakeQueue) Stats(context.Context) (outbox.Stats, error) { return q.stat
 type fakeSender struct {
 	sentTo   types.JID
 	sentBody string
+	sentMsg  *waE2E.Message
 	err      error
+
+	uploaded  []byte
+	uploadErr error
+
+	votedOn  *types.MessageInfo
+	voteErr  error
+	presence string
+}
+
+func (s *fakeSender) BuildPollVote(_ context.Context, poll *types.MessageInfo,
+	options []string) (*waE2E.Message, error) {
+	if s.voteErr != nil {
+		return nil, s.voteErr
+	}
+	s.votedOn = poll
+	return &waE2E.Message{PollUpdateMessage: &waE2E.PollUpdateMessage{}}, nil
+}
+
+func (s *fakeSender) SendChatPresence(_ context.Context, _ types.JID,
+	state types.ChatPresence, _ types.ChatPresenceMedia) error {
+	s.presence = string(state)
+	return nil
 }
 
 func (s *fakeSender) SendMessage(_ context.Context, to types.JID, msg *waE2E.Message,
@@ -111,7 +147,59 @@ func (s *fakeSender) SendMessage(_ context.Context, to types.JID, msg *waE2E.Mes
 	}
 	s.sentTo = to
 	s.sentBody = msg.GetConversation()
+	s.sentMsg = msg
 	return whatsmeow.SendResponse{ID: "3EB0SENT", Timestamp: time.Unix(1786000000, 0)}, nil
+}
+
+// The builders are whatsmeow's real ones in production. Here they construct the
+// same shapes so the handler's choice of arm and key is what is under test, not
+// whatsmeow's protobuf assembly.
+func (s *fakeSender) BuildRevoke(chat, sender types.JID, id types.MessageID) *waE2E.Message {
+	return &waE2E.Message{ProtocolMessage: &waE2E.ProtocolMessage{
+		Type: waE2E.ProtocolMessage_REVOKE.Enum(),
+		Key:  &waCommon.MessageKey{ID: proto.String(id)},
+	}}
+}
+
+func (s *fakeSender) BuildEdit(chat types.JID, id types.MessageID,
+	newContent *waE2E.Message) *waE2E.Message {
+	return &waE2E.Message{EditedMessage: &waE2E.FutureProofMessage{Message: newContent}}
+}
+
+func (s *fakeSender) BuildReaction(chat, sender types.JID, id types.MessageID,
+	reaction string) *waE2E.Message {
+	return &waE2E.Message{ReactionMessage: &waE2E.ReactionMessage{
+		Key:  &waCommon.MessageKey{ID: proto.String(id)},
+		Text: proto.String(reaction),
+	}}
+}
+
+func (s *fakeSender) BuildPollCreation(name string, options []string,
+	selectableCount int) *waE2E.Message {
+	poll := &waE2E.PollCreationMessage{Name: proto.String(name)}
+	for _, option := range options {
+		poll.Options = append(poll.Options, &waE2E.PollCreationMessage_Option{
+			OptionName: proto.String(option),
+		})
+	}
+	return &waE2E.Message{PollCreationMessage: poll}
+}
+
+func (s *fakeSender) Upload(_ context.Context, plaintext []byte,
+	_ whatsmeow.MediaType) (whatsmeow.UploadResponse, error) {
+	if s.uploadErr != nil {
+		return whatsmeow.UploadResponse{}, s.uploadErr
+	}
+	s.uploaded = plaintext
+	length := uint64(len(plaintext))
+	return whatsmeow.UploadResponse{
+		URL:           "https://mmg.whatsapp.net/fixture",
+		DirectPath:    "/fixture/path",
+		MediaKey:      []byte("fixture-media-key"),
+		FileEncSHA256: []byte("fixture-enc-sha"),
+		FileSHA256:    []byte("fixture-sha"),
+		FileLength:    length,
+	}, nil
 }
 
 // ── Harness ─────────────────────────────────────────────────────────────────
@@ -178,6 +266,39 @@ func (h *harness) do(t *testing.T, method, path, body, bearer string) *httptest.
 }
 
 func lidJID(user string) types.JID { return types.NewJID(user, types.HiddenUserServer) }
+
+// stubLIDs makes a phone JID resolve to a LID, which is what makes one person
+// appear under two addresses — the condition the roster has to collapse.
+type stubLIDs struct{ pnToLID map[string]string }
+
+func (s stubLIDs) GetLIDForPN(_ context.Context, pn types.JID) (types.JID, error) {
+	if lid, ok := s.pnToLID[pn.User]; ok {
+		return types.NewJID(lid, types.HiddenUserServer), nil
+	}
+	return types.JID{}, nil
+}
+
+// harnessWithLIDs is the harness with a resolver that knows one phone/LID pair.
+func harnessWithLIDs(t *testing.T) *harness {
+	t.Helper()
+	resolver := identity.NewResolver(stubLIDs{pnToLID: map[string]string{allowedPhone: otherLID}})
+	guard, err := sendguard.New(context.Background(), func(string) string { return "" }, resolver)
+	if err != nil {
+		t.Fatalf("sendguard.New: %v", err)
+	}
+	h := &harness{session: &fakeSession{paired: true}, queue: &fakeQueue{}, sender: &fakeSender{}}
+	api, err := New(Config{
+		Token: token, Session: h.session, Queue: h.queue,
+		Sender: h.sender, Guard: guard, Resolver: resolver,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	h.api = api
+	return h
+}
+
+func groupJID(user string) types.JID { return types.NewJID(user, types.GroupServer) }
 
 // ── Authentication ──────────────────────────────────────────────────────────
 
@@ -290,6 +411,541 @@ func TestSendDeliversToAnAllowlistedRecipient(t *testing.T) {
 	}
 	if got["id"] != "3EB0SENT" {
 		t.Fatalf("id = %v", got["id"])
+	}
+}
+
+// ── Sending media ───────────────────────────────────────────────────────────
+
+const fixturePNG = "iVBORw0KGgoAAAANSUhEUg==" // not a valid image; the API never decodes one
+
+func TestSendMediaUploadsThenSendsAnImageCarryingTheUploadsFields(t *testing.T) {
+	h := newHarness(t, lidJID(allowedLID).String(), true)
+
+	body := `{"to":"` + lidJID(allowedLID).String() + `","mimetype":"image/png",` +
+		`"caption":"Autopsicografia","dataBase64":"` + fixturePNG + `","width":1080,"height":1350}`
+	rec := h.do(t, "POST", "/send/media", body, token)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if len(h.sender.uploaded) == 0 {
+		t.Fatal("nothing was uploaded")
+	}
+
+	image := h.sender.sentMsg.GetImageMessage()
+	if image == nil {
+		t.Fatalf("the sent message is not an image: %v", h.sender.sentMsg)
+	}
+	// The whole contract of an image send: the upload's addressing fields must
+	// arrive on the message, or the recipient gets an undecryptable bubble.
+	if image.GetURL() != "https://mmg.whatsapp.net/fixture" {
+		t.Fatalf("URL = %q", image.GetURL())
+	}
+	if image.GetDirectPath() != "/fixture/path" {
+		t.Fatalf("DirectPath = %q", image.GetDirectPath())
+	}
+	if string(image.GetMediaKey()) != "fixture-media-key" {
+		t.Fatalf("MediaKey = %q", image.GetMediaKey())
+	}
+	if string(image.GetFileEncSHA256()) != "fixture-enc-sha" {
+		t.Fatalf("FileEncSHA256 = %q", image.GetFileEncSHA256())
+	}
+	if image.GetFileLength() != uint64(len(h.sender.uploaded)) {
+		t.Fatalf("FileLength = %d, want %d", image.GetFileLength(), len(h.sender.uploaded))
+	}
+	if image.GetCaption() != "Autopsicografia" {
+		t.Fatalf("Caption = %q", image.GetCaption())
+	}
+	if image.GetWidth() != 1080 || image.GetHeight() != 1350 {
+		t.Fatalf("dimensions = %dx%d", image.GetWidth(), image.GetHeight())
+	}
+}
+
+// Uploading before checking would put the operator's picture on WhatsApp's CDN
+// on behalf of a recipient who was never permitted.
+func TestSendMediaRefusesAnUnallowlistedRecipientWithoutUploading(t *testing.T) {
+	h := newHarness(t, lidJID(allowedLID).String(), true)
+
+	body := `{"to":"` + lidJID(otherLID).String() + `","mimetype":"image/png","dataBase64":"` +
+		fixturePNG + `"}`
+	rec := h.do(t, "POST", "/send/media", body, token)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", rec.Code)
+	}
+	if h.sender.uploaded != nil {
+		t.Fatal("the attachment was uploaded before the recipient was permitted")
+	}
+}
+
+// SVG is the realistic mistake: it is the natural thing to generate, and every
+// recipient's client would show a file it cannot render.
+func TestSendMediaRejectsATypeWhatsAppCannotRender(t *testing.T) {
+	h := newHarness(t, lidJID(allowedLID).String(), true)
+
+	body := `{"to":"` + lidJID(allowedLID).String() + `","mimetype":"image/svg+xml",` +
+		`"dataBase64":"` + fixturePNG + `"}`
+	rec := h.do(t, "POST", "/send/media", body, token)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "image/png") {
+		t.Fatalf("the error does not say what IS accepted: %s", rec.Body.String())
+	}
+	if h.sender.uploaded != nil {
+		t.Fatal("an unsendable type was uploaded anyway")
+	}
+}
+
+func TestSendMediaRejectsAnEmptyOrUndecodableAttachment(t *testing.T) {
+	h := newHarness(t, lidJID(allowedLID).String(), true)
+	to := lidJID(allowedLID).String()
+
+	for _, tc := range []struct{ name, data string }{
+		{"missing", ""},
+		{"not base64", "!!!!not base64!!!!"},
+		{"decodes to nothing", "===="},
+	} {
+		body := `{"to":"` + to + `","mimetype":"image/png","dataBase64":"` + tc.data + `"}`
+		if rec := h.do(t, "POST", "/send/media", body, token); rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s: status = %d, want 400: %s", tc.name, rec.Code, rec.Body.String())
+		}
+	}
+	if h.sender.uploaded != nil {
+		t.Fatal("an empty attachment reached the upload")
+	}
+}
+
+// A failed upload must not be reported as a failed SEND: the operator would go
+// looking at the recipient for a fault that is in the media pipeline.
+func TestSendMediaReportsAnUploadFailureDistinctly(t *testing.T) {
+	h := newHarness(t, lidJID(allowedLID).String(), true)
+	h.sender.uploadErr = errors.New("cdn refused the upload")
+
+	body := `{"to":"` + lidJID(allowedLID).String() + `","mimetype":"image/png","dataBase64":"` +
+		fixturePNG + `"}`
+	rec := h.do(t, "POST", "/send/media", body, token)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "uploading") {
+		t.Fatalf("the error does not identify the failing step: %s", rec.Body.String())
+	}
+	if h.sender.sentMsg != nil {
+		t.Fatal("a message was sent after the upload failed")
+	}
+}
+
+// ── Every media kind, not just images ───────────────────────────────────────
+//
+// The upload is identical for all of them; what differs is the MediaType it is
+// uploaded under and the protobuf arm it is sent in. Sending a video inside an
+// ImageMessage produces a bubble that never renders, so the pairing is the whole
+// contract and each kind is asserted separately.
+func TestSendMediaBuildsTheArmThatMatchesTheKind(t *testing.T) {
+	cases := []struct {
+		kind     string
+		mimetype string
+		check    func(*testing.T, *waE2E.Message)
+	}{
+		{"image", "image/png", func(t *testing.T, m *waE2E.Message) {
+			if m.GetImageMessage() == nil {
+				t.Fatal("not an ImageMessage")
+			}
+		}},
+		{"video", "video/mp4", func(t *testing.T, m *waE2E.Message) {
+			if m.GetVideoMessage() == nil {
+				t.Fatal("not a VideoMessage")
+			}
+		}},
+		{"audio", "audio/mp4", func(t *testing.T, m *waE2E.Message) {
+			if m.GetAudioMessage() == nil {
+				t.Fatal("not an AudioMessage")
+			}
+			if m.GetAudioMessage().GetPTT() {
+				t.Fatal("an audio file was marked as a voice note")
+			}
+		}},
+		{"voice", "audio/ogg; codecs=opus", func(t *testing.T, m *waE2E.Message) {
+			// PTT is the whole difference between somebody speaking and a file
+			// somebody attached, and only the first shows as a voice note.
+			if !m.GetAudioMessage().GetPTT() {
+				t.Fatal("a voice note was sent without PTT, so it renders as a file")
+			}
+		}},
+		{"document", "application/pdf", func(t *testing.T, m *waE2E.Message) {
+			if m.GetDocumentMessage() == nil {
+				t.Fatal("not a DocumentMessage")
+			}
+			if m.GetDocumentMessage().GetFileName() != "boleto.pdf" {
+				t.Fatalf("filename = %q", m.GetDocumentMessage().GetFileName())
+			}
+		}},
+		{"sticker", "image/webp", func(t *testing.T, m *waE2E.Message) {
+			if m.GetStickerMessage() == nil {
+				t.Fatal("not a StickerMessage")
+			}
+		}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.kind, func(t *testing.T) {
+			h := newHarness(t, lidJID(allowedLID).String(), true)
+			body := `{"to":"` + lidJID(allowedLID).String() + `","kind":"` + tc.kind +
+				`","mimetype":"` + tc.mimetype + `","filename":"boleto.pdf","dataBase64":"` +
+				fixturePNG + `"}`
+
+			rec := h.do(t, "POST", "/send/media", body, token)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+			}
+			tc.check(t, h.sender.sentMsg)
+		})
+	}
+}
+
+// An unknown kind must be refused rather than quietly sent as an image: a video
+// in an ImageMessage is a bubble nobody can open.
+func TestSendMediaRefusesAKindItCannotBuild(t *testing.T) {
+	h := newHarness(t, lidJID(allowedLID).String(), true)
+	body := `{"to":"` + lidJID(allowedLID).String() +
+		`","kind":"hologram","mimetype":"image/png","dataBase64":"` + fixturePNG + `"}`
+
+	rec := h.do(t, "POST", "/send/media", body, token)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400: %s", rec.Code, rec.Body.String())
+	}
+	if h.sender.uploaded != nil {
+		t.Fatal("an unbuildable kind was uploaded anyway")
+	}
+}
+
+// The image restriction was right for images and wrong as a global rule: a PDF
+// is not an image, and a transport that only sends PNGs cannot send a document.
+func TestSendMediaAcceptsNonImageTypesForNonImageKinds(t *testing.T) {
+	h := newHarness(t, lidJID(allowedLID).String(), true)
+	body := `{"to":"` + lidJID(allowedLID).String() +
+		`","kind":"document","mimetype":"application/pdf","dataBase64":"` + fixturePNG + `"}`
+
+	if rec := h.do(t, "POST", "/send/media", body, token); rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// Defaulting to image keeps every existing caller working: the route was
+// image-only when it shipped and `kind` did not exist.
+func TestSendMediaWithoutAKindIsStillAnImage(t *testing.T) {
+	h := newHarness(t, lidJID(allowedLID).String(), true)
+	body := `{"to":"` + lidJID(allowedLID).String() +
+		`","mimetype":"image/png","dataBase64":"` + fixturePNG + `"}`
+
+	if rec := h.do(t, "POST", "/send/media", body, token); rec.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	if h.sender.sentMsg.GetImageMessage() == nil {
+		t.Fatal("an unspecified kind did not default to an image")
+	}
+}
+
+// ── Reactions, edits, deletions, polls ──────────────────────────────────────
+
+func TestSendReactionCarriesTheEmojiAndItsTarget(t *testing.T) {
+	h := newHarness(t, lidJID(allowedLID).String(), true)
+	body := `{"to":"` + lidJID(allowedLID).String() + `","messageId":"3EB0TARGET","emoji":"❤️"}`
+
+	rec := h.do(t, "POST", "/send/reaction", body, token)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	reaction := h.sender.sentMsg.GetReactionMessage()
+	if reaction.GetText() != "❤️" {
+		t.Fatalf("emoji = %q", reaction.GetText())
+	}
+	if reaction.GetKey().GetID() != "3EB0TARGET" {
+		t.Fatalf("target = %q", reaction.GetKey().GetID())
+	}
+}
+
+// An empty reaction is how WhatsApp REMOVES one, so it must not be rejected as
+// a missing field — that would make an applied reaction impossible to undo.
+func TestSendReactionAcceptsTheEmptyEmojiThatRemovesOne(t *testing.T) {
+	h := newHarness(t, lidJID(allowedLID).String(), true)
+	body := `{"to":"` + lidJID(allowedLID).String() + `","messageId":"3EB0TARGET","emoji":""}`
+
+	if rec := h.do(t, "POST", "/send/reaction", body, token); rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if h.sender.sentMsg.GetReactionMessage() == nil {
+		t.Fatal("removing a reaction sent no reaction message")
+	}
+}
+
+func TestSendRevokeDeletesForEveryone(t *testing.T) {
+	h := newHarness(t, lidJID(allowedLID).String(), true)
+	body := `{"to":"` + lidJID(allowedLID).String() + `","messageId":"3EB0TARGET"}`
+
+	rec := h.do(t, "POST", "/send/revoke", body, token)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	if h.sender.sentMsg.GetProtocolMessage().GetType() != waE2E.ProtocolMessage_REVOKE {
+		t.Fatalf("not a revocation: %v", h.sender.sentMsg)
+	}
+}
+
+func TestSendEditReplacesTheTextOfAnEarlierMessage(t *testing.T) {
+	h := newHarness(t, lidJID(allowedLID).String(), true)
+	body := `{"to":"` + lidJID(allowedLID).String() + `","messageId":"3EB0TARGET","message":"corrigido"}`
+
+	rec := h.do(t, "POST", "/send/edit", body, token)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	if h.sender.sentMsg.GetEditedMessage() == nil {
+		t.Fatalf("not an edit: %v", h.sender.sentMsg)
+	}
+}
+
+func TestSendPollCarriesItsQuestionAndOptions(t *testing.T) {
+	h := newHarness(t, lidJID(allowedLID).String(), true)
+	body := `{"to":"` + lidJID(allowedLID).String() +
+		`","name":"Jantar?","options":["Pizza","Sushi"],"selectableCount":1}`
+
+	rec := h.do(t, "POST", "/send/poll", body, token)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	poll := h.sender.sentMsg.GetPollCreationMessage()
+	if poll.GetName() != "Jantar?" || len(poll.GetOptions()) != 2 {
+		t.Fatalf("poll = %v", poll)
+	}
+}
+
+// A poll with one option is not a poll, and WhatsApp renders it as a dead end.
+func TestSendPollRefusesFewerThanTwoOptions(t *testing.T) {
+	h := newHarness(t, lidJID(allowedLID).String(), true)
+	body := `{"to":"` + lidJID(allowedLID).String() + `","name":"Jantar?","options":["Pizza"]}`
+
+	if rec := h.do(t, "POST", "/send/poll", body, token); rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+}
+
+// Every one of these sends as the operator, so every one is behind the same
+// allowlist as a plain message. A gate on `/send` alone would be no gate.
+func TestEveryOutboundRouteIsBehindTheAllowlist(t *testing.T) {
+	stranger := lidJID(otherLID).String()
+	for _, route := range []struct{ path, body string }{
+		{"/send/reaction", `{"to":"` + stranger + `","messageId":"X","emoji":"👍"}`},
+		{"/send/revoke", `{"to":"` + stranger + `","messageId":"X"}`},
+		{"/send/edit", `{"to":"` + stranger + `","messageId":"X","message":"hi"}`},
+		{"/send/poll", `{"to":"` + stranger + `","name":"?","options":["a","b"]}`},
+	} {
+		h := newHarness(t, lidJID(allowedLID).String(), true)
+		rec := h.do(t, "POST", route.path, route.body, token)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("%s: status = %d, want 403", route.path, rec.Code)
+		}
+		if h.sender.sentMsg != nil {
+			t.Fatalf("%s: sent to someone off the allowlist", route.path)
+		}
+	}
+}
+
+// ── Replying to a specific message ──────────────────────────────────────────
+//
+// An assistant that drafts replies could previously only send INTO a chat, never
+// reply TO the thing it was answering. In a group that is the difference between
+// an answer and a non sequitur.
+func TestSendQuotingAMessageCarriesTheContext(t *testing.T) {
+	h := newHarness(t, lidJID(allowedLID).String(), true)
+	body := `{"to":"` + lidJID(allowedLID).String() + `","message":"às 15h",` +
+		`"quoted":{"messageId":"3EB0QUOTED","sender":"` + lidJID(otherLID).String() + `"}}`
+
+	rec := h.do(t, "POST", "/send", body, token)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// A quote cannot ride on Conversation — that arm carries no context — so a
+	// quoting send must become an ExtendedTextMessage or the quote is dropped
+	// and the reply silently arrives unattached.
+	extended := h.sender.sentMsg.GetExtendedTextMessage()
+	if extended == nil {
+		t.Fatalf("a quoting send stayed a plain Conversation: %v", h.sender.sentMsg)
+	}
+	if extended.GetText() != "às 15h" {
+		t.Fatalf("text = %q", extended.GetText())
+	}
+	if extended.GetContextInfo().GetStanzaID() != "3EB0QUOTED" {
+		t.Fatalf("stanza = %q", extended.GetContextInfo().GetStanzaID())
+	}
+	if extended.GetContextInfo().GetParticipant() != lidJID(otherLID).String() {
+		t.Fatalf("participant = %q", extended.GetContextInfo().GetParticipant())
+	}
+}
+
+func TestSendWithoutAQuoteStaysAPlainConversation(t *testing.T) {
+	h := newHarness(t, lidJID(allowedLID).String(), true)
+	body := `{"to":"` + lidJID(allowedLID).String() + `","message":"oi"}`
+
+	h.do(t, "POST", "/send", body, token)
+	if h.sender.sentMsg.GetConversation() != "oi" {
+		t.Fatalf("an unquoted send was wrapped anyway: %v", h.sender.sentMsg)
+	}
+}
+
+func TestSendMediaCanQuoteTheMessageItAnswers(t *testing.T) {
+	h := newHarness(t, lidJID(allowedLID).String(), true)
+	body := `{"to":"` + lidJID(allowedLID).String() + `","mimetype":"image/png","dataBase64":"` +
+		fixturePNG + `","quoted":{"messageId":"3EB0QUOTED"}}`
+
+	rec := h.do(t, "POST", "/send/media", body, token)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	if h.sender.sentMsg.GetImageMessage().GetContextInfo().GetStanzaID() != "3EB0QUOTED" {
+		t.Fatalf("the image did not carry the quote: %v", h.sender.sentMsg)
+	}
+}
+
+// ── Voting in a poll ────────────────────────────────────────────────────────
+//
+// The vote is encrypted against a secret whatsmeow stored when the poll arrived,
+// keyed by the poll's chat, sender and id — so a caller needs only to name the
+// poll, and this transport keeps no extra state to make it possible.
+func TestSendPollVoteEncryptsAgainstTheNamedPoll(t *testing.T) {
+	h := newHarness(t, lidJID(allowedLID).String(), true)
+	body := `{"to":"` + lidJID(allowedLID).String() + `","messageId":"3EB0POLL",` +
+		`"sender":"` + lidJID(otherLID).String() + `","options":["Pizza"]}`
+
+	rec := h.do(t, "POST", "/send/poll/vote", body, token)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	if h.sender.votedOn == nil {
+		t.Fatal("no poll was identified to vote in")
+	}
+	if h.sender.votedOn.ID != "3EB0POLL" {
+		t.Fatalf("voted in %q", h.sender.votedOn.ID)
+	}
+	if h.sender.votedOn.Sender.User != otherLID {
+		t.Fatalf("the poll's author was recorded as %s", h.sender.votedOn.Sender)
+	}
+	if h.sender.sentMsg.GetPollUpdateMessage() == nil {
+		t.Fatalf("not a poll vote: %v", h.sender.sentMsg)
+	}
+}
+
+// A vote encrypted against a poll this account never saw cannot be built, and
+// saying so beats sending a vote that decrypts to nothing at every recipient.
+func TestSendPollVoteReportsAnUnknownPollRatherThanSendingNothing(t *testing.T) {
+	h := newHarness(t, lidJID(allowedLID).String(), true)
+	h.sender.voteErr = errors.New("no message secret for that poll")
+
+	body := `{"to":"` + lidJID(allowedLID).String() + `","messageId":"3EB0GONE","options":["Pizza"]}`
+	rec := h.do(t, "POST", "/send/poll/vote", body, token)
+
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422: %s", rec.Code, rec.Body.String())
+	}
+	if h.sender.sentMsg != nil {
+		t.Fatal("a vote was sent despite failing to encrypt")
+	}
+}
+
+// ── Typing ──────────────────────────────────────────────────────────────────
+
+func TestPresenceTellsTheChatSomeoneIsTyping(t *testing.T) {
+	h := newHarness(t, lidJID(allowedLID).String(), true)
+	body := `{"to":"` + lidJID(allowedLID).String() + `","state":"composing"}`
+
+	rec := h.do(t, "POST", "/presence", body, token)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	if h.sender.presence != "composing" {
+		t.Fatalf("presence = %q", h.sender.presence)
+	}
+}
+
+func TestPresenceRefusesAStateThatIsNotOne(t *testing.T) {
+	h := newHarness(t, lidJID(allowedLID).String(), true)
+	body := `{"to":"` + lidJID(allowedLID).String() + `","state":"dancing"}`
+
+	if rec := h.do(t, "POST", "/presence", body, token); rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+}
+
+// Typing at somebody is a signal this account emits into their chat, so it is
+// gated exactly like a message. Without this an unallowlisted contact could be
+// shown "typing…" indefinitely.
+func TestPresenceIsBehindTheAllowlist(t *testing.T) {
+	h := newHarness(t, lidJID(allowedLID).String(), true)
+	body := `{"to":"` + lidJID(otherLID).String() + `","state":"composing"}`
+
+	if rec := h.do(t, "POST", "/presence", body, token); rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", rec.Code)
+	}
+	if h.sender.presence != "" {
+		t.Fatal("presence was sent to someone off the allowlist")
+	}
+}
+
+// ── Sending media to oneself ────────────────────────────────────────────────
+//
+// The self routes carry no allowlist on purpose: there is exactly one possible
+// recipient and it is the operator. That reasoning holds for a picture as much
+// as for a line of text, and an attachment that had to be allowlisted to reach
+// your own chat would be a gate protecting you from yourself.
+func TestSendSelfMediaGoesToTheOwnAccountWithNoAllowlist(t *testing.T) {
+	// Empty allowlist and sending disabled: neither gates the self route.
+	h := newHarness(t, "", false)
+	h.session.paired = true
+
+	body := `{"mimetype":"image/png","caption":"final board","dataBase64":"` + fixturePNG + `"}`
+	rec := h.do(t, "POST", "/send/self/media", body, token)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if len(h.sender.uploaded) == 0 {
+		t.Fatal("nothing was uploaded")
+	}
+	if h.sender.sentTo.User != allowedLID {
+		t.Fatalf("sent to %s, want the operator's own address", h.sender.sentTo)
+	}
+	image := h.sender.sentMsg.GetImageMessage()
+	if image == nil || image.GetCaption() != "final board" {
+		t.Fatalf("not an image with its caption: %v", h.sender.sentMsg)
+	}
+}
+
+func TestSendSelfMediaRejectsATypeWhatsAppCannotRender(t *testing.T) {
+	h := newHarness(t, "", false)
+	h.session.paired = true
+
+	body := `{"mimetype":"image/svg+xml","dataBase64":"` + fixturePNG + `"}`
+	if rec := h.do(t, "POST", "/send/self/media", body, token); rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+	if h.sender.uploaded != nil {
+		t.Fatal("an unsendable type was uploaded anyway")
+	}
+}
+
+// Not paired means there is no "self" to send to — a state the operator fixes by
+// pairing, not a fault at WhatsApp.
+func TestSendSelfMediaReportsNoSelfAsAConflict(t *testing.T) {
+	h := newHarness(t, "", false)
+	h.session.paired = false
+
+	body := `{"mimetype":"image/png","dataBase64":"` + fixturePNG + `"}`
+	if rec := h.do(t, "POST", "/send/self/media", body, token); rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409", rec.Code)
 	}
 }
 
@@ -477,12 +1133,155 @@ func TestContactsAreKeyedByIdentityAndCarryNoPhoneNumber(t *testing.T) {
 	}
 }
 
+// ── One row per person, not per address ─────────────────────────────────────
+//
+// whatsmeow's contact store is keyed by JID, and one person routinely holds two:
+// their phone JID and their LID. Both resolve to the SAME identity key, so a
+// roster built one-row-per-JID lists them twice — and `resolveRecipient` then
+// refuses them as ambiguous, because two candidates matched.
+//
+// On the operator's own account this made 108 of 479 contacts unaddressable,
+// including the operator themselves. The duplicates are not two people to choose
+// between; they are one person seen twice, so they are collapsed here.
+func TestContactsListOnePersonOnceEvenWithTwoAddresses(t *testing.T) {
+	h := harnessWithLIDs(t)
+	h.session.contacts = map[types.JID]types.ContactInfo{
+		// The same person, reachable both ways. The resolver maps the phone JID
+		// onto the LID, so both rows carry one key.
+		lidJID(otherLID):                                   {PushName: "Tuca"},
+		types.NewJID(allowedPhone, types.DefaultUserServer): {PushName: "Tuca"},
+	}
+
+	rec := h.do(t, "GET", "/contacts", "", token)
+	var got struct {
+		Contacts []struct {
+			Key      string `json:"key"`
+			PushName string `json:"pushName"`
+		} `json:"contacts"`
+		Count int `json:"count"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+
+	seen := map[string]int{}
+	for _, entry := range got.Contacts {
+		seen[entry.Key]++
+	}
+	for key, n := range seen {
+		if n > 1 {
+			t.Fatalf("%s appears %d times; a person with two addresses is still one recipient", key, n)
+		}
+	}
+	if got.Count != len(got.Contacts) {
+		t.Fatalf("count = %d but %d entries were returned", got.Count, len(got.Contacts))
+	}
+}
+
+// Collapsing must not lose the name: the phone-JID row is often the one with a
+// push name on it, and dropping it would leave a nameless, unaddressable key.
+func TestContactsKeepTheNameWhenCollapsingDuplicates(t *testing.T) {
+	h := harnessWithLIDs(t)
+	h.session.contacts = map[types.JID]types.ContactInfo{
+		lidJID(otherLID): {},
+		types.NewJID(allowedPhone, types.DefaultUserServer): {PushName: "Tuca"},
+	}
+
+	rec := h.do(t, "GET", "/contacts", "", token)
+	if !strings.Contains(rec.Body.String(), "Tuca") {
+		t.Fatalf("collapsing dropped the only name there was: %s", rec.Body.String())
+	}
+}
+
 func TestContactsReportsNotPairedAsAConflict(t *testing.T) {
 	h := newHarness(t, "", false)
 	h.session.contactsErr = session.ErrNotPaired
 
 	if rec := h.do(t, "GET", "/contacts", "", token); rec.Code != http.StatusConflict {
 		t.Fatalf("status = %d, want 409", rec.Code)
+	}
+}
+
+// A group is a recipient, and until it appears in the roster it is an
+// unaddressable one: the bridge resolves the name the operator types against
+// this response, so a groupless roster cannot send to a group at all — and
+// worse, a short group name prefix-matches a PERSON and sends there instead.
+func TestContactsCarryJoinedGroupsWithTheirSubject(t *testing.T) {
+	h := newHarness(t, "", false)
+	h.session.contacts = map[types.JID]types.ContactInfo{
+		lidJID(otherLID): {PushName: "Tuca"},
+	}
+	h.session.groups = []types.GroupInfo{
+		{JID: groupJID("120363000000000001"), GroupName: types.GroupName{Name: "We"}},
+	}
+
+	rec := h.do(t, "GET", "/contacts", "", token)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var got struct {
+		Contacts []struct {
+			Key     string `json:"key"`
+			Kind    string `json:"kind"`
+			Subject string `json:"subject"`
+		} `json:"contacts"`
+		Count int `json:"count"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if got.Count != 2 {
+		t.Fatalf("count = %d, want 2 (one person, one group)", got.Count)
+	}
+
+	var found bool
+	for _, entry := range got.Contacts {
+		if entry.Kind != "group" {
+			continue
+		}
+		found = true
+		if entry.Subject != "We" {
+			t.Fatalf("group subject = %q, want %q", entry.Subject, "We")
+		}
+		if entry.Key != "120363000000000001@g.us" {
+			t.Fatalf("group key = %q, want the group JID", entry.Key)
+		}
+	}
+	if !found {
+		t.Fatalf("no group in the roster: %s", rec.Body.String())
+	}
+}
+
+// Group subjects come from a live IQ, so they fail independently of the contact
+// store. Failing the whole roster would take away the ability to message PEOPLE
+// because a group listing timed out — but answering as though the account had
+// joined no groups is worse, because "no contact matches" is indistinguishable
+// from a name that was never there. So: degrade, and say so.
+func TestContactsDegradeToPeopleWhenGroupsCannotBeListed(t *testing.T) {
+	h := newHarness(t, "", false)
+	h.session.contacts = map[types.JID]types.ContactInfo{
+		lidJID(otherLID): {PushName: "Tuca"},
+	}
+	h.session.groupsErr = errors.New("iq timed out")
+
+	rec := h.do(t, "GET", "/contacts", "", token)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want the people to still be usable: %s", rec.Code, rec.Body.String())
+	}
+
+	var got struct {
+		Count             int    `json:"count"`
+		GroupsUnavailable string `json:"groupsUnavailable"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if got.Count != 1 {
+		t.Fatalf("count = %d, want the one person", got.Count)
+	}
+	if got.GroupsUnavailable == "" {
+		t.Fatal("the roster dropped every group silently")
 	}
 }
 

@@ -25,29 +25,18 @@ export default defineTool({
   description:
     "Look at an image, sticker, GIF or PDF from a WhatsApp conversation — the actual picture or " +
     "document, not a description of it. Read the chat first with whatsapp_read_chat: each message " +
-    "carries a `fromEnd` position and a `kind`, and you pass both back here. Passing `kind` (and " +
-    "ideally `from` and `time`) is what proves you mean the message you read: if new messages have " +
-    "arrived and shifted the chat, the fetch is refused instead of returning someone else's " +
-    "attachment. Cannot read audio — use whatsapp_transcribe_voice for voice notes.",
+    "carries a `key` — the protocol's own message id — and you pass that back here. It addresses " +
+    "one message exactly, so nothing can shift underneath it and return someone else's attachment. " +
+    "Cannot read audio — use whatsapp_transcribe_voice for voice notes.",
   inputSchema: z.object({
-    chat: z.string().min(1).describe("Conversation name, as returned in the `chat` field of whatsapp_read_chat."),
-    fromEnd: z
-      .number()
-      .int()
-      .min(0)
-      .describe("The message's `fromEnd` position, copied from whatsapp_read_chat. 0 is the newest message."),
-    kind: z
-      .enum(["image", "sticker", "gif", "document", "video"])
-      .describe("The message's `kind`, copied from whatsapp_read_chat. Checked against what is actually there."),
-    from: z.string().optional().describe("The message's `from`, copied verbatim. Strengthens the check."),
-    time: z.string().optional().describe("The message's `time`, copied verbatim. Strengthens the check."),
+    key: z
+      .string()
+      .min(1)
+      .describe("The message's `key`, copied verbatim from whatsapp_read_chat. The protocol's message id."),
   }),
-  async execute({ chat, fromEnd, kind, from, time }, ctx) {
+  async execute({ key }, ctx) {
     try {
-      const media = await bridge.fetchMedia(
-        { chat, fromEnd, kind, from, time, maxBytes: MAX_BYTES },
-        ctx.abortSignal,
-      );
+      const media = await bridge.fetchMedia({ key }, ctx.abortSignal);
       return { ok: true as const, ...media, viewable: VIEWABLE.test(media.mediaType) };
     } catch (error) {
       if (error instanceof BridgeError) return { ok: false as const, error: error.message };
@@ -63,9 +52,10 @@ export default defineTool({
       };
     }
 
-    const label =
-      `${output.kind}${output.filename ? ` "${output.filename}"` : ""} from ` +
-      `${output.from || "unknown"} at ${output.time || "unknown time"} in "${output.chat}"`;
+    // Described by what it IS, not by where it sat: the position-and-timestamp
+    // label existed to prove the fetch had hit the row the caller meant, which
+    // a message id settles on its own.
+    const label = `the attachment${output.filename ? ` "${output.filename}"` : ""}`;
 
     if (!output.viewable) {
       return {

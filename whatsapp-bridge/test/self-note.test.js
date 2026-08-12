@@ -4,8 +4,8 @@ import assert from "node:assert/strict";
 import {
   MAX_MESSAGES,
   MAX_MESSAGE_CHARS,
-  assertSelfChatOpen,
   assertSelfNoteConfigured,
+  assertSelfNoteEnabled,
   normalizeMessages,
   sendSelfNoteWith,
 } from "../src/self-note.js";
@@ -19,18 +19,14 @@ import {
 const NAME = "Joao (You)";
 const okEnv = { WA_SELF_CHAT_NAME: NAME };
 
-/** Records calls so a test can assert that nothing was typed on a refusal. */
+/** Records sends so a test can assert that nothing was written on a refusal. */
 function spyDeps(overrides = {}) {
-  const calls = { openChat: [], typed: [] };
+  const calls = { sent: [] };
   const deps = {
     env: okEnv,
-    openChatTitle: async () => NAME,
-    openChat: async (q) => {
-      calls.openChat.push(q);
-      return { opened: q, exactMatch: true, contains: true };
-    },
-    typeAndSend: async (text) => {
-      calls.typed.push(text);
+    send: async (message) => {
+      calls.sent.push(message);
+      return { id: `id-${calls.sent.length}` };
     },
     ...overrides,
   };
@@ -97,7 +93,10 @@ test("messages: rejects a non-array", () => {
 test(`messages: rejects more than ${MAX_MESSAGES}, so a digest cannot become a burst`, () => {
   assert.throws(
     () => normalizeMessages(["a", "b", "c"]),
-    (e) => e.statusCode === 400 && /interaction/i.test(e.message),
+    // The refusal used to cite browser interactions. The cap survived the
+    // browser because its real reason did: each message is its own notification
+    // on the operator's phone.
+    (e) => e.statusCode === 400 && /burst/i.test(e.message),
   );
 });
 
@@ -118,155 +117,77 @@ test("messages: preserves newlines and emoji inside a message verbatim", () => {
 });
 
 /* ---------------------------------------------------------------- *
- * The open-chat assertion — the safety-critical comparison
- * ---------------------------------------------------------------- */
-
-test("assertion: passes on an exact match", () => {
-  assert.doesNotThrow(() => assertSelfChatOpen(NAME, NAME));
-});
-
-test("assertion: refuses a prefix of the expected name", () => {
-  assert.throws(() => assertSelfChatOpen("Joao", NAME), (e) => e.statusCode === 409);
-});
-
-test("assertion: refuses a name that merely contains the expected one", () => {
-  assert.throws(
-    () => assertSelfChatOpen("Joao (You) and family", NAME),
-    (e) => e.statusCode === 409,
-  );
-});
-
-test("assertion: refuses a case-only difference", () => {
-  assert.throws(() => assertSelfChatOpen("joao (you)", NAME), (e) => e.statusCode === 409);
-});
-
-test("assertion: refuses an empty title, which means no chat is open", () => {
-  assert.throws(() => assertSelfChatOpen("", NAME), (e) => e.statusCode === 409);
-});
-
-test("assertion: names both strings so the failure is diagnosable", () => {
-  assert.throws(
-    () => assertSelfChatOpen("Ana Paula", NAME),
-    (e) => e.message.includes("Ana Paula") && e.message.includes(NAME),
-  );
-});
-
-/* ---------------------------------------------------------------- *
  * Orchestration
+ *
+ * The safety-critical comparison this section used to hold — that the OPEN chat
+ * is exactly the configured one — is gone, and its absence is the point. It
+ * existed because `openChat()` typed into a search box and clicked the first
+ * result, so "Joao" could open "Joao Antunes". The transport addresses the
+ * account's own JID, read from the device store and never taken from a caller,
+ * so there is no name to mis-resolve and nothing left to compare.
  * ---------------------------------------------------------------- */
 
-test("send: writes a single message when the self chat is already open", async () => {
+test("send: writes a single message", async () => {
   const { deps, calls } = spyDeps();
   const result = await sendSelfNoteWith(deps, { messages: ["body"] });
 
-  assert.equal(result.sent, true);
-  assert.equal(result.chat, NAME);
-  assert.deepEqual(calls.typed, ["body"]);
-  assert.deepEqual(calls.openChat, [], "no navigation needed when already open");
+  assert.equal(result.sent, 1);
+  assert.deepEqual(calls.sent, ["body"]);
 });
 
 test("send: writes context then body, in that order, as separate messages", async () => {
   const { deps, calls } = spyDeps();
-  await sendSelfNoteWith(deps, { messages: ["Draft · Fabio", "Oi Fabio"] });
+  await sendSelfNoteWith(deps, { messages: ["Draft \u00b7 Fabio", "Oi Fabio"] });
 
-  assert.deepEqual(calls.typed, ["Draft · Fabio", "Oi Fabio"]);
+  assert.deepEqual(calls.sent, ["Draft \u00b7 Fabio", "Oi Fabio"]);
 });
 
-test("send: navigates to the self chat when another chat is open", async () => {
-  let title = "Helena";
-  const { deps, calls } = spyDeps({
-    openChatTitle: async () => title,
-    openChat: async (q) => {
-      calls.openChat.push(q);
-      title = NAME;
-      return { opened: NAME, exactMatch: true, contains: true };
-    },
-  });
-
+test("send: takes no recipient, so no caller can redirect a note", async () => {
+  const { deps, calls } = spyDeps();
   await sendSelfNoteWith(deps, { messages: ["body"] });
 
-  assert.deepEqual(calls.openChat, [NAME]);
-  assert.deepEqual(calls.typed, ["body"]);
+  // The dependency is `send(message)`: there is no address parameter to pass.
+  assert.equal(deps.send.length, 1);
+  assert.deepEqual(calls.sent, ["body"]);
 });
 
-test("send: refuses when navigation lands on a different chat, and types nothing", async () => {
-  const { deps, calls } = spyDeps({
-    openChatTitle: async () => "Helena",
-    openChat: async (q) => {
-      calls.openChat.push(q);
-      // The fuzzy search matched a similarly-named contact instead.
-      return { opened: "Joao Peixoto", exactMatch: false, contains: true };
-    },
-  });
+test("send: writes nothing when the feature is switched off", async () => {
+  const { deps, calls } = spyDeps({ env: { WA_ALLOW_SELF_NOTE: "false" } });
 
   await assert.rejects(
-    () => sendSelfNoteWith(deps, { messages: ["private draft"] }),
-    (e) => e.statusCode === 409,
+    () => sendSelfNoteWith(deps, { messages: ["body"] }),
+    (e) => e.statusCode === 403,
   );
-  assert.deepEqual(calls.typed, [], "nothing may be typed after a failed resolution");
+  assert.deepEqual(calls.sent, [], "a refusal must not write");
 });
 
-test("send: refuses when openChat claims success but the header disagrees", async () => {
-  const { deps, calls } = spyDeps({
-    // Never becomes the self chat, however confident openChat is.
-    openChatTitle: async () => "Helena",
-    openChat: async (q) => {
-      calls.openChat.push(q);
-      return { opened: NAME, exactMatch: true, contains: true };
-    },
-  });
+test("send: validates every message before writing any of them", async () => {
+  const { deps, calls } = spyDeps();
 
   await assert.rejects(
-    () => sendSelfNoteWith(deps, { messages: ["private draft"] }),
-    (e) => e.statusCode === 409,
+    () => sendSelfNoteWith(deps, { messages: ["fine", ""] }),
+    (e) => e.statusCode === 400,
   );
-  assert.deepEqual(calls.typed, []);
+  assert.deepEqual(calls.sent, [], "a partial note is worse than none");
 });
 
-test("send: checks configuration before touching the browser", async () => {
-  let touched = false;
-  const { deps } = spyDeps({
-    env: {},
-    openChatTitle: async () => {
-      touched = true;
-      return NAME;
-    },
-  });
+test("send: refuses more messages than the cap, and writes none", async () => {
+  const { deps, calls } = spyDeps();
 
-  await assert.rejects(() => sendSelfNoteWith(deps, { messages: ["body"] }), (e) => e.statusCode === 403);
-  assert.equal(touched, false, "a missing env var must not report a WhatsApp problem");
+  await assert.rejects(
+    () => sendSelfNoteWith(deps, { messages: ["a", "b", "c"] }),
+    (e) => e.statusCode === 400,
+  );
+  assert.deepEqual(calls.sent, []);
 });
 
-test("send: validates messages before touching the browser", async () => {
-  let touched = false;
-  const { deps } = spyDeps({
-    openChatTitle: async () => {
-      touched = true;
-      return NAME;
-    },
-  });
-
-  await assert.rejects(() => sendSelfNoteWith(deps, { messages: [] }), (e) => e.statusCode === 400);
-  assert.equal(touched, false);
-});
-
-test("send: reports what it wrote, for the caller to echo back", async () => {
-  const { deps } = spyDeps();
-  const result = await sendSelfNoteWith(deps, { messages: ["a", "b"] });
-
-  assert.deepEqual(result.messages, ["a", "b"]);
-  assert.equal(result.chat, NAME);
-  assert.ok(Date.parse(result.at), "at is an ISO timestamp");
-});
-
-test("send: stops at the first failure rather than continuing the sequence", async () => {
-  const { deps, calls } = spyDeps({
-    typeAndSend: async (text) => {
-      calls.typed.push(text);
-      if (calls.typed.length === 1) throw new Error("composer vanished");
-    },
-  });
-
-  await assert.rejects(() => sendSelfNoteWith(deps, { messages: ["first", "second"] }));
-  assert.deepEqual(calls.typed, ["first"], "the second message must not be attempted");
+test("configuration: the off switch alone gates the transport path", () => {
+  // WA_SELF_CHAT_NAME no longer routes anything, so the send path asks only
+  // whether the feature is enabled. assertSelfNoteConfigured still exists for
+  // callers that want the configured title itself.
+  assert.doesNotThrow(() => assertSelfNoteEnabled({}));
+  assert.throws(
+    () => assertSelfNoteEnabled({ WA_ALLOW_SELF_NOTE: "false" }),
+    (e) => e.statusCode === 403,
+  );
 });
