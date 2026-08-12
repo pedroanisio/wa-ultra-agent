@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import { test } from "node:test";
 
 import {
+  archiveIdentityStrings,
   realIdentityStrings,
   scanForContactIdentifiers,
   scanForRealIdentities,
@@ -41,6 +42,39 @@ import {
  * what fails loudly if the configuration is missing on a machine that has an archive.
  */
 
+/**
+ * The operator's own configuration, whether or not the shell exported it.
+ *
+ * ── Why the guard reads .env itself ─────────────────────────────────────────
+ * Both halves of this control derive their forbidden set from configuration, and
+ * `node --test` inherits a shell that has not sourced `.env` — so on the ONE
+ * machine that holds the real names, the guard skipped. It reported "nothing to
+ * check" while the tree contained five real names in ten files, and it went on
+ * reporting that while an agent added nine more.
+ *
+ * A control whose default state on the operator's own machine is "skipped" is a
+ * control nobody has. It reads the file the operator already keeps, which is
+ * gitignored, and never overwrites a variable the environment really set.
+ */
+function operatorEnv() {
+  const merged = { ...process.env };
+  let text;
+  try {
+    text = readFileSync(ROOT + ".env", "utf8");
+  } catch {
+    return merged; // No .env here — CI, or a fresh clone. The skip below is honest.
+  }
+
+  for (const line of text.split("\n")) {
+    const assignment = /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/.exec(line);
+    if (!assignment) continue;
+    const [, key, raw] = assignment;
+    if (merged[key]) continue;
+    merged[key] = raw.trim().replace(/^(['"])(.*)\1$/s, "$2");
+  }
+  return merged;
+}
+
 /** Tracked files only. An untracked scratch file is not a publication risk. */
 function trackedFiles() {
   const out = execFileSync("git", ["ls-files", "-z"], {
@@ -65,7 +99,8 @@ const EXEMPT = new Set([
 ]);
 
 test("guard: real identities from the live config appear in no tracked file", (t) => {
-  const forbidden = realIdentityStrings(process.env);
+  const env = operatorEnv();
+  const forbidden = realIdentityStrings(env);
 
   if (forbidden.length === 0) {
     t.skip(
@@ -325,5 +360,104 @@ test("guard: no tracked file contains a contact identifier", () => {
     `Contact identifiers found in ${offences.length} place(s):\n  ${offences.join("\n  ")}\n\n` +
       "Replace them with values assembled at run time from synthetic parts, the way this " +
       "test's own fixtures are. The matched strings are deliberately not printed.",
+  );
+});
+
+/* ══════════════════════════════════════════════════════════════════════════ *
+ * Names the ARCHIVE knows — the half that had been missing
+ *
+ * The configuration names the people who may be written to. The archive names
+ * everyone the account has ever spoken to, which is a far larger set and the one
+ * an agent debugging against live data will reach for. On 12 August 2026 exactly
+ * that happened: nine group names and two people went into test fixtures and
+ * source comments, none of them in `.env`, so the half above saw nothing while
+ * the identifier half caught three `@lid` literals on the same lines.
+ *
+ * Sourcing the forbidden set from store.db closes it without writing a single
+ * name down — the same property that makes the configuration-derived half safe
+ * to have in a public repository.
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * The archive's conversation names, from whichever archive this machine has.
+ *
+ * A file first, because it needs nothing running. The bridge second, because the
+ * archive normally lives in a Docker volume no host process can open — and a
+ * guard that cannot see the data on the one machine that HAS the data is the
+ * guard that missed this leak.
+ */
+async function archiveChatNames() {
+  const candidates = [
+    process.env.WA_STORE_PATH,
+    ROOT + "data/store.db",
+    ROOT + "whatsapp-bridge/data/store.db",
+  ].filter(Boolean);
+
+  for (const path of candidates) {
+    try {
+      const { DatabaseSync } = await import("node:sqlite");
+      const db = new DatabaseSync(path, { readOnly: true });
+      const rows = db
+        .prepare("SELECT display_name AS displayName FROM chats WHERE display_name IS NOT NULL")
+        .all();
+      db.close();
+      if (rows.length > 0) return rows;
+    } catch {
+      // Missing, unreadable, or not an archive. Try the next.
+    }
+  }
+
+  const env = operatorEnv();
+  // The container name resolves inside the compose network and nowhere else; a
+  // test runs on the host, where the same bridge is on loopback.
+  const url = (env.WA_BRIDGE_URL || "").replace(/\/\/[^:/]+:/, "//127.0.0.1:");
+  const token = env.WA_BRIDGE_TOKEN;
+  if (!url || !token) return [];
+  try {
+    const response = await fetch(`${url.replace(/\/$/, "")}/archive/chats?limit=10000`, {
+      headers: { authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(5_000),
+    });
+    if (!response.ok) return [];
+    const body = await response.json();
+    return Array.isArray(body?.chats) ? body.chats : [];
+  } catch {
+    return [];
+  }
+}
+
+test("guard: no tracked file contains a name from this machine's archive", async (t) => {
+  const forbidden = archiveIdentityStrings(await archiveChatNames());
+
+  if (forbidden.length === 0) {
+    t.skip(
+      "No archive is readable here (no store.db with names, no bridge configured), so " +
+        "there is nothing to scan for. Not a pass — there was nothing to check.",
+    );
+    return;
+  }
+
+  const offences = [];
+  for (const file of trackedFiles()) {
+    if (EXEMPT.has(file)) continue;
+    let text;
+    try {
+      text = readFileSync(ROOT + file, "utf8");
+    } catch {
+      continue;
+    }
+    for (const hit of scanForRealIdentities(text, forbidden)) {
+      offences.push(`${file}:${hit.line} leaks an ${hit.kind}`);
+    }
+  }
+
+  assert.deepEqual(
+    offences,
+    [],
+    `Names from this machine's archive found in ${offences.length} tracked place(s):\n  ` +
+      `${offences.join("\n  ")}\n\n` +
+      "A conversation's name is correspondence — who is in a group called what, with " +
+      "whom — and this repository is public. Replace them with invented fixtures that " +
+      "carry the same SHAPE. The matched strings are deliberately not printed.",
   );
 });

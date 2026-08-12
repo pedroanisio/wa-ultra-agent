@@ -199,9 +199,9 @@ test("a value containing double quotes is single-quoted, not escaped", () => {
   // to keep the commas inside a group name. Escaping them into \" hands a
   // different literal to Compose, dotenv and a shell, which do not agree on
   // backslash escapes. Single quotes are literal in all three.
-  const value = '"Dan, Ju, Pê",We';
+  const value = '"Ana, Bia, Cauê",We';
   const written = setEnvValues(SAMPLE, { WA_SEND_ALLOWLIST: value });
-  assert.match(written, /^WA_SEND_ALLOWLIST='"Dan, Ju, Pê",We'$/m);
+  assert.match(written, /^WA_SEND_ALLOWLIST='"Ana, Bia, Cauê",We'$/m);
   assert.equal(envValues(written).WA_SEND_ALLOWLIST, value);
 });
 

@@ -60,7 +60,7 @@ export function foldName(value) {
       .normalize("NFD")
       // Combining marks, once NFD has split them from their letters.
       .replace(/\p{M}+/gu, "")
-      // Decoration in a chat name: `👥 Casa & Crianças` is said as "casa e criancas".
+      // Decoration in a chat name: `👥 Sítio & Açaí` is said as "sitio e acai".
       .replace(/[\p{Extended_Pictographic}\p{Emoji_Presentation}\uFE0F]/gu, " "),
   );
 }

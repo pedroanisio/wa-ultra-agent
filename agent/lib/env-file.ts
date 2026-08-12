@@ -157,7 +157,7 @@ export function formatEnvValue(value: string): string {
   // ── Why a double-quoted value may need single quotes ──────────────────────
   // The send allowlist legitimately contains double quotes, and they are
   // SIGNIFICANT: the bridge's splitter uses them to protect the commas inside a
-  // group name like "Dan, Ju, Pê". Escaping them into `\"` hands a different
+  // group name like "Ana, Bia, Cauê". Escaping them into `\"` hands a different
   // literal to whatever reads the file next — Compose, dotenv and a shell do
   // not agree on backslash escapes inside double quotes. Single quotes are
   // literal in all three, so a value carrying double quotes is wrapped in them

@@ -163,6 +163,72 @@ export function realIdentityStrings(env = {}) {
 }
 
 /**
+ * Every real name the ARCHIVE knows, each with what it is.
+ *
+ * ── Why the configuration was never the whole set ───────────────────────────
+ * `realIdentityStrings` says the operator's contacts' names "are only knowable
+ * from .env". That was true of who may be WRITTEN to, and false of who is in the
+ * archive: the allowlist holds a handful of people, and store.db holds everyone
+ * the account has ever spoken to. A guard sourced from the allowlist is blind to
+ * every other real name in the operator's life.
+ *
+ * It went on being blind while the leak it exists to prevent happened again, in
+ * this repository, on 12 August 2026: nine group names and two people's names,
+ * written into test fixtures and source comments by an agent debugging against
+ * the live archive. The identifier half caught three `@lid` literals on the same
+ * lines. Not one of the names was in `.env`, so the name half saw nothing.
+ *
+ * Fixtures built from live data are how this keeps happening, and the fix is not
+ * "be careful": it is that the machine holding the data can check the tree
+ * against it, which is what this function makes possible.
+ *
+ * ── Why single short words are not forbidden ────────────────────────────────
+ * A group called "We" is a real group name and also an English word. Forbidding
+ * it fails on ordinary prose in dozens of files, and a noisy guard is a disabled
+ * guard — the same argument `MINIMUM_IDENTIFYING_LENGTH` and the bare-digit
+ * exclusion already make. So a name qualifies when it is more than one word, or
+ * one word long enough to be a name rather than a word. The gap is stated rather
+ * than hidden: a short single-word group name is not covered here.
+ *
+ * @param chats  Rows shaped like `store.chats()`: `{ displayName }`.
+ * @returns {{value: string, kind: string}[]}
+ */
+export function archiveIdentityStrings(chats = []) {
+  const found = new Map();
+
+  const offer = (raw) => {
+    const value = collapse(String(raw ?? "")).trim();
+    if (!value) return;
+    if (value.length < MINIMUM_IDENTIFYING_LENGTH) return;
+
+    const words = value.split(" ").filter(Boolean);
+    if (words.length < 2 && value.length < 6) return;
+
+    const key = value.toLowerCase();
+    // "conversation name" rather than person-or-group: this side cannot tell them
+    // apart, and the operator does not need to be told which of their chats it is.
+    if (!found.has(key)) found.set(key, { value, kind: "archived conversation name" });
+  };
+
+  for (const chat of chats) {
+    const name = String(chat?.displayName ?? "");
+    offer(name);
+
+    // ── Why the undecorated form is forbidden too ────────────────────────────
+    // A group's name carries an emoji its members never type. The archive holds
+    // "👥 Casa" and every mention of it in prose, in a fixture and in a test
+    // assertion says "Casa" — so a guard that only knows the decorated form
+    // watches the one spelling nobody writes. Caught the first time this rule
+    // ran: the decorated name was replaced in a fixture and the same real name
+    // survived, undecorated, four lines below.
+    const bare = name.replace(/[\p{Extended_Pictographic}\p{Emoji_Presentation}️]/gu, " ");
+    if (collapse(bare).trim() !== collapse(name).trim()) offer(bare);
+  }
+
+  return [...found.values()];
+}
+
+/**
  * The address forms a contact identifier can take in this tree.
  *
  * ── Why this rule is structural and the name rule is not ────────────────────

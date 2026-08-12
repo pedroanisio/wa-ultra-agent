@@ -75,8 +75,8 @@ test("unfolds continuation lines, which is how long summaries arrive", () => {
 });
 
 test("unescapes commas, semicolons and newlines", () => {
-  const [e] = parseIcs(event({ SUMMARY: "Dentista\\, Valentina\\; 16h\\nlevar carteirinha" }));
-  assert.equal(e.summary, "Dentista, Valentina; 16h\nlevar carteirinha");
+  const [e] = parseIcs(event({ SUMMARY: "Dentista\\, Zaira\\; 16h\\nlevar carteirinha" }));
+  assert.equal(e.summary, "Dentista, Zaira; 16h\nlevar carteirinha");
 });
 
 test("ignores todos and alarms, which share the same file", () => {

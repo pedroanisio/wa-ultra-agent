@@ -199,7 +199,7 @@ export function resolveRecipient(name, contacts = [], options = {}) {
     return {
       contact,
       labels: names.map(normaliseName),
-      // Both the stripped and the raw form: `Familia (Ulian)` has to be
+      // Both the stripped and the raw form: `Vizinhos (Norte)` has to be
       // reachable as "familia" AND as "familia ulian", because both are things
       // the operator legitimately calls it.
       tokenSets: names.map((label) => new Set([...nameTokens(label), ...nameTokens(String(label).replace(/[()]/g, " "))])),
@@ -303,15 +303,15 @@ const normaliseName = foldName;
 function nameTokens(value) {
   return (
     normaliseName(value)
-      // Parentheses are separators here, not deletions: `Familia (Ulian)` is
+      // Parentheses are separators here, not deletions: `Vizinhos (Norte)` is
       // said as "familia ulian", and normaliseName drops a trailing parenthetical
       // wholesale so that `Ana (You)` still equals `Ana`.
       .replace(/[()]/g, " ")
       .replace(/[^\p{L}\p{N}]+/gu, " ")
       .split(" ")
       .filter(Boolean)
-      // Conjunctions that people write as separators. `Casa & Crianças` is
-      // typed back as "casa e criancas" and `Rex + Pals` as "rex and pals"; the
+      // Conjunctions that people write as separators. `Sítio & Açaí` is
+      // typed back as "sitio e acai" and `Rex + Pals` as "rex and pals"; the
       // word is the punctuation, spelled out. Dropped from BOTH sides, so it
       // cannot make a name match one it does not.
       .filter((token) => !CONJUNCTIONS.has(token))

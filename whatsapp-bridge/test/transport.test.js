@@ -444,9 +444,9 @@ test("createTransport: the outbox limit is capped at what the API accepts", asyn
 
 const SEARCH_ROSTER = [
   { key: "1@g.us", kind: "group", subject: "Kim, Lu, Rê" },
-  { key: "2@g.us", kind: "group", subject: "👥 Casa & Crianças" },
+  { key: "2@g.us", kind: "group", subject: "👥 Sítio & Açaí" },
   { key: "3@g.us", kind: "group", subject: "Rex + Pals" },
-  { key: "4@g.us", kind: "group", subject: "Familia (Ulian)" },
+  { key: "4@g.us", kind: "group", subject: "Vizinhos (Norte)" },
   { key: "5@lid", kind: "person", pushName: "Ana" },
   { key: "6@lid", kind: "person", pushName: "Ana Paula" },
 ];
@@ -463,8 +463,8 @@ test("search: separators are not part of anybody's name", () => {
 });
 
 test("search: a decorative emoji in the chat name is ignored", () => {
-  assert.equal(resolveRecipient("Casa & Crianças", SEARCH_ROSTER).to, "2@g.us");
-  assert.equal(resolveRecipient("casa e criancas", SEARCH_ROSTER).to, "2@g.us");
+  assert.equal(resolveRecipient("Sítio & Açaí", SEARCH_ROSTER).to, "2@g.us");
+  assert.equal(resolveRecipient("sitio e acai", SEARCH_ROSTER).to, "2@g.us");
 });
 
 test("search: a conjunction written as a word matches one written as a symbol", () => {
@@ -473,8 +473,8 @@ test("search: a conjunction written as a word matches one written as a symbol", 
 });
 
 test("search: a parenthetical is reachable both with and without it", () => {
-  assert.equal(resolveRecipient("Familia", SEARCH_ROSTER).to, "4@g.us");
-  assert.equal(resolveRecipient("Familia Ulian", SEARCH_ROSTER).to, "4@g.us");
+  assert.equal(resolveRecipient("Vizinhos", SEARCH_ROSTER).to, "4@g.us");
+  assert.equal(resolveRecipient("Vizinhos Norte", SEARCH_ROSTER).to, "4@g.us");
 });
 
 test("search: an exact name beats a longer one that contains it", () => {
@@ -505,7 +505,7 @@ test("search: a name that is not there is still not there", () => {
 
 test("search: a miss names the closest wordings, so a typo is correctable", () => {
   assert.throws(
-    () => resolveRecipient("Casa dos Meninos", SEARCH_ROSTER),
-    (e) => /Closest by wording/.test(e.message) && /Casa & Crianças/.test(e.message),
+    () => resolveRecipient("Sítio dos Meninos", SEARCH_ROSTER),
+    (e) => /Closest by wording/.test(e.message) && /Sítio & Açaí/.test(e.message),
   );
 });

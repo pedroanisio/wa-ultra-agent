@@ -90,7 +90,7 @@ export const SETTINGS: readonly SettingSpec[] = [
     key: "WA_SEND_ALLOWLIST",
     label: "Allowlist",
     // Deliberately NOT a comma-separated list. The bridge's own splitter treats
-    // a double-quoted entry as one name so that a group called "Dan, Ju, Pê"
+    // a double-quoted entry as one name so that a group called "Ana, Bia, Cauê"
     // survives — and a naive split on every comma shatters it into three
     // entries, none of which match that group while each becomes its own
     // standing permission. Widening the send boundary by reformatting it is not
@@ -101,7 +101,7 @@ export const SETTINGS: readonly SettingSpec[] = [
     note:
       "Matched case-insensitively, as a substring, against the name WhatsApp " +
       "resolves — so \"Ana\" also reaches \"Ana Paula\". Wrap an entry in " +
-      "double quotes to keep the commas inside it: '\"Dan, Ju, Pê\",We'.",
+      "double quotes to keep the commas inside it: '\"Ana, Bia, Cauê\",We'.",
     whenEmpty: "An empty list permits NO ONE. It never means everyone.",
   },
   {

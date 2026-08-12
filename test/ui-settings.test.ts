@@ -77,12 +77,12 @@ test("an empty allowlist is valid, because permitting nobody is a real setting",
 
 test("a quoted allowlist entry survives verbatim, commas and all", () => {
   // The bridge's own splitter treats a double-quoted entry as ONE name, so that
-  // a group called "Dan, Ju, Pê" is one permission. Re-splitting it on every
+  // a group called "Ana, Bia, Cauê" is one permission. Re-splitting it on every
   // comma shatters it into three entries — none of which match that group,
   // while each becomes a standing permission of its own. The send boundary is
   // not something a rendering pass may reformat.
   const spec = settingSpec("WA_SEND_ALLOWLIST")!;
-  const real = '"Pedro Anisio Silva","Dan, Ju, Pê",We';
+  const real = '"Alex Fixture Moreira","Ana, Bia, Cauê",We';
   assert.deepEqual(validateSetting(spec, real), { ok: true, value: real });
 });
 
@@ -90,7 +90,7 @@ test("an unclosed quote in the allowlist is refused", () => {
   // It silently swallows the rest of the list into a single entry, which is a
   // permission nobody granted.
   const spec = settingSpec("WA_SEND_ALLOWLIST")!;
-  assert.equal(validateSetting(spec, '"Dan, Ju, Pê,We').ok, false);
+  assert.equal(validateSetting(spec, '"Ana, Bia, Cauê,We').ok, false);
 });
 
 test("a stray comma in a plain list is refused, not silently dropped", () => {
@@ -131,12 +131,12 @@ test("a valid batch is written into the file, comments intact", () => {
   const before = ["# The send gate.", "WA_ALLOW_SEND=false", "WA_SEND_ALLOWLIST=", ""].join("\n");
   const after = applySettings(before, {
     WA_ALLOW_SEND: "true",
-    WA_SEND_ALLOWLIST: '"Dan, Ju, Pê",We',
+    WA_SEND_ALLOWLIST: '"Ana, Bia, Cauê",We',
   });
   assert.match(after, /# The send gate\./);
   assert.equal(envValues(after).WA_ALLOW_SEND, "true");
   // Byte for byte what was submitted: the quoting is the bridge's grammar.
-  assert.equal(envValues(after).WA_SEND_ALLOWLIST, '"Dan, Ju, Pê",We');
+  assert.equal(envValues(after).WA_SEND_ALLOWLIST, '"Ana, Bia, Cauê",We');
 });
 
 test("every setting with a default declares it, so unset is never shown as a value", () => {

@@ -369,7 +369,7 @@ test("durability: an archive survives being closed and reopened", () => {
 function seeded() {
   const db = store();
   db.upsertMessages("Helena", [
-    msg({ key: "m1", from: "Helena", time: "01/03/2026 09:00", text: "a excursão da Valentina é dia 28" }),
+    msg({ key: "m1", from: "Helena", time: "01/03/2026 09:00", text: "a excursão da Zaira é dia 28" }),
     msg({ key: "m2", from: "Joao", time: "01/03/2026 09:05", text: "beleza, anoto", outgoing: true }),
     msg({ key: "m3", from: "Helena", time: "02/03/2026 10:00", text: "kkkkk" }),
   ]);
