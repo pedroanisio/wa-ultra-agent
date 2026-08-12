@@ -87,6 +87,8 @@ Rules, all of them load-bearing:
 export default defineTool({
   description:
     "Propose the next best interaction in one conversation, from its interaction twin: what to say " +
+    "or do next. Use it when the user asks what to do about a conversation, who needs a reply, or " +
+    "what they are forgetting — and in a review pass over a chat that has gone quiet. " +
     "or do next, why, when, and a draft in the user's own voice where a message is the right move. " +
     "Returns a short ranked list, and returning nothing — or 'wait' — is a normal, correct result " +
     "for a conversation that needs no move. It PROPOSES ONLY: nothing here is sent, and a draft " +

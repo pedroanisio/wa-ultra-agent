@@ -1,7 +1,8 @@
 import { defineTool, toolOutput, toolOutputPart } from "eve/tools";
 import { z } from "zod";
 
-import { ImageError, MAX_PROMPT_CHARS, generateImage, storeImage } from "../lib/imagegen.ts";
+import { ImageError, MAX_PROMPT_CHARS, generateImage, previewFor, storeImage } from "../lib/imagegen.ts";
+import { describeSize, fitsInContext } from "../lib/tool-output.ts";
 
 /**
  * Make a picture. Send nothing.
@@ -23,15 +24,22 @@ import { ImageError, MAX_PROMPT_CHARS, generateImage, storeImage } from "../lib/
  */
 
 /**
- * eve warns above 3 MiB, and a content part is re-sent on every later turn of
- * the conversation. An image past that is stored and described rather than
- * shown — the alternative is one picture crowding out the chat it was made for.
+ * What is shown is a DOWNSCALE of what was made.
+ *
+ * A generated JPEG runs to a couple of hundred kilobytes, and a content part is
+ * re-sent on every later turn of the conversation — so the full image would
+ * spend a slice of the context window over and over for a picture the model
+ * looked at once. The size that is checked here is therefore the preview's, and
+ * the budget is the shared one in `tool-output.ts` rather than a number invented
+ * in this file: a ceiling that does not move with the model's window is a guard
+ * that silently stops guarding.
  */
-const MAX_PREVIEW_BYTES = 3 * 1024 * 1024;
 
 export default defineTool({
   description:
-    "Generate an image from a description, using OpenAI's image model. This does NOT send anything — " +
+    "Generate an image from a description, using OpenAI's image model. Use it when the user asks for " +
+    "a picture to be made — not to illustrate an answer they did not ask to see illustrated. " +
+    "This does NOT send anything — " +
     "it makes the picture, hands it back for you to look at, and returns an `id`. Look at what came " +
     "back before you do anything with it: image models misspell text, miscount objects and add things " +
     "nobody asked for, and none of that is reported as an error. When it is right, send it with " +
@@ -99,7 +107,12 @@ export default defineTool({
       throw error;
     }
 
-    const shownInline = image.bytes.byteLength <= MAX_PREVIEW_BYTES;
+    // A failed downscale is not a failed generation: the picture is stored and
+    // sendable, it just cannot be shown, and that is reported rather than
+    // papered over with the full-size bytes.
+    const preview = await previewFor(image.bytes);
+    const affordable = preview ? fitsInContext(preview.byteLength) : { ok: false };
+
     return {
       ok: true as const,
       id: stored.id,
@@ -107,9 +120,10 @@ export default defineTool({
       bytes: image.bytes.byteLength,
       size: image.size,
       prompt: image.prompt,
-      // Only what is small enough to live in the conversation. The bytes on disk
-      // are the ones that get sent either way.
-      preview: shownInline ? image.bytes.toString("base64") : null,
+      // The small copy, and only when it fits. The bytes on disk are the ones
+      // that get sent either way — the user receives the full-size image.
+      preview: preview && affordable.ok ? preview.toString("base64") : null,
+      previewBytes: preview?.byteLength ?? 0,
     };
   },
 
@@ -127,26 +141,31 @@ export default defineTool({
       };
     }
 
-    const kb = `${Math.round(output.bytes / 1024)} KB`;
+    const kb = describeSize(output.bytes);
     if (!output.preview) {
       return {
         type: "text" as const,
         value:
-          `The image was generated (${output.size}, ${kb}) and stored as ${output.id}, but it is too ` +
-          "large to show here, so it is UNSEEN. Say that to the user and let them decide — do not " +
-          "describe it as though you had looked at it.",
+          `The image was generated (${output.size}, ${kb}) and stored as ${output.id}, but no copy ` +
+          "small enough to show could be made, so it is UNSEEN. You can still send it with " +
+          "whatsapp_send_image — but say plainly that you have not looked at it and let the user " +
+          "decide. Do not describe it as though you had.",
       };
     }
 
     return toolOutput.content([
       toolOutputPart.text(
-        `Generated from your prompt, stored as ${output.id} (${output.size}, ${kb}). Nothing has been ` +
+        `Generated from your prompt, stored as ${output.id} (${output.size}, ${kb} — shown below as a ` +
+          `smaller copy; the full-size one is what gets sent). Nothing has been ` +
           "sent. Look at it properly before you do: check any text in the picture letter by letter, " +
           "check the count of anything countable, and check that what is in the frame is what was " +
           "asked for. If it is right, send it with whatsapp_send_image and this id. If it is not, say " +
           "what is wrong and generate again — do not send it and apologise afterwards.",
       ),
-      toolOutputPart.file(output.preview, { mediaType: output.mimetype }),
+      // The preview is always a JPEG, whatever the stored image is — the
+      // downscale re-encodes, so declaring the original's type here would label
+      // a JPEG as a PNG.
+      toolOutputPart.file(output.preview, { mediaType: "image/jpeg" }),
     ]);
   },
 });

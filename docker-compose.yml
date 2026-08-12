@@ -184,7 +184,14 @@ services:
       whatsapp-bridge:
         condition: service_healthy
     environment:
-      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:?set ANTHROPIC_API_KEY in .env}"
+      # Which model the agent runs on. The id must exist in agent/lib/model.ts,
+      # which carries its context window and parameter support — the guards are
+      # fractions of that window, so an unlisted model has no guards and the
+      # agent refuses to boot rather than guess.
+      WA_MODEL_ID: "${WA_MODEL_ID:-}"
+      # Both providers' keys: the registry decides which one is used. Anthropic
+      # is no longer required for the agent to run, so it no longer fails boot.
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
       WA_BRIDGE_URL: "http://whatsapp-bridge:8099"
       WA_BRIDGE_TOKEN: "${WA_BRIDGE_TOKEN:?set WA_BRIDGE_TOKEN in .env}"
       # The UI gate. An agent that can read and send your WhatsApp must never
@@ -235,6 +242,15 @@ services:
       # the container and deliberately not on a volume: a generated image is
       # kept only long enough to be looked at and sent.
       WA_IMAGE_DIR: "${WA_IMAGE_DIR:-/tmp/wa-images}"
+      # Web search, through Brave. Unset leaves it unavailable, which is a
+      # working state. Only the query is uploaded — no message, no contact.
+      BRAVE_API_KEY: "${BRAVE_API_KEY:-}"
+      BRAVE_SEARCH_API_KEY: "${BRAVE_SEARCH_API_KEY:-}"
+      # Bias results to where the user actually is. Unset is Brave's US/English
+      # default, which answers a local question with the wrong country's pages.
+      WA_SEARCH_COUNTRY: "${WA_SEARCH_COUNTRY:-}"
+      WA_SEARCH_LANG: "${WA_SEARCH_LANG:-}"
+      WA_SEARCH_URL: "${WA_SEARCH_URL:-}"
       # Read-only calendar feed. The URL is a credential in its own right.
       WA_CALENDAR_ICS_URL: "${WA_CALENDAR_ICS_URL:-}"
       # The document renderer. Unset is a working state: the connection simply
@@ -252,6 +268,27 @@ services:
       # when the frameforge profile is not running — the directory is empty and
       # whatsapp_deliver_render says the render is gone.
       - frameforge-work:/work:ro
+      # eve's checkpoint store. THIS is what makes a durable agent durable:
+      # sessions, workflow runs and their events are written here, and without a
+      # volume they live in the container's writable layer and are destroyed by
+      # the next `up --build`.
+      #
+      # That is not theoretical — it is why an `/eve` conversation lost its
+      # thread mid-sentence: a rebuild landed between two messages and took the
+      # session with it, so the agent asked which joke the user meant while the
+      # joke was on their screen. The framework was checkpointing correctly the
+      # whole time; the deployment was throwing the checkpoints away.
+      #
+      # Scoped to `.workflow-data` rather than all of `.eve` deliberately: the
+      # rest of that directory is BUILD output — agent-summary.json, builds,
+      # cache — which must come from the image on every deploy. A volume over
+      # `.eve` would pin a stale build and shadow the new one.
+      #
+      # Safe to mount because the Dockerfile creates the path as node:node; a
+      # named volume seeds from the image, so it inherits that ownership. Mount
+      # it at a path the image lacks and Docker creates it root-owned, which the
+      # agent (uid 1000) cannot write to.
+      - eve-workflow-data:/app/.eve/.workflow-data
     ports:
       - "127.0.0.1:3000:3000"
     networks:
@@ -265,6 +302,11 @@ volumes:
   # Render scratch space, shared between the renderer (read-write) and the agent
   # (read-only). Ephemeral by nature: sessions are overwritten and cleaned up.
   frameforge-work:
+  # eve's durable state: session continuations, workflow runs, their events and
+  # the hook token index. Deleting this volume does not break the agent — it
+  # forgets every conversation in progress, which is the same thing a rebuild
+  # used to do on its own.
+  eve-workflow-data:
 
 networks:
   internal:

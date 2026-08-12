@@ -346,7 +346,7 @@ const server = createServer(async (req, res) => {
         // `newest` cuts the limit from the recent end. Without it a limit of 20
         // over a long chat returns its twenty OLDEST messages, which reads as an
         // empty conversation to anything asking what just happened.
-        archiveMessages({
+        await archiveMessages({
           chat,
           limit: Number(url.searchParams.get("limit")) || undefined,
           newest: url.searchParams.get("newest") === "1",
@@ -550,6 +550,10 @@ const server = createServer(async (req, res) => {
           status: url.searchParams.get("status") || undefined,
           overdue: url.searchParams.get("overdue") === "true" || undefined,
           dueBefore: url.searchParams.get("dueBefore") || undefined,
+          // The window the item was SAID in. `dueBefore` above is the window it
+          // is due in; asking "the last 45 days" means the first one.
+          since: url.searchParams.get("since") || undefined,
+          until: url.searchParams.get("until") || undefined,
           limit: Number(url.searchParams.get("limit")) || undefined,
         }),
       );

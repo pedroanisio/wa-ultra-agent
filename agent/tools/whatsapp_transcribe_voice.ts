@@ -22,7 +22,9 @@ const MAX_BYTES = 20 * 1024 * 1024;
 
 export default defineTool({
   description:
-    "Turn a WhatsApp voice note into text. Read the chat first with whatsapp_read_chat: voice notes " +
+    "Turn a WhatsApp voice note into text. Use it whenever a chat contains a voice note whose content " +
+    "matters to the answer — a summary that silently skips one has a hole in it. " +
+    "Read the chat first with whatsapp_read_chat: voice notes " +
     "appear as `[voice note · 3:42]` with a `fromEnd` position, which you pass back here along with " +
     "`kind: \"voice\"`. Passing `from` and `time` too is what proves you mean the message you read — " +
     "if new messages have shifted the chat the fetch is refused rather than transcribing someone " +

@@ -29,7 +29,9 @@ import { BridgeError, bridge } from "../lib/bridge.ts";
  */
 export default defineTool({
   description:
-    "Remember that a nickname refers to a particular conversation, so it resolves next time. " +
+    "Remember that a nickname refers to a particular conversation, so it resolves next time. Use it " +
+    "when the user calls someone by a name the archive does not know — a nickname, a shortening, a " +
+    "family word — so the next mention resolves without asking them again. " +
     "`canonical` must be the exact chat name. Set `forget: true` to remove one. This does NOT grant " +
     "permission to message anyone: the allowlist is unchanged.\n\n" +
     "You MUST say where the nickname came from. Use origin 'session' when the USER told you, in " +

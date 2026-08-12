@@ -32,7 +32,8 @@ const MAX_BYTES = 3 * 1024 * 1024;
 
 export default defineTool({
   description:
-    "Look at an image, sticker, GIF or PDF from a WhatsApp conversation — the actual picture or " +
+    "Look at an image, sticker, GIF or PDF from a WhatsApp conversation. Use it when the answer depends " +
+    "on what an attachment actually shows, rather than on the fact that one was sent — the actual picture or " +
     "document, not a description of it. Read the chat first with whatsapp_read_chat: each message " +
     "carries a `key` — the protocol's own message id — and you pass that back here. It addresses " +
     "one message exactly, so nothing can shift underneath it and return someone else's attachment. " +

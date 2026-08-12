@@ -763,12 +763,70 @@ export function resolveArchiveChat(query) {
   return loose.length === 1 ? loose[0].key : null;
 }
 
-export function archiveMessages({ chat, limit, newest = false }) {
+export async function archiveMessages({ chat, limit, newest = false }) {
   // Resolved, then reported back as asked: the caller gets both, so a wrong
   // resolution is visible rather than silent.
   const key = resolveArchiveChat(chat) ?? chat;
   const messages = store().messagesFor(key, { limit, newest });
-  return { chat, resolved: key, messages };
+  return { chat, resolved: key, messages: await withSenderNames(messages) };
+}
+
+/**
+ * The roster, cached, keyed by identity.
+ *
+ * Refetched on a timer rather than per read: a chat read is the most frequent
+ * call the agent makes and the roster changes on the scale of new contacts, not
+ * seconds. A stale name is a cosmetic error for minutes; a roster fetch on every
+ * read is a network round trip on every read.
+ */
+let rosterCache = { at: 0, names: new Map() };
+const ROSTER_TTL_MS = 5 * 60 * 1000;
+
+async function senderNames() {
+  if (Date.now() - rosterCache.at < ROSTER_TTL_MS) return rosterCache.names;
+  try {
+    const { contacts } = await transport().contacts();
+    const names = new Map();
+    for (const contact of contacts ?? []) {
+      const name = contact.pushName || contact.fullName || contact.businessName || contact.subject;
+      if (name) names.set(contact.key, name);
+    }
+    rosterCache = { at: Date.now(), names };
+  } catch {
+    // Keep whatever was cached. A read that loses its names is worse than one
+    // whose names are a few minutes old, and the transport being briefly
+    // unreachable must not make a conversation unreadable.
+  }
+  return rosterCache.names;
+}
+
+/**
+ * Put a human name on every row that has one.
+ *
+ * ── Why this is not cosmetic ────────────────────────────────────────────────
+ * The archive stores `sender` as a bare identity key — `<digits>@lid` — and
+ * nothing else. A model reading a group therefore sees opaque keys and a chat
+ * title, and if it needs to say who said what it has only the title to guess
+ * from. That is exactly what happened: in a group whose NAME contained two
+ * people, a line one of them wrote was reported to the operator as something
+ * the other had said — in a chat where the misquoted one had sent three of
+ * sixty-three messages.
+ *
+ * ARCHITECTURAL CONTRACT (PALS's LAW): a model asked to attribute a quote from
+ * data that does not carry attribution will produce one anyway. The fix is not a
+ * better prompt — it is giving the read path the name, so attribution is looked
+ * up rather than inferred.
+ */
+async function withSenderNames(messages) {
+  if (!messages?.length) return messages ?? [];
+
+  const names = await senderNames();
+  return messages.map((message) => ({
+    ...message,
+    // The operator's own messages are labelled as such rather than by name: the
+    // agent is writing TO them, and "you" is what makes a summary read correctly.
+    senderName: message.outgoing ? "you" : (names.get(message.sender) ?? null),
+  }));
 }
 
 /** Persist what an extraction pass found. All-or-nothing on provenance. */

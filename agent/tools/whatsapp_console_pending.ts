@@ -28,9 +28,15 @@ import { BridgeError, bridge } from "../lib/bridge.ts";
  */
 export default defineTool({
   description:
-    "Collect what the user typed to you in `/eve` mode from their own WhatsApp chat. Returns their " +
-    "messages and clears them, so answer everything you receive — with whatsapp_write_self — before " +
-    "calling again. Empty is the normal state: they only reach you while they have entered /eve.",
+    "Collect what the user typed to you in `/eve` mode from their own WhatsApp chat. " +
+    "Use it when a scheduled run tells you to check for messages that never reached you, or when " +
+    "the user says they wrote to you on their phone and got no answer. Do NOT call it speculatively: " +
+    "the bridge normally pushes those messages to you the moment they arrive, so this is the backstop, " +
+    "not the mechanism. " +
+    "READING THE QUEUE EMPTIES IT — the messages are returned once and are gone, so answer everything " +
+    "you receive (with whatsapp_write_self) before calling again; a second call will not show them to " +
+    "you twice. Empty is the normal and expected result: the user only reaches you here while they " +
+    "have entered /eve.",
   inputSchema: z.object({
     waitMs: z
       .number()

@@ -22,6 +22,8 @@
  * exactly right after it fails.
  */
 
+import { MODEL } from "./model.ts";
+
 /** Roughly four characters per token, for English and for base64 alike. */
 const CHARS_PER_TOKEN = 4;
 
@@ -29,15 +31,36 @@ const CHARS_PER_TOKEN = 4;
 const BASE64_INFLATION = 4 / 3;
 
 /**
- * The ceiling on ONE tool result, in bytes before encoding.
+ * The model's context window, in tokens — read from the model, never restated.
  *
- * Deliberately far below the context window rather than close to it. A tool
- * result is never the only thing in a turn — there is a conversation, a system
- * prompt, the other tools' output and the model's own reasoning — so a single
- * result that fills most of the window has already broken the turn even when it
- * technically fits.
+ * Every limit below is a FRACTION of this, so the number has to change when the
+ * model does. It used to be a constant sitting beside the budget; a model swap
+ * moved the real window from 1M to 200K and left the constant behind, which is
+ * how a guard against context overflow becomes a cause of it.
  */
-export const CONTEXT_BYTE_BUDGET = Number(process.env.WA_TOOL_BYTE_BUDGET) || 768 * 1024;
+export const CONTEXT_WINDOW_TOKENS =
+  Number(process.env.WA_CONTEXT_WINDOW_TOKENS) || MODEL.contextWindowTokens;
+
+/**
+ * How much of the window one tool result may claim.
+ *
+ * Deliberately a small fraction rather than most of it. A tool result is never
+ * the only thing in a turn — there is the conversation, the system prompt, the
+ * other tools' output and the model's own reasoning — so a single result that
+ * fills the window has already broken the turn even when it technically fits.
+ */
+const BUDGET_SHARE = 0.25;
+
+/**
+ * The ceiling on ONE tool result, in bytes BEFORE encoding.
+ *
+ * The share is applied to the encoded size and divided back out, so a quarter of
+ * the window means a quarter of the window in the thing the model actually
+ * reads — not a quarter of the file, which base64 would inflate past a third.
+ */
+export const CONTEXT_BYTE_BUDGET =
+  Number(process.env.WA_TOOL_BYTE_BUDGET) ||
+  Math.floor((CONTEXT_WINDOW_TOKENS * BUDGET_SHARE * CHARS_PER_TOKEN) / BASE64_INFLATION);
 
 /** Bytes as something a person reads in an error message. */
 export function describeSize(bytes: number): string {

@@ -5,7 +5,7 @@
  *
  * eve's built-in `web_search` is provider-managed: it selects an AI Gateway
  * search provider (`exa` or `parallel`), and a model reached through a direct
- * provider — which this agent is, `anthropic("claude-sonnet-5")` in agent.ts —
+ * provider — which this agent is; see `lib/model.ts` for which one —
  * falls back to that provider's own server-side search instead. Neither path can
  * be pointed at a Brave subscription. So the key in `.env` needs a tool, and
  * this is it.
@@ -67,7 +67,14 @@ export class SearchError extends Error {
  * fails, which is an HTTP 401 with nothing to say about configuration.
  */
 export function braveKey(env: Record<string, string | undefined> = process.env): string {
-  return (env.BRAVE_API_KEY || env.BRAVE_SEARCH_API_KEY || "").trim();
+  // Trimmed before it is chosen, not after. A variable left as whitespace is a
+  // variable that is set as far as `||` is concerned, and it would win over the
+  // other spelling and then fail as a 401 about a key nobody set.
+  for (const value of [env.BRAVE_API_KEY, env.BRAVE_SEARCH_API_KEY]) {
+    const key = (value ?? "").trim();
+    if (key) return key;
+  }
+  return "";
 }
 
 /**
@@ -94,9 +101,15 @@ export function searchRequest({
   lang?: string;
   offset?: number;
 }) {
+  // A count outside the range is clamped rather than sent. `Number.isFinite`
+  // rather than `||` because zero is a number a caller can mean and NaN is not:
+  // `count || DEFAULT` treats both as unset and quietly returns five results to
+  // someone who asked for one.
+  const wanted = Number.isFinite(count) ? Math.trunc(count) : DEFAULT_RESULTS;
+
   const params = new URLSearchParams({
     q: query,
-    count: String(Math.min(MAX_RESULTS, Math.max(1, Math.trunc(count) || DEFAULT_RESULTS))),
+    count: String(Math.min(MAX_RESULTS, Math.max(1, wanted))),
     // Stated rather than inherited. It is Brave's own default, and a provider
     // changing it underneath us would change what this agent shows a user
     // without a line of this repository changing.
@@ -157,6 +170,46 @@ export interface SearchResults {
 /** Only schemes a person can open. A `javascript:` "citation" is not a source. */
 const SAFE_SCHEME = /^https?:$/;
 
+/** The named entities worth spelling out; everything else goes through the numeric path. */
+const ENTITIES: Record<string, string> = {
+  amp: "&",
+  lt: "<",
+  gt: ">",
+  quot: '"',
+  apos: "'",
+  nbsp: " ",
+  "#39": "'",
+};
+
+/**
+ * A snippet as prose, rather than as a fragment of a results page.
+ *
+ * Brave marks the query's own terms with `<strong>` and escapes punctuation as
+ * entities, because the response is built to be rendered as HTML. Nothing
+ * downstream renders HTML: the snippet goes to a model that may quote it into a
+ * WhatsApp message, and `Supported through &lt;strong&gt;April 2028` is what
+ * that looks like when it arrives on somebody's phone.
+ *
+ * Tags come off before entities are decoded, never after — decoding first turns
+ * an escaped `&lt;script&gt;` written in the page's own text into a tag this
+ * function would then strip, quietly deleting words the source published.
+ */
+export function cleanSnippet(value: string): string {
+  return value
+    .replace(/<[^>]*>/g, "")
+    .replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (whole, name: string) => {
+      const key = name.toLowerCase();
+      if (ENTITIES[key]) return ENTITIES[key];
+      if (key.startsWith("#x")) return String.fromCodePoint(Number.parseInt(key.slice(2), 16));
+      if (key.startsWith("#")) return String.fromCodePoint(Number.parseInt(key.slice(1), 10));
+      // An entity this code does not know is left exactly as it was written. It
+      // is somebody's text, and guessing at it is worse than showing it.
+      return whole;
+    })
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 /**
  * ⚠ ARCHITECTURAL CONTRACT (PALS's LAW) — LLM OUTPUT IS UNVERIFIED BY DEFAULT
  *
@@ -206,13 +259,19 @@ export function parseResults(response: unknown): SearchResults {
     if (!SAFE_SCHEME.test(url.protocol)) continue;
 
     const extraSnippets = Array.isArray(entry.extra_snippets)
-      ? entry.extra_snippets.filter((snippet): snippet is string => typeof snippet === "string")
+      ? entry.extra_snippets
+          .filter((snippet): snippet is string => typeof snippet === "string")
+          .map(cleanSnippet)
       : undefined;
 
     hits.push({
-      title: typeof entry.title === "string" ? entry.title : url.hostname,
-      url: url.toString(),
-      description: typeof entry.description === "string" ? entry.description : "",
+      title: typeof entry.title === "string" ? cleanSnippet(entry.title) : url.hostname,
+      // Parsed to validate the scheme, but reported EXACTLY as it was given.
+      // `new URL(x).toString()` normalises — it appends a root slash, re-encodes
+      // the path — and a citation the user pastes somewhere should be the string
+      // the source published, not this code's rendering of it.
+      url: href,
+      description: typeof entry.description === "string" ? cleanSnippet(entry.description) : "",
       ...(extraSnippets?.length ? { extraSnippets } : {}),
     });
   }

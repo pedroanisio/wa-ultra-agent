@@ -1335,13 +1335,20 @@ export function openStore(
      * ones last. A list that buries tomorrow's deadline under six "someday"
      * notes is not an answer to "what do I owe people".
      */
-    extractions({ type, actor, status = "open", chat, overdue, dueBefore, limit = 100 } = {}) {
+    extractions({ type, actor, status = "open", chat, overdue, dueBefore, since, until, limit = 100 } = {}) {
       const where = ["e.status = ?"];
       const args = [status];
 
       if (type) { where.push("e.type = ?"); args.push(type); }
       if (actor) { where.push("e.actor = ?"); args.push(actor); }
       if (chat) { where.push("c.name = ?"); args.push(chat); }
+      // WHEN IT WAS SAID, not when it is due — the two are different questions
+      // and only the first answers "check the last 45 days". `due_at` filters
+      // below cannot serve it: most items carry no due date at all, so a window
+      // applied to `due_at` silently drops everything that was merely promised.
+      // Same column and same coercion as `search`, so one window means one thing.
+      if (since) { where.push("m.sent_at_iso >= ?"); args.push(new Date(since).toISOString()); }
+      if (until) { where.push("m.sent_at_iso <= ?"); args.push(new Date(until).toISOString()); }
       // An undated item is never overdue — it was never promised for a day.
       if (overdue) { where.push("e.due_at IS NOT NULL AND e.due_at < ?"); args.push(today()); }
       if (dueBefore) { where.push("e.due_at IS NOT NULL AND e.due_at < ?"); args.push(dueBefore); }
@@ -2317,9 +2324,50 @@ export function openStore(
         .map((row) => ({ ...row, provisional: Boolean(row.provisional) }));
     },
 
+    /**
+     * How far back the archive actually reaches.
+     *
+     * ── The question this answers ───────────────────────────────────────────
+     * "What period are you considering?" — asked, reasonably, of an assistant
+     * that had just reported a pending item and could not say over what window
+     * it had looked. Counts alone cannot answer it: 8,824 messages is not a
+     * period, and an agent that knows only the count will either hedge or
+     * invent one.
+     *
+     * `undated` is reported beside the bounds rather than folded into them. A
+     * row whose timestamp failed to parse is stored with a null `sent_at_iso`,
+     * and those rows are invisible to MIN/MAX — so a span computed from the
+     * dated rows alone is a claim about *some* of the archive presented as a
+     * claim about all of it. Saying how many rows the span cannot see is what
+     * keeps "the oldest message is from 3 June" honest.
+     */
+    span() {
+      const bounds = db
+        .prepare(
+          `SELECT MIN(sent_at_iso) AS oldest, MAX(sent_at_iso) AS newest, COUNT(*) AS dated
+             FROM messages WHERE sent_at_iso IS NOT NULL AND sent_at_iso <> ''`,
+        )
+        .get();
+      const undated = db
+        .prepare(
+          `SELECT COUNT(*) AS n FROM messages WHERE sent_at_iso IS NULL OR sent_at_iso = ''`,
+        )
+        .get().n;
+
+      const oldest = bounds.oldest ?? null;
+      const newest = bounds.newest ?? null;
+      const days =
+        oldest && newest
+          ? Math.max(1, Math.round((Date.parse(newest) - Date.parse(oldest)) / 86_400_000))
+          : 0;
+
+      return { oldest, newest, days, dated: bounds.dated, undated };
+    },
+
     stats() {
       const count = (table) => db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get().n;
       return {
+        span: this.span(),
         chats: count("chats"),
         messages: count("messages"),
         transcripts: count("transcripts"),

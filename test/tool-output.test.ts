@@ -1,7 +1,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { CONTEXT_BYTE_BUDGET, approximateTokens, describeSize, fitsInContext } from "../agent/lib/tool-output.ts";
+import {
+  CONTEXT_BYTE_BUDGET,
+  CONTEXT_WINDOW_TOKENS,
+  approximateTokens,
+  describeSize,
+  fitsInContext,
+} from "../agent/lib/tool-output.ts";
 
 /**
  * The guard that stops one tool result from spending the whole context window.
@@ -81,7 +87,10 @@ function fakeMedia(bytes: number, mediaType = "image/jpeg") {
 }
 
 test("an ordinary photo is still returned", async () => {
-  const restore = fakeMedia(200 * 1024);
+  // 100 KB, not the 200 KB this asserted under the 1M-token window: the
+  // largest attachment that fits shrank with the model, and pretending
+  // otherwise would mean loosening the guard to keep an old number green.
+  const restore = fakeMedia(100 * 1024);
   try {
     const result = await viewMedia.execute({ key: "3EB0" }, {} as never);
     assert.equal(result.ok, true);
@@ -116,4 +125,24 @@ test("the refusal tells the model what happened, in one readable line", async ()
   } finally {
     restore();
   }
+});
+
+/* ── the budget must track the window ──────────────────────────────── */
+
+test("one tool result can never claim most of the context window", () => {
+  // The regression this guards: the byte budget was chosen against a 1M-token
+  // window and the model then moved to a 200K one, at which point a "safe"
+  // 768 KB result was the entire window. A budget that does not move with the
+  // model is a guard that quietly stops guarding.
+  const worstCase = approximateTokens(CONTEXT_BYTE_BUDGET, { base64: true });
+  assert.ok(
+    worstCase < CONTEXT_WINDOW_TOKENS / 2,
+    `one result may take ${worstCase} of ${CONTEXT_WINDOW_TOKENS} tokens — too much of the window`,
+  );
+});
+
+test("an ordinary attachment still fits under the smaller window", () => {
+  // The guard must not be so tight that a modest photo stops working — but on a
+  // 200K-token window "modest" is around a hundred kilobytes, not a megabyte.
+  assert.equal(fitsInContext(100 * 1024, { base64: true }).ok, true);
 });

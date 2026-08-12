@@ -17,7 +17,9 @@ import { BridgeError, bridge } from "../lib/bridge.ts";
  */
 export default defineTool({
   description:
-    "List obligations recorded from conversations: what the user promised (`commitment`), what they " +
+    "List obligations recorded from conversations. Use it when the user asks what they owe, what they " +
+    "are waiting on, or what is overdue — and before drafting to someone they have an open promise " +
+    "with. It lists what the user promised (`commitment`), what they " +
     "were asked to do (`request`), what other people owe them (`waiting`), and questions asked of " +
     "them that were never answered (`question`). This is what answers 'what do I owe people' and " +
     "'what am I waiting on'. Pass `overdue: true` for anything past its stated date. Every item " +

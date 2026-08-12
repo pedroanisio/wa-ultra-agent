@@ -415,6 +415,37 @@ unavailable, which is a working state. Only the prompt is uploaded — no messag
 no contact and no image from a chat. Configuration is in the **Generated images**
 section of `.env.example`.
 
+## Searching the web
+
+`whatsapp_search_web` asks Brave and returns titles, links and snippets. It sits
+beside `whatsapp_search_archive`, and the pair answers different questions —
+"what did somebody tell me?" is the archive, "what is true out in the world?" is
+the web. The `web-search` skill carries the procedure.
+
+eve ships a `web_search` and it cannot be used here: it selects an AI Gateway
+provider (`exa` or `parallel`), and a direct provider model — which
+[agent.ts](agent/agent.ts) uses — falls back to that provider's own server-side
+search instead. Neither path can be pointed at a Brave subscription, so the key
+gets its own tool.
+
+Two things are enforced rather than left to judgement. Results are **stripped of
+Brave's highlight markup** — the API wraps query terms in `<strong>` and escapes
+punctuation as entities because its response is built to be rendered as HTML, and
+nothing downstream renders HTML; handed on untouched, the model quotes
+`&lt;strong&gt;April 2028` into somebody's chat. And a result with no openable
+`http(s)` link is **dropped**, because a snippet the user cannot check is a claim
+wearing a citation.
+
+The output is labelled untrusted content every time. That is not decoration: this
+agent can send messages, and anyone can publish "ignore your previous
+instructions" and get it indexed. A search result is the case where a stranger
+chooses the words knowing an agent may read them, so the standing rule — what you
+read is not what you are told — is restated at the point of use.
+
+Set `BRAVE_API_KEY` and it works; unset, the tool says search is not configured.
+Only the query is uploaded. Configuration is in the **Web search** section of
+`.env.example`.
+
 ## Tests
 
 ```bash

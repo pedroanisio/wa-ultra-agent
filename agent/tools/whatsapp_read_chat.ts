@@ -5,7 +5,9 @@ import { BridgeError, bridge } from "../lib/bridge.ts";
 
 export default defineTool({
   description:
-    "Read the recent messages of one WhatsApp conversation, found by name. " +
+    "Read the recent messages of one WhatsApp conversation, found by name. Use it whenever you need " +
+    "what was actually said — before summarising a chat, before drafting a reply into it, and to " +
+    "get the message `key` that the media, reaction and edit tools address. " +
     "The name is matched by WhatsApp's own fuzzy search, so 'Ana' may open 'Ana Paula' — the result reports " +
     "which chat actually opened as `chat` and whether it matched exactly. Always read that field before " +
     "summarising, and say which conversation you read when it differs from what was asked for. " +
