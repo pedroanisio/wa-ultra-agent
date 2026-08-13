@@ -53,7 +53,13 @@ export default defineTool({
       // it is a corrupt one, described to the model as though it were the real
       // thing. Refusing leaves the user able to ask for something else; a
       // silently spent context window leaves the whole turn dead with a 400.
-      const verdict = fitsInContext(media.sizeBytes, { base64: true, what: "attachment" });
+      const verdict = fitsInContext(media.sizeBytes, {
+        base64: true,
+        what: "attachment",
+        // The budget shrinks as this conversation fills: a photo that fitted an
+        // hour ago may not fit now, and that is the guard working.
+        sessionId: ctx.session?.id,
+      });
       if (!verdict.ok) {
         return {
           ok: true as const,

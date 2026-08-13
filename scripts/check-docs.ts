@@ -13,7 +13,9 @@
  * So each check below asserts COMPLETENESS and REFERENTIAL INTEGRITY, and
  * leaves the writing alone:
  *
- *   - every route the bridge serves is documented somewhere,
+ *   - every route the bridge AND the transport serve is documented somewhere,
+ *   - every console command the user can type is in the README, and vice versa,
+ *   - every dated report says whether its findings are still open,
  *   - every tool on disk is in the spec, and the spec names no tool that is not,
  *   - every config key the code reads appears in .env.example,
  *   - every path under agent/ that a document names is really on disk,
@@ -74,6 +76,143 @@ async function checkRoutes() {
     `${actual.size} routes served by the bridge, ${actual.size - undocumented.length} documented`,
     undocumented,
     "Document each in README.md's \"Bridge API\" table, or in HOWTO-TRANSPORT-SETUP.md if it is a pairing/setup endpoint.",
+  );
+}
+
+/* ------------------------------------------------------------------ *
+ * 1b. Transport routes
+ *
+ * The bridge's 47 were checked and the transport's 20 were not, which is worse
+ * than checking neither: `docs:check` passing reads as "the route surface is
+ * covered", and two thirds of a surface is not a surface. A new transport
+ * endpoint was undocumented by default with nothing to say so.
+ *
+ * Go's ServeMux takes "METHOD /path" as one pattern string, which is why the
+ * method comes along for free here and has to be split off before matching —
+ * the docs write the path.
+ * ------------------------------------------------------------------ */
+async function checkTransportRoutes() {
+  const api = await read("whatsapp-transport/internal/httpapi/api.go");
+  const patterns = [...api.matchAll(/mux\.(?:Handle|HandleFunc)\("([A-Z]+ [^"]+)"/g)].map((m) => m[1]);
+
+  const corpus = (
+    await Promise.all(["README.md", "SPEC.md", "HOWTO-TRANSPORT-SETUP.md"].map((f) => read(f)))
+  ).join("\n");
+
+  // Path only. A doc that writes `POST /send/media` and one that writes it as a
+  // row in a table with the method in its own column are both documentation;
+  // demanding the method be adjacent would fail on the second and teach people
+  // to write for the checker instead of the reader.
+  const undocumented = patterns
+    .filter((p) => !corpus.includes(p.slice(p.indexOf(" ") + 1)))
+    .sort();
+
+  fail(
+    "routes:transport",
+    `${patterns.length} routes served by the transport, ${patterns.length - undocumented.length} documented`,
+    undocumented,
+    "Document each in README.md or HOWTO-TRANSPORT-SETUP.md, which owns the pairing and outbox endpoints.",
+  );
+
+  // Guards the extraction itself. If someone moves registration out of api.go,
+  // the loop above finds nothing and reports a clean surface — the exact
+  // silent-pass this check exists to prevent.
+  fail(
+    "routes:transport",
+    "no routes found in whatsapp-transport/internal/httpapi/api.go",
+    patterns.length >= 15 ? [] : [`found ${patterns.length}, expected the full transport surface`],
+    "The mux registration moved. Point this extraction at wherever it went, or the check silently passes forever.",
+  );
+}
+
+/* ------------------------------------------------------------------ *
+ * 1c. The console's command surface
+ *
+ * The highest-traffic surface in the system and the last one with no check:
+ * `/menu`, `/game`, `/eve`, `/status`, `/noop`, `/quit` are what a person
+ * literally types into WhatsApp. `/noop` was dispatched by the console and
+ * documented nowhere at all.
+ *
+ * Both directions matter and the second is the sharper one. A command in the
+ * docs that the console does not dispatch is a user typing something into their
+ * own chat and getting silence back — and because the self chat is a notebook,
+ * silence is exactly what an unrecognised line is SUPPOSED to produce. There is
+ * no error to see.
+ * ------------------------------------------------------------------ */
+async function checkConsoleCommands() {
+  const plugins = await read("whatsapp-bridge/src/plugins.js");
+  const dispatched = [...plugins.matchAll(/^\s*command:\s*"(\/[a-z]+)"/gm)].map((m) => m[1]);
+
+  // THE MENU BLOCK, not the whole README, and the distinction is load-bearing
+  // in both directions. Searching the whole file lets a passing mention in prose
+  // stand in for a menu entry — this check was written that way first, and it
+  // sat green while `/noop` was missing from the menu, because a paragraph
+  // further down happened to name it. A command absent from `/menu` is a command
+  // nobody discovers, whatever else the README says about it. Searching the
+  // whole file also picks up `/health` and `/status` from the HTTP route tables,
+  // which are not console commands at all.
+  const readme = await read("README.md");
+  const fence = /```\n📋 \*What I can do here\*[\s\S]*?```/.exec(readme);
+  if (!fence) {
+    fail(
+      "console:menu",
+      "the README's console menu block could not be found",
+      ["expected a fenced block opening with 📋 *What I can do here*"],
+      "The menu moved or was reworded. Point this extraction at it — until then both console checks below are vacuous.",
+    );
+    return;
+  }
+  const menu = new Set([...fence[0].matchAll(/`(\/[a-z]+)`/g)].map((m) => m[1]));
+
+  fail(
+    "console:undocumented",
+    `${dispatched.length} console commands dispatched, ${dispatched.filter((c) => menu.has(c)).length} in the README's menu`,
+    dispatched.filter((c) => !menu.has(c)).sort(),
+    "Add each to README.md's console menu block. This is the surface the user types into; a command that is not in the menu is one nobody will ever discover.",
+  );
+
+  fail(
+    "console:phantom",
+    "commands the README's menu offers that the console does not dispatch",
+    [...menu].filter((c) => !dispatched.includes(c)).sort(),
+    "Remove it from the menu or add it to PLUGINS. A command that does nothing returns silence, and silence is what an ordinary note returns too.",
+  );
+
+  fail(
+    "console:phantom",
+    "no commands found in whatsapp-bridge/src/plugins.js",
+    dispatched.length >= 4 ? [] : [`found ${dispatched.length}, expected the full console surface`],
+    "The PLUGINS shape changed. Point this extraction at it, or both checks above silently pass forever.",
+  );
+}
+
+/* ------------------------------------------------------------------ *
+ * 1d. Reports say whether they are still true
+ *
+ * `reports/` holds dated forensic artifacts — a surface-gap audit, two hygiene
+ * passes, a corpus study. Their findings get FIXED, usually within a day here,
+ * and a reader who opens one afterwards meets a blocker-severity table with
+ * nothing to say every item is closed. Two of the three were in exactly that
+ * state.
+ *
+ * The check is not "is it accurate" — nothing static can tell. It is "does it
+ * say, near the top, what it still claims to be".
+ * ------------------------------------------------------------------ */
+const REPORT_STATUS = /\*\*(CLOSED|RESOLVED|OPEN|SNAPSHOT|SUPERSEDED|SUPERSEDES|IN PROGRESS)\b/i;
+
+async function checkReportStatus() {
+  const offenders: string[] = [];
+  for await (const file of walk(join(ROOT, "reports"))) {
+    if (!file.endsWith(".md")) continue;
+    const head = (await readFile(file, "utf8")).split("\n").slice(0, 45).join("\n");
+    if (!REPORT_STATUS.test(head)) offenders.push(file.slice(ROOT.length));
+  }
+
+  fail(
+    "reports:status",
+    "dated reports with no status marker in their first 45 lines",
+    offenders.sort(),
+    "Open with a bold **CLOSED** / **RESOLVED** / **OPEN** / **SNAPSHOT** line saying what is still true and, if closed, which commits closed it. A finished audit read as an open one costs somebody an afternoon.",
   );
 }
 
@@ -393,6 +532,9 @@ async function* walk(dir: string): AsyncGenerator<string> {
 /* ------------------------------------------------------------------ */
 
 await checkRoutes();
+await checkTransportRoutes();
+await checkConsoleCommands();
+await checkReportStatus();
 await checkTools();
 await checkSkillTools();
 await checkAgentPaths();

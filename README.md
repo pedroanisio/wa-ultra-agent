@@ -303,6 +303,7 @@ is the point. Send `/menu` and it becomes a console:
 
 📋 *Session*
   `/menu` — List everything available here.
+  `/noop` — Say what state this chat is in, and change nothing.
   `/quit` — Exit the state you are in and come back to the notebook.
 
 🎮 *Games*
@@ -320,6 +321,14 @@ a bare `5` is a move, and inside `/eve` it is a question for the agent. Outside
 both it is a shopping note and nothing replies to it. Entering one state from
 another leaves the first, because two open sessions in one chat would make the
 next `5` ambiguous.
+
+Which is why `/noop` exists. A session survives a restart and an hour of not
+looking at your phone, and the state is visible only in motion — so coming back
+to the chat, the only way to find out whether the next `5` is a move or a
+shopping note was to type something and watch what happened to it. Guess wrong
+and that is a move you did not mean to play. `/noop` answers the question
+without being the experiment: it is the one command whose contract is that the
+session it describes is the session you still have afterwards.
 
 **The console is not the only thing that can answer this chat.** The agent has a
 tic-tac-toe of its own (`whatsapp_tictactoe`, addressed as `ttt`), which keeps

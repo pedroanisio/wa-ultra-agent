@@ -2,6 +2,7 @@ import { anthropic } from "@ai-sdk/anthropic";
 import { openai } from "@ai-sdk/openai";
 import { defineAgent } from "eve";
 
+import { agentGuards } from "./lib/context-budget.ts";
 import { MODEL, clientFor, reasoningFor } from "./lib/model.ts";
 
 /**
@@ -48,4 +49,26 @@ export default defineAgent({
   // does. A number restated next to its use is the same defect the model id
   // above is written to avoid.
   reasoning: reasoningFor(),
+
+  // When older messages get summarised to make room.
+  //
+  // ── Why this is declared rather than inherited ──────────────────────────────
+  //
+  // eve's default is 0.9 of the window, and it is evaluated against
+  // `lastKnownInputTokens` — the size of the PREVIOUS request. That makes it a
+  // rear-view mirror: a step that adds more than the gap between the last
+  // reading and the ceiling jumps straight over it. A turn died at 1,570,042
+  // tokens against a 1,000,000 window that way, 670,042 past a threshold that
+  // never saw it coming.
+  //
+  // Compacting earlier does not fix the reactivity, but it widens the margin the
+  // reactive check has to be wrong by. The research on context rot argues the
+  // same number from the other side: answers degrade long before the window is
+  // full, so 0.9 was only ever a rule about not crashing.
+  compaction: agentGuards().compaction,
+
+  // The outer fuse. eve's inherited default is 40,000,000 input tokens per
+  // session — forty windows — which does not bound anything a runaway loop
+  // would do before someone noticed the bill.
+  limits: agentGuards().limits,
 });

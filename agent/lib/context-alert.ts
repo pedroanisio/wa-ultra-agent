@@ -16,6 +16,7 @@
  * Pure, so the bands and the arithmetic can be tested without a model.
  */
 
+import { type StepUsage, observeUsage, usedTokens } from "./context-budget.ts";
 import { MODEL } from "./model.ts";
 
 import { CONTEXT_WINDOW_TOKENS } from "./tool-output.ts";
@@ -50,29 +51,16 @@ export { CONTEXT_WINDOW_TOKENS } from "./tool-output.ts";
  */
 export const ALERT_BANDS = [0.8, 0.9, 0.95] as const;
 
-/** The usage numbers eve reports on `step.completed`. */
-export interface StepUsage {
-  readonly inputTokens?: number;
-  readonly outputTokens?: number;
-  readonly cacheReadTokens?: number;
-  readonly cacheWriteTokens?: number;
-}
-
 /**
- * How much of the window one model call actually occupied.
+ * The usage numbers eve reports on `step.completed`, and how to total them.
  *
- * Cached tokens count. Prompt caching changes what is *billed*, not what is
- * *sent*: a cache read is prompt the model still had to be given, and counting
- * only `inputTokens` on a cache-heavy agent reports a conversation at a
- * fraction of its real size — which is exactly the failure this alert exists to
- * prevent. Output is excluded because it is not context until the next call
- * carries it back as input, where it is counted.
+ * Both now live in `context-budget.ts`, because the same figure that decides
+ * whether to WARN the user also decides what a tool may SPEND. Two copies of
+ * this arithmetic would drift, and the half that drifted would be the half that
+ * silently stopped protecting anything.
  */
-export function usedTokens(usage: StepUsage | undefined): number {
-  if (!usage) return 0;
-  const parts = [usage.inputTokens, usage.cacheReadTokens, usage.cacheWriteTokens];
-  return parts.reduce<number>((total, part) => total + (typeof part === "number" && part > 0 ? part : 0), 0);
-}
+export type { StepUsage } from "./context-budget.ts";
+export { usedTokens } from "./context-budget.ts";
 
 /** The highest band this usage has reached, or undefined below them all. */
 export function bandReached(fraction: number): number | undefined {
@@ -126,6 +114,13 @@ export function assessStep(input: {
 }): { readonly alert: string; readonly used: number; readonly fraction: number } | undefined {
   const window = input.window ?? CONTEXT_WINDOW_TOKENS;
   const used = usedTokens(input.usage);
+
+  // Record before deciding. The tool budget reads this ledger, so a step that
+  // does not earn a NOTICE must still tighten what the next tool may spend —
+  // the alert is advice, the ledger is the guard, and only one of them may be
+  // skipped when nothing needs saying.
+  if (used > 0) observeUsage(input.sessionId, input.usage);
+
   if (used <= 0 || window <= 0) return undefined;
 
   const fraction = used / window;

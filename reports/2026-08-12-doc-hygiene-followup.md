@@ -58,7 +58,7 @@ The other two findings are lower stakes: two historical reports carried no
 status marker, so a reader opening `2026-08-12-surface-gap-audit.md` met a
 blocker-severity findings table with nothing to say it was closed.
 
-**Top-3 actions** — all three are done in this pass, not proposed:
+**Top-3 actions** — all done in this pass, not proposed:
 
 1. **`README.md`: phantom schedule** — rewritten to describe the tool as it is
    (answers when asked) and to record that the schedule was retired and why.
@@ -69,6 +69,11 @@ blocker-severity findings table with nothing to say it was closed.
 3. **Two unmarked historical reports** — banners added to
    `2026-08-12-surface-gap-audit.md` (CLOSED, with the commits that closed it)
    and `2026-08-10-corpus-findings.md` (snapshot; its §7 subject was deleted).
+
+A second round then implemented the three checks this report had left as
+recommendations — transport routes, console commands, report status — and those
+immediately found `/noop` dispatched by the console and documented nowhere, plus
+a live report with no status marker. See *Automation Recommendations*.
 
 ## Documentation Inventory
 
@@ -165,16 +170,34 @@ would imply there was something to review.
 The earlier pass's recommendations were implemented, so this table is short by
 design. What follows is what remains **unautomated after** that work.
 
-| # | Doc | Element | Current State | Recommended Tool | Hook Point | Drift Risk if Manual |
-|---|---|---|---|---|---|---|
-| 1 | any | Paths under `agent/` | **Automated this pass** | `checkAgentPaths()` in `scripts/check-docs.ts` | CI + `npm run docs:check` | Was: a retired schedule stayed documented across two audits |
-| 2 | `README.md`, `SPEC.md` | Go transport routes (20) | Hand-written; only *bridge* routes are checked | Extend `checkRoutes()` to parse `whatsapp-transport/internal/httpapi/api.go` | Same hook | A new transport route is undocumented by default, and the bridge's 47 being checked makes the gap invisible |
-| 3 | `README.md` | Console slash-commands (`/menu`, `/game`, `/eve`, `/status`, `/quit`) | Hand-written block | Extract the literals from `whatsapp-bridge/src/plugins.js`, assert each is documented | Same hook | This is a **user-facing** command surface with no check at all — the closest analogue to the CLI-help drift this skill warns about |
-| 4 | `reports/*.md` | Status banners | Hand-written, and two were missing | A check that any file under `reports/` carries a dated status line | Same hook | A closed audit reads as an open one; costs a reader an afternoon |
+**All four are implemented.** The table records what each replaces and what it
+caught, because a check that has never caught anything is a check nobody should
+trust.
 
-### Detailed recommendations
+| # | Doc | Element | Tool | Hook | What it caught when first run |
+|---|---|---|---|---|---|
+| 1 | any | Paths under `agent/` | `checkAgentPaths()` | CI + `npm run docs:check` | `agent/schedules/tictactoe.md` — a retired schedule documented across two audits |
+| 2 | `README.md`, `HOWTO` | Go transport routes (20) | `checkTransportRoutes()` | Same | Nothing — all 20 were documented. Pure regression guard, and the asymmetry it removes was the risk: 47 of 67 routes checked *reads* as full coverage |
+| 3 | `README.md` | Console slash-commands (6) | `checkConsoleCommands()` | Same | `/noop` — dispatched by the console, documented nowhere |
+| 4 | `reports/*.md` | Status banners | `checkReportStatus()` | Same | `2026-08-12-context-architecture.md` — a live report with no marker |
 
-#### #1 (done): assert every documented `agent/` path exists
+Each carries a **self-guard**: if the transport's mux registration moves, if
+`PLUGINS` changes shape, or if the README's menu fence is reworded, the check
+says so instead of finding nothing and reporting a clean surface. That failure
+mode — a check that passes because its extraction broke — is the one that
+matters, because it is indistinguishable from success in CI.
+
+**#3 was itself wrong on the first attempt, and the way it was caught is the
+point.** It searched the whole README, so a passing mention of `` `/noop` `` in
+prose satisfied it while the command was still missing from the menu block a
+user actually reads. The bug surfaced only because each check was tested by
+*re-introducing the defect it exists to catch* — remove `/noop` from the menu,
+confirm the check fails, restore. It did not fail. A check written and never
+seen to fail would have shipped green and worthless.
+
+### Detailed notes
+
+#### #1: assert every documented `agent/` path exists
 
 **What**: `checkAgentPaths()` in `scripts/check-docs.ts`. Every
 `` `agent/{schedules,skills,tools,hooks,channels,connections}/…` `` named in a
@@ -196,30 +219,37 @@ guards make.
 then reverted. A check that has never been seen to fail is a check nobody should
 trust.
 
-#### #2: extend route checking to the Go transport
+#### #2: route checking extended to the Go transport
 
-**What**: `checkRoutes()` reads only `whatsapp-bridge/src/server.js`. The
-transport serves 20 routes registered in
-`whatsapp-transport/internal/httpapi/api.go`, and none is checked.
+**What**: `checkRoutes()` read only `whatsapp-bridge/src/server.js`. The
+transport's 20 routes, registered in `whatsapp-transport/internal/httpapi/api.go`,
+were unchecked.
 
-**How**: extract with `/mux\.HandleFunc\("([^"]+)"/g` against that file and run
-the same "documented somewhere" assertion. ~15 lines, same `fail()` shape.
+**How**: `checkTransportRoutes()` matches both `mux.Handle` and `mux.HandleFunc`,
+splits Go's `"METHOD /path"` pattern, and asserts the path appears in README,
+SPEC or HOWTO. The method is deliberately not required to be adjacent — a table
+with the method in its own column is documentation too, and demanding otherwise
+teaches people to write for the checker.
 
-**Drift risk**: the asymmetry is the danger — 47 of 67 routes are enforced, so
-the check *looks* comprehensive and a new transport route silently is not.
+**Why it mattered even though nothing was undocumented**: the asymmetry was the
+danger. 47 of 67 routes enforced makes `docs:check` passing read as full route
+coverage, so the next transport endpoint would have been undocumented by default
+with nothing to say so.
 
-#### #3: assert the console command surface is documented
+#### #3: the console command surface, checked both ways
 
-**What**: `/menu`, `/game`, `/eve`, `/status`, `/quit` are dispatched from
-string literals in `whatsapp-bridge/src/plugins.js`, and README prints a menu
-block listing them.
+**What**: six commands are dispatched from `PLUGINS` in
+`whatsapp-bridge/src/plugins.js`, and the README prints a menu block listing
+them. `/noop` was in the first list and not the second.
 
-**How**: extract `/^\s*"(\/[a-z]+)"/` from `plugins.js`, assert each appears in
-README's console section. Bidirectional is better: a command in the docs that
-the console does not dispatch is a user typing something that does nothing.
+**How**: `checkConsoleCommands()` extracts `command: "/x"` from `plugins.js` and
+compares against the fenced menu block in the README — both directions. A
+command in the menu that the console does not dispatch is the sharper failure:
+the user types it into their own chat and gets silence, and silence is exactly
+what an ordinary note returns, so there is no error to see.
 
-**Drift risk**: highest-traffic surface with no check. This is what the user
-actually types into WhatsApp.
+**The menu block, not the whole README** — see the note above about how the
+first version of this check sat green while the defect was live.
 
 ## Quarantine Artifacts
 

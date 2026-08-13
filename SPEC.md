@@ -420,6 +420,7 @@ whatsapp_search_archive({                                                  // �
   limit?: number
 })
 
+whatsapp_search_page({ resultSetId: string; after?: number; limit?: number }) // ✅ page 2 of a search
 whatsapp_get_context({ key: string; before?: number; after?: number })     // ✅
 
 whatsapp_edit_message({ to, messageId, message })                          // ✅
@@ -441,6 +442,17 @@ failed rather than only that it now works. Every filter above was implemented in
 individually tested there — and five of them were dropped in transit by the bridge function between
 the HTTP layer that parsed them and the SQL that honours them. The failure had no symptom: a
 narrowed search returned an unnarrowed result, which reads exactly like an answer.
+
+**A broad search is also enough text to overflow the window in one step**, which is why
+`whatsapp_search_page` exists. The search returns a head sized to what the conversation can afford,
+reports `truncated: true`, and keeps the remainder behind a `resultSetId` the paging tool reads.
+The alternative — silently returning fewer matches — is the worse bug by some distance: a model
+handed ten of ninety hits with nothing saying so summarises the ten and reports it as the answer.
+Paging exists so that a partial view is always an explicit one.
+
+Pages come from a **snapshot** taken when the search ran, not from re-running the query. The archive
+is written to while the model reads, so a re-run could return different rows and page two could
+silently skip or repeat a message.
 
 The fix was not to correct the forwarding list but to delete it. `archive-query.js` parses the query
 string once and the object is passed through whole, so there is no hand-copied field list left to

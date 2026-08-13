@@ -65,6 +65,11 @@ export const TOOLS: readonly ToolSpec[] = [
   { tool: "whatsapp_read_chat", group: "reading" },
   { tool: "whatsapp_list_chats", group: "reading" },
   { tool: "whatsapp_search_archive", group: "reading" },
+  // Reads on from a search whose result was too large to return at once. It
+  // touches no archive and no network — it pages a snapshot the search already
+  // fetched — but it belongs in `reading` because that is what it does for the
+  // person looking at the list.
+  { tool: "whatsapp_search_page", group: "reading" },
   { tool: "whatsapp_get_context", group: "reading" },
   { tool: "whatsapp_archive_chat", group: "reading" },
   { tool: "whatsapp_status", group: "reading" },

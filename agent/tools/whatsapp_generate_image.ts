@@ -80,7 +80,7 @@ export default defineTool({
       ),
   }),
 
-  async execute({ prompt, size, background, quality }) {
+  async execute({ prompt, size, background, quality }, ctx) {
     let image: Awaited<ReturnType<typeof generateImage>>;
     try {
       image = await generateImage({ prompt, size, background, quality }, {});
@@ -111,7 +111,9 @@ export default defineTool({
     // sendable, it just cannot be shown, and that is reported rather than
     // papered over with the full-size bytes.
     const preview = await previewFor(image.bytes);
-    const affordable = preview ? fitsInContext(preview.byteLength) : { ok: false };
+    const affordable = preview
+      ? fitsInContext(preview.byteLength, { sessionId: ctx.session?.id })
+      : { ok: false };
 
     return {
       ok: true as const,
