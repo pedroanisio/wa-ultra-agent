@@ -20,6 +20,7 @@ and [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- check the surfaces a person actually touches, and page a search that would not fit (`88e2a15`)
 - reach each model through the endpoint that accepts its tools, and search the web (`c7edfa9`)
 - check the documentation against the code, in CI (`76c0b38`)
 - the queue you can act on, instead of a phone and a curl (`7039e82`)
@@ -43,6 +44,8 @@ and [Semantic Versioning](https://semver.org/).
 
 ### Documentation
 
+- the tic-tac-toe schedule was retired, and two documents did not hear (`e082a5d`)
+- regenerate the changelog (`2817eb2`)
 - scrub a real name from the quarantined draft (`21149ab`)
 - regenerate the changelog (`ae85b18`)
 - make every document describe the system that exists (`da153ae`)
